@@ -1,0 +1,17 @@
+{
+  "name": "dsmastra",
+  "module": "src/index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "^1.2.19"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^2.0.24",
+    "@mastra/core": "^1.58.0",
+    "ai": "^5.0.33",
+    "zod": "^4.1.5"
+  }
+}
