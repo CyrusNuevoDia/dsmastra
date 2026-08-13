@@ -1,17 +1,23 @@
 {
   "name": "dsmastra",
-  "module": "src/index.ts",
   "type": "module",
+  "module": "src/index.ts",
+  "scripts": {
+    "check": "ultracite check",
+    "fix": "ultracite fix"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.41",
+    "@mastra/core": "^1.58.0",
+    "ai": "^7.0.65",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
-    "@types/bun": "^1.2.19"
+    "@biomejs/biome": "^2.5.8",
+    "@types/bun": "^1.2.19",
+    "ultracite": "^7.10.3"
   },
   "peerDependencies": {
     "typescript": "^5"
-  },
-  "dependencies": {
-    "@ai-sdk/openai": "^2.0.24",
-    "@mastra/core": "^1.58.0",
-    "ai": "^5.0.33",
-    "zod": "^4.1.5"
   }
 }
