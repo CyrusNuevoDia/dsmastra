@@ -4,6 +4,8 @@ import type { z } from "zod"
 
 import { at } from "@/collections"
 import type { Fields } from "@/fields"
+import { classifyJSON } from "@/json"
+import type { MetricOutput, MetricResult } from "@/metrics"
 import type {
   Candidate,
   EvaluationBatch,
@@ -13,9 +15,7 @@ import type {
   ReflectiveExample,
   RNG,
   Trajectory,
-} from "@/gepa/engine"
-import { classifyJSON } from "@/json"
-import type { MetricOutput, MetricResult } from "@/metric"
+} from "@/optimizers/gepa/engine"
 import type { Example, Program } from "@/program"
 import { schemaProperties } from "@/schema"
 
@@ -24,19 +24,21 @@ export type ScoreWithFeedback = MetricResult & { feedback?: string }
 
 /**
  * GEPA metric contract: called with (gold, prediction, trace) at module level
- * and with (gold, prediction, fullTrace, predName, predTrace) for
- * per-predictor feedback. A result without a `feedback` field gets the default
+ * and with (gold, prediction, fullTrace, stepId, stepTrace) for
+ * per-step feedback. A result without a `feedback` field gets the default
  * feedback string.
  */
 export type GEPAMetric<TInput = Fields, TOutput = Fields> = (
   gold: Example<TInput, TOutput>,
   prediction: TOutput | null,
   trace: GEPATraceStep[] | null,
-  predName?: string,
-  predTrace?: GEPATraceStep[]
+  stepId?: string,
+  stepTrace?: GEPATraceStep[]
 ) => MetricOutput
 
-export type ReflectionLM = LanguageModel | ((prompt: string) => Promise<string>)
+export type ReflectionModel =
+  | LanguageModel
+  | ((prompt: string) => Promise<string>)
 
 const defaultFeedback = (score: number) =>
   `This trajectory got a score of ${score}.`
@@ -46,15 +48,15 @@ export const runFeedbackMetric = async <TInput, TOutput>(
   gold: Example<TInput, TOutput>,
   prediction: TOutput | null,
   trace: GEPATraceStep[] | null,
-  predName?: string,
-  predTrace?: GEPATraceStep[]
+  stepId?: string,
+  stepTrace?: GEPATraceStep[]
 ): Promise<Required<Pick<ScoreWithFeedback, "feedback" | "score">>> => {
   const { score, ...metadata } = await metric(
     gold,
     prediction,
     trace,
-    predName,
-    predTrace
+    stepId,
+    stepTrace
   )
   const feedback = classifyJSON(metadata.feedback)
   return {
@@ -84,7 +86,7 @@ const MAX_HEADER_DEPTH = 6
  * (`value\n\n`), headers with a single newline, empty dicts/lists add a bare
  * newline, and the depth cap applies on recursion.
  */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a predictor output is open until `classifyJSON` sorts it below; that call is the boundary parse
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is open until `classifyJSON` sorts it below; that call is the boundary parse
 const renderValue = (value: unknown, level: number): string => {
   const header = "#".repeat(level)
   const nextLevel = Math.min(level + 1, MAX_HEADER_DEPTH)
@@ -197,7 +199,7 @@ export type ProgramAdapterConfig<TInput = Fields, TOutput = Fields> = {
   failureScore: number
   metric: GEPAMetric<TInput, TOutput>
   program: Program<TInput, TOutput>
-  reflectionLM: ReflectionLM
+  reflectionModel: ReflectionModel
   warnOnScoreMismatch: boolean
 }
 
@@ -211,27 +213,30 @@ export type ProgramGEPAAdapter<TInput = Fields, TOutput = Fields> = GEPAAdapter<
 export const createProgramAdapter = <TInput, TOutput>(
   config: ProgramAdapterConfig<TInput, TOutput>
 ): ProgramGEPAAdapter<TInput, TOutput> => {
-  const { adapterRNG, failureScore, metric, program, reflectionLM } = config
+  const { adapterRNG, failureScore, metric, program, reflectionModel } = config
   let warnedScoreMismatch = false
 
   const proposeText =
-    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- `ReflectionLM` is a published `LanguageModel | (prompt) => Promise<string>` union; a callable is only distinguishable from a model object at runtime
-    typeof reflectionLM === "function"
-      ? reflectionLM
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- `ReflectionModel` is a published `LanguageModel | (prompt) => Promise<string>` union; a callable is only distinguishable from a model object at runtime
+    typeof reflectionModel === "function"
+      ? reflectionModel
       : async (prompt: string) => {
-          const { text } = await generateText({ model: reflectionLM, prompt })
+          const { text } = await generateText({
+            model: reflectionModel,
+            prompt,
+          })
           return text
         }
 
-  // Instructions only, exactly like upstream build_program — the clone keeps
-  // whatever demos the student's predictors already carry (e.g. from a
+  // Descriptions only, exactly like upstream build_program — the clone keeps
+  // whatever few-shot examples the student's steps already carry (e.g. from a
   // bootstrapFewShot pre-pass).
   const buildProgram = (candidate: Candidate): Program<TInput, TOutput> => {
     const built = program.clone()
-    for (const predictor of built.predictors) {
-      const instructions = candidate[predictor.name]
-      if (instructions !== undefined) {
-        predictor.instructions = instructions
+    for (const step of built.steps) {
+      const description = candidate[step.id]
+      if (description !== undefined) {
+        step.description = description
       }
     }
     return built
@@ -250,7 +255,7 @@ export const createProgramAdapter = <TInput, TOutput>(
         const trace: GEPATraceStep[] = []
         let prediction: TOutput | null = null
         try {
-          prediction = await built.run(example.inputs, {
+          prediction = await built.run(example.inputData, {
             trace,
           })
         } catch (error) {
@@ -266,7 +271,7 @@ export const createProgramAdapter = <TInput, TOutput>(
       })
     )
     const batchResult: EvaluationBatch<TInput, TOutput> = {
-      outputs: trajectories.map((t) => t.prediction),
+      outputData: trajectories.map((t) => t.prediction),
       scores: trajectories.map((t) => t.score),
     }
     if (captureTraces) {
@@ -277,17 +282,16 @@ export const createProgramAdapter = <TInput, TOutput>(
 
   const recordForStep = async (
     trajectory: Trajectory<TInput, TOutput>,
-    step: GEPATraceStep,
+    traceStep: GEPATraceStep,
     componentName: string
   ): Promise<ReflectiveExample> => {
-    if (step.parseFailure !== undefined) {
-      const predictor = program.predictors.find((p) => p.name === componentName)
+    if (traceStep.parseFailure !== undefined) {
+      const step = program.steps.find((s) => s.id === componentName)
       return {
         Feedback:
-          PARSE_FAILURE_FEEDBACK_PREFIX +
-          expectedStructure(predictor?.outputSchema),
-        "Generated Outputs": PARSE_FAILURE_OUTPUT(step.parseFailure),
-        Inputs: stringifyFields(step.inputs),
+          PARSE_FAILURE_FEEDBACK_PREFIX + expectedStructure(step?.outputSchema),
+        "Generated Outputs": PARSE_FAILURE_OUTPUT(traceStep.parseFailure),
+        Inputs: stringifyFields(traceStep.inputData),
       }
     }
     const { feedback, score } = await runFeedbackMetric(
@@ -296,9 +300,9 @@ export const createProgramAdapter = <TInput, TOutput>(
       trajectory.prediction,
       trajectory.trace,
       componentName,
-      [step]
+      [traceStep]
     )
-    // The predictor-level score is discarded in favor of the module-level
+    // The step-level score is discarded in favor of the module-level
     // score; only the feedback text ever reaches the reflection LM.
     if (
       score !== trajectory.score &&
@@ -307,13 +311,13 @@ export const createProgramAdapter = <TInput, TOutput>(
     ) {
       warnedScoreMismatch = true
       console.warn(
-        "GEPA: predictor-level metric score differs from module-level score; using the module-level score."
+        "GEPA: step-level metric score differs from module-level score; using the module-level score."
       )
     }
     return {
       Feedback: feedback,
-      "Generated Outputs": stringifyFields(step.outputs),
-      Inputs: stringifyFields(step.inputs),
+      "Generated Outputs": stringifyFields(traceStep.outputData),
+      Inputs: stringifyFields(traceStep.inputData),
     }
   }
 
@@ -326,9 +330,7 @@ export const createProgramAdapter = <TInput, TOutput>(
     trajectory: Trajectory<TInput, TOutput>,
     componentName: string
   ): GEPATraceStep | null => {
-    let steps = trajectory.trace.filter(
-      (step) => step.predictorName === componentName
-    )
+    let steps = trajectory.trace.filter((step) => step.stepId === componentName)
     if (!config.addFormatFailureAsFeedback) {
       steps = steps.filter((step) => step.parseFailure === undefined)
     }

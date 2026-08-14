@@ -1,5 +1,5 @@
 /**
- * Predictor outputs are whatever the model produced and the schema accepted, so
+ * Step outputs are whatever the model produced and the schema accepted, so
  * the code that renders them into prompts genuinely meets an open JSON value. The
  * classification happens exactly once, here, and everything downstream branches on
  * the returned `kind` rather than re-interrogating the representation.

@@ -2,15 +2,15 @@ import { expect, test } from "bun:test"
 
 import { z } from "zod"
 
-import { declareStep } from "@/predictor"
+import { declareStep } from "@/step"
 
 import { model } from "../_helpers"
 
 test("declareStep → doubles number (live)", async () => {
   const step = declareStep({
+    description: "Return y = x * 2.",
     id: "double",
     inputSchema: z.object({ x: z.number().int().min(0).max(5) }),
-    instructions: "Return y = x * 2.",
     model,
     outputSchema: z.object({ y: z.number() }),
   })

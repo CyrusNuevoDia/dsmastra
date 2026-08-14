@@ -3,8 +3,11 @@ import { expect, test } from "bun:test"
 import { z } from "zod"
 
 import type { Fields } from "@/fields"
-import { autoBudget, gepa } from "@/gepa"
-import { createProgramAdapter, extractInstructionText } from "@/gepa/adapter"
+import { autoBudget, gepa, gepaProgram } from "@/optimizers/gepa"
+import {
+  createProgramAdapter,
+  extractInstructionText,
+} from "@/optimizers/gepa/adapter"
 import {
   buildMergeSubsample,
   createEpochShuffledSampler,
@@ -14,47 +17,26 @@ import {
   runMergeIteration,
   selectParetoParent,
   updateParetoFront,
-} from "@/gepa/engine"
+} from "@/optimizers/gepa/engine"
 import type {
   Candidate,
   EngineOptions,
   GEPAAdapter,
   GEPAState,
-} from "@/gepa/engine"
-import type { Demo, Predictor } from "@/predictor"
+} from "@/optimizers/gepa/engine"
+import type { Prompts } from "@/optimizers/utils"
 import { createProgram } from "@/program"
-import type { Program } from "@/program"
-import type { Example } from "@/simba"
+import type { Example, Program } from "@/program"
+import type { AnyTunableStep } from "@/step"
+import { createWorkflow } from "@/workflow"
 
 const zero = () => 0
 
 const examples = (n: number): Example[] =>
   Array.from({ length: n }, (_, id) => ({
-    inputs: { id },
-    outputs: {},
+    inputData: { id },
+    outputData: {},
   }))
-
-// --- Auto-budget -------------------------------------------------------------
-
-test("autoBudget matches hand-computed values", () => {
-  // numPreds=1, n=6, V=10: N = floor(max(4*log2(6), 9)) = 10
-  // total = 10 + 30 + 350 + (floor(11/5)+1)*10 = 420
-  expect(autoBudget(1, 6, 10)).toBe(420)
-  // N<m branch: numPreds=1, n=2: N = 4 < 5
-  // total = 4 + 10 + 140 + (floor(5/5)+1+1)*4 = 166
-  expect(autoBudget(1, 2, 4)).toBe(166)
-})
-
-test("autoBudget N=0 branch returns before periodic evals", () => {
-  // n=0 → max(-Inf, 0) → N=0 → total = valsetSize only
-  expect(autoBudget(1, 0, 7)).toBe(7)
-})
-
-test("autoBudget guards throw", () => {
-  expect(() => autoBudget(1, 2, -1)).toThrow()
-  expect(() => autoBudget(1, 2, 4, -1)).toThrow()
-  expect(() => autoBudget(1, 2, 4, 35, 0)).toThrow()
-})
 
 // --- Pareto frontier ---------------------------------------------------------
 
@@ -162,7 +144,7 @@ const scriptedAdapter = (
   evaluate: (batch, candidate, captureTraces) => {
     const scores = batch.map((example) => scoreOf(candidate, example))
     return Promise.resolve({
-      outputs: batch.map(() => ({})),
+      outputData: batch.map(() => ({})),
       scores,
       ...(captureTraces
         ? {
@@ -170,7 +152,7 @@ const scriptedAdapter = (
               example,
               prediction: {},
               score: scores[k] as number,
-              trace: [{ inputs: {}, outputs: {}, predictorName: "c1" }],
+              trace: [{ inputData: {}, outputData: {}, stepId: "c1" }],
             })),
           }
         : {}),
@@ -203,9 +185,9 @@ const engineOptions = (overrides: Partial<EngineOptions>): EngineOptions => ({
   rng: zero,
   seedCandidate: { c1: "s1", c2: "s2" },
   skipPerfectScore: true,
-  trainset: examples(3),
+  trainingSet: examples(3),
   useMerge: true,
-  valset: examples(4),
+  validationSet: examples(4),
   ...overrides,
 })
 
@@ -221,17 +203,27 @@ test("reflection acceptance is strict > on sums; cursor advances on rejection", 
   expect(state.programCandidates.length).toBe(1)
   // Round-robin advanced on the parent despite both rejections.
   expect(proposalLog).toEqual([["c1"], ["c2"]])
-  expect(state.namedPredictorIdToUpdateNextForProgramCandidate[0]).toBe(0)
+  expect(state.stepIdToUpdateNextForCandidate[0]).toBe(0)
   // Rejected proposals still bill both minibatch evals: 4 + 2*(3+3) = 16.
-  expect(state.totalNumEvals).toBe(16)
+  expect(state.totalEvalsCount).toBe(16)
 })
 
-test("accepted child: full eval billed, discovery snapshot, cursor inheritance", async () => {
+test("accepted child: full eval billed, discovery snapshot, cursor inheritance, onImprovement fires", async () => {
   const adapter = scriptedAdapter(
     (candidate) => (candidate.c1 === "better" ? 1 : 0.5),
     () => "better"
   )
-  const state = await runGEPA(adapter, engineOptions({ maxMetricCalls: 14 }))
+  const improvements: Candidate[] = []
+  const state = await runGEPA(
+    adapter,
+    engineOptions({
+      maxMetricCalls: 14,
+      onImprovement: (candidate) => {
+        improvements.push(candidate)
+        return Promise.resolve()
+      },
+    })
+  )
   expect(state.programCandidates.length).toBe(2)
   expect(state.programCandidates[1]).toEqual({
     c1: "better",
@@ -239,17 +231,19 @@ test("accepted child: full eval billed, discovery snapshot, cursor inheritance",
   })
   expect(state.parentProgramForCandidate[1]).toEqual([0])
   // Snapshot taken BEFORE billing the full eval: 4 seed + 3 + 3 = 10.
-  expect(state.numMetricCallsByDiscovery[1]).toBe(10)
-  expect(state.totalNumEvals).toBe(14)
-  expect(state.numFullDSEvals).toBe(2)
+  expect(state.metricCallCountsByDiscovery[1]).toBe(10)
+  expect(state.totalEvalsCount).toBe(14)
+  expect(state.fullDSEvalsCount).toBe(2)
   // Child inherits max(parent cursors) = 1 (parent advanced c1 → c2).
-  expect(state.namedPredictorIdToUpdateNextForProgramCandidate[1]).toBe(1)
+  expect(state.stepIdToUpdateNextForCandidate[1]).toBe(1)
   // Frontier replaced by the strictly better child on every instance.
   for (const valId of [0, 1, 2, 3]) {
     expect([
-      ...(state.programAtParetoFrontValset.get(valId) as Set<number>),
+      ...(state.programAtParetoFrontValidationSet.get(valId) as Set<number>),
     ]).toEqual([1])
   }
+  // The accepted child beat the seed's aggregate, so it checkpointed mid-run.
+  expect(improvements).toEqual([{ c1: "better", c2: "s2" }])
 })
 
 test("empty proposed text still produces a real child that gets evaluated", async () => {
@@ -263,7 +257,7 @@ test("empty proposed text still produces a real child that gets evaluated", asyn
   // Equal sums mean the merge is rejected, so no candidate is added.
   expect(state.programCandidates.length).toBe(1)
   // 4 seed + 2 iterations × (3 parent + 3 child) = 16, child evals included.
-  expect(state.totalNumEvals).toBe(16)
+  expect(state.totalEvalsCount).toBe(16)
 })
 
 test("a fruitless merge search falls through to reflection in the same iteration", async () => {
@@ -278,7 +272,7 @@ test("a fruitless merge search falls through to reflection in the same iteration
   // all-perfect skip). Every iteration after the first therefore bills 3:
   // 14, 17, 20, 23, 26 → five iterations, ending at i=4 (burning the merge
   // iteration would end at i=5).
-  expect(state.totalNumEvals).toBe(26)
+  expect(state.totalEvalsCount).toBe(26)
   expect(state.i).toBe(4)
 })
 
@@ -289,7 +283,7 @@ test("budget is checked at the top of the loop only (bounded overshoot)", async 
   )
   const state = await runGEPA(adapter, engineOptions({ maxMetricCalls: 5 }))
   // The single iteration runs to completion past the budget: 4+3+3+4 = 14.
-  expect(state.totalNumEvals).toBe(14)
+  expect(state.totalEvalsCount).toBe(14)
 })
 
 // --- Merge -------------------------------------------------------------------
@@ -324,16 +318,16 @@ const mergeLineageState = (): GEPAState => {
     updateParetoFront(front, frontPrograms, idx, scores)
   }
   return {
+    fullDSEvalsCount: 3,
     i: 0,
-    namedPredictorIdToUpdateNextForProgramCandidate: [0, 0, 0],
-    numFullDSEvals: 3,
-    numMetricCallsByDiscovery: [0, 6, 12],
+    metricCallCountsByDiscovery: [0, 6, 12],
     parentProgramForCandidate: [[null], [0], [0]],
-    paretoFrontValset: front,
+    paretoFrontValidationSet: front,
     progCandidateValSubscores: subscores,
-    programAtParetoFrontValset: frontPrograms,
+    programAtParetoFrontValidationSet: frontPrograms,
     programCandidates: candidates,
-    totalNumEvals: 18,
+    stepIdToUpdateNextForCandidate: [0, 0, 0],
+    totalEvalsCount: 18,
   }
 }
 
@@ -387,7 +381,7 @@ const mergeScoreAdapter = (
 ): GEPAAdapter =>
   scriptedAdapter(
     (candidate, example) => {
-      const valId = example.inputs.id as number
+      const valId = example.inputData.id as number
       const { c1, c2 } = candidate
       if (c1 === "A" && c2 === "B") {
         return mergedScore(valId)
@@ -414,7 +408,7 @@ test("merge acceptance is non-strict >= on subsample sums", async () => {
   const outcome = await runMergeIteration(
     adapter,
     state,
-    { rng: zero, valset: examples(6) },
+    { rng: zero, validationSet: examples(6) },
     memory
   )
   expect(outcome).toBe("accepted")
@@ -422,8 +416,8 @@ test("merge acceptance is non-strict >= on subsample sums", async () => {
   expect(state.parentProgramForCandidate[3]).toEqual([1, 2])
   // The triplet is memoized before the acceptance decision.
   expect(memory.triedTriplets.has("0|1|2")).toBe(true)
-  // 18 + 5 (subsample) + 6 (full valset eval) = 29.
-  expect(state.totalNumEvals).toBe(29)
+  // 18 + 5 (subsample) + 6 (full validationSet eval) = 29.
+  expect(state.totalEvalsCount).toBe(29)
 })
 
 test("rejected merge still bills its subsample eval", async () => {
@@ -437,55 +431,49 @@ test("rejected merge still bills its subsample eval", async () => {
   const outcome = await runMergeIteration(
     adapter,
     state,
-    { rng: zero, valset: examples(6) },
+    { rng: zero, validationSet: examples(6) },
     memory
   )
   expect(outcome).toBe("rejected")
   expect(state.programCandidates.length).toBe(3)
-  expect(state.totalNumEvals).toBe(23)
+  expect(state.totalEvalsCount).toBe(23)
 })
 
 // --- Adapter: evaluate never throws ------------------------------------------
 
-type MathPredictor = Predictor<
-  z.ZodType<{ x: number }>,
-  z.ZodType<{ y: number }>
->
-
-const makeMathPredictor = (name: string): MathPredictor => {
-  const predictor: MathPredictor = {
-    call: (inputs, ctx) => {
-      const { x } = inputs
-      if (x === 3 && !predictor.instructions.includes("double")) {
-        throw new Error("boom")
-      }
-      const y = predictor.instructions.includes("double") ? x * 2 : x
-      ctx?.trace?.push({ inputs, outputs: { y }, predictorName: name })
-      return Promise.resolve({ y })
-    },
+const makeMathStep = (id: string): AnyTunableStep => {
+  const step: AnyTunableStep = {
     clone: () => {
-      const cloned = makeMathPredictor(name)
-      cloned.instructions = predictor.instructions
-      cloned.demos = structuredClone(predictor.demos)
+      const cloned = makeMathStep(id)
+      cloned.description = step.description
+      cloned.examples = structuredClone(step.examples)
       return cloned
     },
-    demos: [],
+    description: "identity",
+    examples: [],
+    execute: ({ inputData }, ctx) => {
+      const x = inputData.x as number
+      if (x === 3 && !step.description.includes("double")) {
+        throw new Error("boom")
+      }
+      const y = step.description.includes("double") ? x * 2 : x
+      ctx?.trace?.push({ inputData, outputData: { y }, stepId: id })
+      return Promise.resolve({ y })
+    },
+    id,
     inputSchema: z.object({ x: z.number() }),
-    instructions: "identity",
     model: "stub" as never,
-    name,
     outputSchema: z.object({ y: z.number() }),
+    settings: {},
   }
-  return predictor
+  return step
 }
 
-const makeMathProgram = (): Program => {
-  const predictor = makeMathPredictor("math")
-  return createProgram({
-    forward: (call, input: Fields) => call("math", input),
-    predictors: [predictor],
+const makeMathProgram = (): Program =>
+  createProgram({
+    forward: (call, inputData: Fields) => call("math", inputData),
+    steps: [makeMathStep("math")],
   })
-}
 
 test("evaluate never throws per example: failures score failureScore with null output", async () => {
   const adapter = createProgramAdapter({
@@ -499,54 +487,54 @@ test("evaluate never throws per example: failures score failureScore with null o
       return { score: 1 }
     },
     program: makeMathProgram(),
-    reflectionLM: () => Promise.resolve(""),
+    reflectionModel: () => Promise.resolve(""),
     warnOnScoreMismatch: true,
   })
   const batch: Example[] = [
-    { inputs: { x: 1 }, outputs: { y: 1 } },
-    { inputs: { x: 3 }, outputs: { y: 6 } },
+    { inputData: { x: 1 }, outputData: { y: 1 } },
+    { inputData: { x: 3 }, outputData: { y: 6 } },
   ]
   const result = await adapter.evaluate(batch, { math: "identity" }, false)
-  expect(result.outputs).toEqual([{ y: 1 }, null])
+  expect(result.outputData).toEqual([{ y: 1 }, null])
   expect(result.scores).toEqual([1, -1])
 })
 
-// --- Demos flow through instruction-only candidates --------------------------
+// --- Examples flow through description-only candidates -----------------------
 
-test("student demos survive gepa untouched; candidates stay instruction-only", async () => {
-  const demo: Demo = { augmented: true, inputs: { x: 5 }, outputs: { y: 10 } }
+test("student examples survive gepa untouched; candidates stay description-only", async () => {
+  const example: Example = { inputData: { x: 5 }, outputData: { y: 10 } }
   const program = makeMathProgram()
-  ;(program.predictors[0] as Predictor).demos = [demo]
-  const result = await gepa(program, examples(3), {
+  ;(program.steps[0] as AnyTunableStep).examples = [example]
+  const result = await gepaProgram(program, examples(3), {
     // The seed eval alone exceeds this, so the loop never runs.
     maxMetricCalls: 1,
     metric: () => ({ score: 0 }),
-    reflectionLM: () => Promise.resolve(""),
+    reflectionModel: () => Promise.resolve(""),
   })
-  // The candidate is a bare instruction map, exactly upstream's dict[str, str].
+  // The candidate is a bare description map, exactly upstream's dict[str, str].
   expect(result.candidates[0]).toEqual({ math: "identity" })
-  // The rebuilt best program still carries the pre-installed demos.
-  expect(result.program.predictors[0]?.demos).toEqual([demo])
+  // The rebuilt best program still carries the pre-installed examples.
+  expect(result.program.steps[0]?.examples).toEqual([example])
 })
 
 // --- End-to-end toy run ------------------------------------------------------
 
 test("gepa e2e: budget enforced, best candidate beats or matches the seed", async () => {
-  const trainset: Example[] = Array.from({ length: 6 }, (_, i) => ({
-    inputs: { x: i + 1 },
-    outputs: { y: (i + 1) * 2 },
+  const trainingSet: Example[] = Array.from({ length: 6 }, (_, i) => ({
+    inputData: { x: i + 1 },
+    outputData: { y: (i + 1) * 2 },
   }))
-  const result = await gepa(makeMathProgram(), trainset, {
+  const result = await gepaProgram(makeMathProgram(), trainingSet, {
     maxMetricCalls: 60,
     metric: (gold, prediction) => ({
-      score: prediction?.y === gold.outputs.y ? 1 : 0,
+      score: prediction?.y === gold.outputData.y ? 1 : 0,
     }),
-    reflectionLM: () =>
+    reflectionModel: () =>
       Promise.resolve("```\nAlways double the input: return y = x * 2.\n```"),
     seed: 1,
   })
   expect(result.totalMetricCalls).toBeGreaterThanOrEqual(60)
-  // Overshoot is bounded by one valset eval plus two minibatch evals.
+  // Overshoot is bounded by one validationSet eval plus two minibatch evals.
   expect(result.totalMetricCalls).toBeLessThanOrEqual(60 + 6 + 2 * 3)
   expect(result.candidates.length).toBeGreaterThan(1)
   expect(result.bestIdx).toBeGreaterThan(0)
@@ -554,8 +542,95 @@ test("gepa e2e: budget enforced, best candidate beats or matches the seed", asyn
     result.valAggregateScores[0] as number
   )
   expect(result.valAggregateScores[result.bestIdx]).toBe(1)
-  // The returned program actually carries the improved instructions.
-  expect(result.program.predictors[0]?.instructions.includes("double")).toBe(
-    true
+  // The returned program actually carries the improved description.
+  expect(result.program.steps[0]?.description.includes("double")).toBe(true)
+})
+
+// --- Workflow-level gepa ------------------------------------------------------
+
+const mathWorkflow = () =>
+  createWorkflow({
+    id: "math",
+    inputSchema: z.object({ x: z.number() }),
+    outputSchema: z.object({ y: z.number() }),
+  })
+    .then(makeMathStep("math"))
+    .commit()
+
+test("autoBudget matches hand-computed values", () => {
+  // stepsCount=1, n=6, V=10: N = floor(max(4*log2(6), 9)) = 10
+  // total = 10 + 30 + 350 + (floor(11/5)+1)*10 = 420
+  expect(autoBudget(1, 6, 10)).toBe(420)
+  // N<m branch: stepsCount=1, n=2: N = 4 < 5
+  // total = 4 + 10 + 140 + (floor(5/5)+1+1)*4 = 166
+  expect(autoBudget(1, 2, 4)).toBe(166)
+})
+
+test("autoBudget N=0 branch returns before periodic evals", () => {
+  // n=0 → max(-Inf, 0) → N=0 → total = validationSetSize only
+  expect(autoBudget(1, 0, 7)).toBe(7)
+})
+
+test("autoBudget guards throw", () => {
+  expect(() => autoBudget(1, 2, -1)).toThrow()
+  expect(() => autoBudget(1, 2, 4, -1)).toThrow()
+  expect(() => autoBudget(1, 2, 4, 35, 0)).toThrow()
+})
+
+test("gepa budget knobs: exactly one of auto, maxFullEvals, maxMetricCalls", async () => {
+  const savePrompts = () => Promise.resolve()
+  await expect(
+    gepa(mathWorkflow(), { savePrompts, trainingSet: examples(2) })
+  ).rejects.toThrow(
+    "Exactly one of auto, maxFullEvals, maxMetricCalls must be set"
   )
+  await expect(
+    gepa(mathWorkflow(), {
+      maxFullEvals: 1,
+      maxMetricCalls: 1,
+      savePrompts,
+      trainingSet: examples(2),
+    })
+  ).rejects.toThrow(
+    "Exactly one of auto, maxFullEvals, maxMetricCalls must be set"
+  )
+})
+
+test("gepa workflow: few-shot pre-pass runs un-billed, savePrompts checkpoints and finishes", async () => {
+  const trainingSet: Example[] = Array.from({ length: 4 }, (_, i) => ({
+    inputData: { x: i + 4 },
+    outputData: { y: (i + 4) * 2 },
+  }))
+  let metricCalls = 0
+  const saved: Prompts[] = []
+  const { score, workflow: tuned } = await gepa(mathWorkflow(), {
+    // Budget of 1: GEPA's own loop never runs (the seed eval exhausts it) —
+    // yet the pre-pass still bootstrapped examples, proving its metric calls
+    // are not billed against GEPA's budget.
+    maxFewShotExamples: 2,
+    maxMetricCalls: 1,
+    metric: (gold, prediction) => {
+      metricCalls += 1
+      return { score: prediction?.y === gold.outputData.y ? 1 : 0 }
+    },
+    reflectionModel: () => Promise.resolve(""),
+    savePrompts: (prompts) => {
+      saved.push(structuredClone(prompts))
+      return Promise.resolve()
+    },
+    trainingSet,
+  })
+  // Identity math step: x∈[4..7] all fail (y=x ≠ 2x)? No — identity returns
+  // y=x, expected 2x, so bootstrap accepts none and backfills labeled ones.
+  const tunedStep = tuned.steps.math as AnyTunableStep
+  expect(tunedStep.examples.length).toBeGreaterThan(0)
+  expect(score).toBe(0)
+  // Final savePrompts always fires, carrying the tuned state.
+  expect(saved.length).toBeGreaterThanOrEqual(1)
+  const last = saved.at(-1) as Prompts
+  expect(last.version).toBe(1)
+  expect(last.steps.math?.examples).toEqual(tunedStep.examples)
+  // The metric ran for the bootstrap attempts plus the seed eval — more calls
+  // than GEPA's entire budget, none of which aborted the pre-pass.
+  expect(metricCalls).toBeGreaterThan(1)
 })

@@ -6,34 +6,52 @@ import { at, first, last } from "@/collections"
 import type { Fields } from "@/fields"
 import type { JSONData } from "@/json"
 import { classifyJSON } from "@/json"
-import type { MetricOutput } from "@/metric"
-import type { RunContext, TraceStep } from "@/predictor"
+import { exactMatch } from "@/metrics"
+import type { Metric } from "@/metrics"
+import {
+  programToWorkflow,
+  promptsOf,
+  workflowToProgram,
+} from "@/optimizers/utils"
+import type { SavePrompts } from "@/optimizers/utils"
 import type { Example, Program } from "@/program"
 import { createRNG, samplePoisson, shuffle, weightedChoice } from "@/random"
 import { schemaProperties } from "@/schema"
+import type { RunContext, TraceStep } from "@/step"
+import type { CommittedWorkflow, StepMap } from "@/workflow"
 
-export type { Example } from "@/program"
-
-export type { MetricResult } from "@/metric"
-
-export type Metric<TInput = Fields, TOutput = Fields> = (
-  example: Example<TInput, TOutput>,
-  prediction: TOutput | undefined
-) => MetricOutput
-
-export type SIMBAConfig<TInput = Fields, TOutput = Fields> = {
-  bsize?: number
-  demoInputFieldMaxlen?: number
-  maxDemos?: number
+export type SIMBAConfig = {
+  batchSize?: number
+  candidates?: number
+  candidateTemperature?: number
+  maxFewShotExamples?: number
+  maxFewShotInputLength?: number
   maxSteps?: number
-  metric: Metric<TInput, TOutput>
-  numCandidates?: number
-  /** LM used to write rules; defaults to the first predictor's model. */
+  /** Defaults to exact match on every expected field. */
+  metric?: Metric
+  /** LM used to write rules; defaults to the first step's model. */
   promptModel?: LanguageModel
+  samplingTemperature?: number
+  savePrompts: SavePrompts
   seed?: number
   teacherSettings?: { model: LanguageModel; temperature?: number }
-  temperatureForCandidates?: number
-  temperatureForSampling?: number
+  trainingSet: readonly Example[]
+}
+
+type InternalConfig<TInput = Fields, TOutput = Fields> = {
+  batchSize?: number
+  candidates?: number
+  candidateTemperature?: number
+  maxFewShotExamples?: number
+  maxFewShotInputLength?: number
+  maxSteps?: number
+  metric: Metric<TInput, TOutput>
+  /** Called with each optimization step's winning program — checkpointing. */
+  onImprovement?: (program: Program<TInput, TOutput>) => Promise<void>
+  promptModel?: LanguageModel
+  samplingTemperature?: number
+  seed?: number
+  teacherSettings?: { model: LanguageModel; temperature?: number }
 }
 
 export type Rollout<TInput = Fields, TOutput = Fields> = {
@@ -57,10 +75,11 @@ export type TrialLog = {
   step: number
 }
 
-export type SIMBAResult<TInput, TOutput> = {
-  /** All finalist programs with their full-trainset scores, sorted descending. */
+export type SIMBAProgramResult<TInput, TOutput> = {
+  /** All finalist programs with their full-trainingSet scores, sorted descending. */
   candidates: { program: Program<TInput, TOutput>; score: number }[]
   program: Program<TInput, TOutput>
+  score: number
   trialLogs: TrialLog[]
 }
 
@@ -134,19 +153,19 @@ export const percentile = (values: number[], p: number): number => {
 }
 
 /**
- * Group model-major rollouts into per-example buckets (stride = bsize), each
- * sorted by score descending, then order buckets by
+ * Group model-major rollouts into per-example buckets (stride = batchSize),
+ * each sorted by score descending, then order buckets by
  * (max−min gap, max score, max−avg gap) lexicographically descending.
  * Rollout records are shallow-copied so strategies never mutate shared state.
  */
 export const makeBuckets = <TInput, TOutput>(
   rollouts: Rollout<TInput, TOutput>[],
-  bsize: number
+  batchSize: number
 ): Bucket<TInput, TOutput>[] => {
   const buckets: Bucket<TInput, TOutput>[] = []
-  for (let exampleIdx = 0; exampleIdx < bsize; exampleIdx += 1) {
+  for (let exampleIdx = 0; exampleIdx < batchSize; exampleIdx += 1) {
     const bucket: Rollout<TInput, TOutput>[] = []
-    for (let i = exampleIdx; i < rollouts.length; i += bsize) {
+    for (let i = exampleIdx; i < rollouts.length; i += batchSize) {
       bucket.push({ ...at(rollouts, i, "rollouts") })
     }
     bucket.sort((a, b) => b.score - a.score)
@@ -169,82 +188,85 @@ export const makeBuckets = <TInput, TOutput>(
   return buckets
 }
 
-// --- Demo dropping ----------------------------------------------------------
+// --- Example dropping --------------------------------------------------------
 
 /**
- * max_demos enforced probabilistically: expected ~1 drop for a full predictor,
- * at least one forced at/over the cap. Draws are with replacement, so the
- * realized drop count can be lower than the sampled one. The single index set
- * applies to every predictor of the candidate.
+ * maxFewShotExamples enforced probabilistically: expected ~1 drop for a full
+ * step, at least one forced at/over the cap. Draws are with replacement, so
+ * the realized drop count can be lower than the sampled one. The single index
+ * set applies to every step of the candidate.
  */
-export const dropDemos = (
+export const dropExamples = (
   candidate: Program<never, unknown>,
-  maxDemos: number,
+  maxFewShotExamples: number,
   rng: () => number,
   poissonRNG: () => number
 ): number => {
-  const cap = maxDemos > 0 ? maxDemos : 3
-  const numDemos = Math.max(
+  const cap = maxFewShotExamples > 0 ? maxFewShotExamples : 3
+  const examplesCount = Math.max(
     0,
-    ...candidate.predictors.map((p) => p.demos.length)
+    ...candidate.steps.map((step) => step.examples.length)
   )
   let toDrop = Math.max(
-    samplePoisson(poissonRNG, numDemos / cap),
-    numDemos >= cap ? 1 : 0
+    samplePoisson(poissonRNG, examplesCount / cap),
+    examplesCount >= cap ? 1 : 0
   )
-  toDrop = Math.min(toDrop, numDemos)
+  toDrop = Math.min(toDrop, examplesCount)
   const dropIdxs = new Set<number>()
   for (let i = 0; i < toDrop; i += 1) {
-    dropIdxs.add(Math.floor(rng() * numDemos))
+    dropIdxs.add(Math.floor(rng() * examplesCount))
   }
-  for (const predictor of candidate.predictors) {
-    predictor.demos = predictor.demos.filter((_, idx) => !dropIdxs.has(idx))
+  for (const step of candidate.steps) {
+    step.examples = step.examples.filter((_, idx) => !dropIdxs.has(idx))
   }
   return toDrop
 }
 
 // --- Strategy A: append_a_demo ---------------------------------------------
 
-export const appendADemo = <TInput, TOutput>(
+export const appendAnExample = <TInput, TOutput>(
   bucket: Bucket<TInput, TOutput>,
   candidate: Program<TInput, TOutput>,
-  opts: { demoInputFieldMaxlen: number; p10: number }
+  opts: { maxFewShotInputLength: number; p10: number }
 ): boolean => {
   const good = first(bucket.rollouts, "bucket rollouts")
   if (good.score <= opts.p10) {
     console.log(
-      `Skipping appending a demo as good score ${good.score} is at or below the 10th percentile.`
+      `Skipping appending an example as good score ${good.score} is at or below the 10th percentile.`
     )
     return false
   }
 
-  const nameToDemo = new Map<string, { inputs: Fields; outputs: Fields }>()
-  for (const step of good.trace) {
-    const inputs: Fields = { ...step.inputs }
-    for (const [key, value] of Object.entries(inputs)) {
+  const idToExample = new Map<string, Example>()
+  for (const traceStep of good.trace) {
+    const inputData: Fields = { ...traceStep.inputData }
+    for (const [key, value] of Object.entries(inputData)) {
       const text = String(value)
       if (
-        opts.demoInputFieldMaxlen &&
-        text.length > opts.demoInputFieldMaxlen
+        opts.maxFewShotInputLength &&
+        text.length > opts.maxFewShotInputLength
       ) {
-        inputs[key] =
-          `${text.slice(0, opts.demoInputFieldMaxlen)}\n\t\t... <TRUNCATED FOR BREVITY>`
+        inputData[key] =
+          `${text.slice(0, opts.maxFewShotInputLength)}\n\t\t... <TRUNCATED FOR BREVITY>`
       }
     }
-    // Keep only the last demo per predictor in the trajectory.
-    nameToDemo.set(step.predictorName, { inputs, outputs: step.outputs })
+    // Keep only the last example per step in the trajectory.
+    idToExample.set(traceStep.stepId, {
+      inputData,
+      outputData: traceStep.outputData,
+    })
   }
 
   let added = 0
-  for (const [name, demo] of nameToDemo) {
-    const predictor = candidate.predictors.find((p) => p.name === name)
-    if (!predictor) {
+  for (const [stepId, example] of idToExample) {
+    const step = candidate.steps.find((s) => s.id === stepId)
+    if (!step) {
       continue
     }
-    predictor.demos.push({ augmented: true, ...demo })
+    step.examples.push(example)
     added += 1
   }
-  console.log(`Added ${added} demos (one each) across all predictors.`)
+  console.log(`Added ${added} examples (one each) across all steps.`)
   return true
 }
 
@@ -315,7 +337,7 @@ const offerFeedbackSchema = (moduleNames: string[]) =>
   })
 
 /** Replace non-serializable values recursively, like dspy's recursive_mask. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a predictor output is an open value until `classifyJSON` sorts it on the next line; that call is the boundary parse, and `JSONData` is the named type it returns
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is an open value until `classifyJSON` sorts it on the next line; that call is the boundary parse, and `JSONData` is the named type it returns
 export const recursiveMask = (value: unknown): JSONData => {
   const json = classifyJSON(value)
   switch (json.kind) {
@@ -363,12 +385,12 @@ const indentContinuations = (text: string): string =>
 
 export const inspectModules = (program: Program<never, unknown>): string => {
   const blocks = [MODULE_SEPARATOR]
-  for (const predictor of program.predictors) {
+  for (const step of program.steps) {
     blocks.push(
-      `Module ${predictor.name}`,
-      `\n\tInput Fields:${indentContinuations(fieldDescriptionLines(predictor.inputSchema))}`,
-      `\tOutput Fields:${indentContinuations(fieldDescriptionLines(predictor.outputSchema))}`,
-      `\tOriginal Instructions: ${indentContinuations(predictor.instructions)}`,
+      `Module ${step.id}`,
+      `\n\tInput Fields:${indentContinuations(fieldDescriptionLines(step.inputSchema))}`,
+      `\tOutput Fields:${indentContinuations(fieldDescriptionLines(step.outputSchema))}`,
+      `\tOriginal Instructions: ${indentContinuations(step.description)}`,
       MODULE_SEPARATOR
     )
   }
@@ -410,10 +432,12 @@ type RolloutContrast = {
 }
 
 const toTrajectory = (trace: TraceStep[]) =>
-  trace.map((step) => ({
-    inputs: step.inputs,
-    module_name: step.predictorName,
-    outputs: step.outputs,
+  // Serialized keys stay `inputs`/`outputs` for byte-parity with the upstream
+  // prompt rendering.
+  trace.map((traceStep) => ({
+    inputs: traceStep.inputData,
+    module_name: traceStep.stepId,
+    outputs: traceStep.outputData,
   }))
 
 /** Stand-in shown when a rollout carries no usable contrast. */
@@ -468,17 +492,17 @@ export const appendARule = async <TInput, TOutput extends Fields>(
   const { example } = good
   const result = await offerFeedback(
     opts.promptModel,
-    candidate.predictors.map((p) => p.name),
+    candidate.steps.map((step) => step.id),
     {
       better_program_outputs: goodView.prediction ?? {},
       better_program_trajectory: toTrajectory(goodView.trace),
       better_reward_info: goodView.outputMetadata,
       better_reward_value: goodView.score,
-      module_names: candidate.predictors.map((p) => p.name),
+      module_names: candidate.steps.map((step) => step.id),
       modules_defn: inspectModules(candidate),
-      oracle_metadata: example.outputs,
+      oracle_metadata: example.outputData,
       program_code: candidate.code,
-      program_inputs: example.inputs,
+      program_inputs: example.inputData,
       worse_program_outputs: badView.prediction ?? {},
       worse_program_trajectory: toTrajectory(badView.trace),
       worse_reward_info: badView.outputMetadata,
@@ -486,11 +510,11 @@ export const appendARule = async <TInput, TOutput extends Fields>(
     }
   )
 
-  for (const predictor of candidate.predictors) {
-    const advice = result.moduleAdvice[predictor.name]
+  for (const step of candidate.steps) {
+    const advice = result.moduleAdvice[step.id]
     if (advice !== undefined) {
-      console.log(`Advice for ${predictor.name}: ${advice}`)
-      predictor.instructions = `${predictor.instructions}\n\n${advice}`
+      console.log(`Advice for ${step.id}: ${advice}`)
+      step.description = `${step.description}\n\n${advice}`
     }
   }
   return true
@@ -507,7 +531,7 @@ const runRollout = async <TInput, TOutput>(
   const trace: TraceStep[] = []
   let prediction: TOutput | undefined
   try {
-    prediction = await program.run(example.inputs, {
+    prediction = await program.run(example.inputData, {
       ...ctx,
       trace,
     })
@@ -533,32 +557,37 @@ const runRollout = async <TInput, TOutput>(
 
 // --- Main loop --------------------------------------------------------------
 
-export const simba = async <TInput extends Fields, TOutput extends Fields>(
+export const simbaProgram = async <
+  TInput extends Fields,
+  TOutput extends Fields,
+>(
   student: Program<TInput, TOutput>,
-  trainset: Example<TInput, TOutput>[],
-  config: SIMBAConfig<TInput, TOutput>
-): Promise<SIMBAResult<TInput, TOutput>> => {
+  trainingSet: Example<TInput, TOutput>[],
+  config: InternalConfig<TInput, TOutput>
+): Promise<SIMBAProgramResult<TInput, TOutput>> => {
   const {
-    bsize = 32,
-    demoInputFieldMaxlen = 100_000,
-    maxDemos = 4,
+    batchSize = 32,
+    candidates = 6,
+    candidateTemperature = 0.2,
+    maxFewShotExamples = 4,
+    maxFewShotInputLength = 100_000,
     maxSteps = 8,
     metric,
-    numCandidates = 6,
+    onImprovement,
+    samplingTemperature = 0.2,
     seed = 0,
     teacherSettings,
-    temperatureForCandidates = 0.2,
-    temperatureForSampling = 0.2,
   } = config
 
-  if (trainset.length < bsize) {
-    throw new Error(`Trainset too small: ${trainset.length} < ${bsize}`)
+  if (trainingSet.length < batchSize) {
+    throw new Error(
+      `TrainingSet too small: ${trainingSet.length} < ${batchSize}`
+    )
   }
 
   type AnyProgram = Program<TInput, TOutput>
   const baseline = student.clone()
-  const promptModel =
-    config.promptModel ?? first(baseline.predictors, "predictors").model
+  const promptModel = config.promptModel ?? first(baseline.steps, "steps").model
 
   const rng = createRNG(seed)
   const poissonRNG = createRNG(seed)
@@ -576,12 +605,15 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
   let currentP10 = 0
   let currentP90 = 0
 
-  const demoStrategy = (
+  const exampleStrategy = (
     bucket: Bucket<TInput, TOutput>,
     candidate: AnyProgram
   ) =>
     Promise.resolve(
-      appendADemo(bucket, candidate, { demoInputFieldMaxlen, p10: currentP10 })
+      appendAnExample(bucket, candidate, {
+        maxFewShotInputLength,
+        p10: currentP10,
+      })
     )
   const ruleStrategy = (
     bucket: Bucket<TInput, TOutput>,
@@ -593,22 +625,22 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
       promptModel,
     })
   const strategies =
-    maxDemos > 0 ? [demoStrategy, ruleStrategy] : [ruleStrategy]
+    maxFewShotExamples > 0 ? [exampleStrategy, ruleStrategy] : [ruleStrategy]
 
-  const dataIdxs = trainset.map((_, i) => i)
+  const dataIdxs = trainingSet.map((_, i) => i)
   shuffle(rng, dataIdxs)
   let instanceIdx = 0
   let nextRolloutId = 0
 
   const nextBatch = (): Example<TInput, TOutput>[] => {
-    if (instanceIdx + bsize > trainset.length) {
+    if (instanceIdx + batchSize > trainingSet.length) {
       shuffle(rng, dataIdxs)
       instanceIdx = 0
     }
     const batch = dataIdxs
-      .slice(instanceIdx, instanceIdx + bsize)
-      .map((i) => at(trainset, i, "trainset"))
-    instanceIdx += bsize
+      .slice(instanceIdx, instanceIdx + batchSize)
+      .map((i) => at(trainingSet, i, "trainingSet"))
+    instanceIdx += batchSize
     return batch
   }
 
@@ -624,24 +656,24 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
       })
       nextRolloutId += 1
     }
-    while (models.length < numCandidates) {
+    while (models.length < candidates) {
       models.push({ seed: nextRolloutId, temperature: 1 })
       nextRolloutId += 1
     }
     return models
   }
 
-  // Model-major, example-minor: bucket extraction strides by bsize.
+  // Model-major, example-minor: bucket extraction strides by batchSize.
   const sampleRollouts = (
     batch: Example<TInput, TOutput>[]
   ): Promise<Rollout<TInput, TOutput>[]> => {
     // The pool is frozen for the whole call, so score the programs once.
     const avg = avgScores()
-    const topK = topKPlusBaseline(avg, numCandidates)
+    const topK = topKPlusBaseline(avg, candidates)
     const runs: (() => Promise<Rollout<TInput, TOutput>>)[] = []
     for (const modelCtx of prepareModelsForResampling()) {
       for (const example of batch) {
-        const srcIdx = softmaxSample(rng, topK, avg, temperatureForSampling)
+        const srcIdx = softmaxSample(rng, topK, avg, samplingTemperature)
         // Rollouts never mutate the program, so no clone is needed.
         const rolloutProgram = at(programs, srcIdx, "programs")
         runs.push(() => runRollout(rolloutProgram, example, metric, modelCtx))
@@ -655,12 +687,12 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
   ): Promise<AnyProgram[]> => {
     // Candidates only join the pool after the step, so score it once.
     const avg = avgScores()
-    const topK = topKPlusBaseline(avg, numCandidates)
-    const candidates: AnyProgram[] = []
+    const topK = topKPlusBaseline(avg, candidates)
+    const generated: AnyProgram[] = []
     for (const bucket of buckets) {
-      const srcIdx = softmaxSample(rng, topK, avg, temperatureForCandidates)
+      const srcIdx = softmaxSample(rng, topK, avg, candidateTemperature)
       const candidate = at(programs, srcIdx, "programs").clone()
-      dropDemos(candidate, maxDemos, rng, poissonRNG)
+      dropExamples(candidate, maxFewShotExamples, rng, poissonRNG)
       const strategy = at(
         strategies,
         Math.floor(rng() * strategies.length),
@@ -675,12 +707,12 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
         console.error(`Strategy failed with error: ${error}`)
         continue
       }
-      candidates.push(candidate)
-      if (candidates.length >= numCandidates + 1) {
+      generated.push(candidate)
+      if (generated.length >= candidates + 1) {
         break
       }
     }
-    return candidates
+    return generated
   }
 
   const evaluateOn = async (
@@ -704,7 +736,7 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
     const batch = nextBatch()
 
     console.log(
-      `Sampling program trajectories on ${bsize} examples x ${numCandidates} samples.`
+      `Sampling program trajectories on ${batchSize} examples x ${candidates} samples.`
     )
     const rollouts = await sampleRollouts(batch)
 
@@ -716,13 +748,13 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
       `Batch ${step + 1}: Baseline mini-batch score: ${baselineScore}`
     )
 
-    const buckets = makeBuckets(rollouts, bsize)
-    const candidates = await generateCandidates(buckets)
+    const buckets = makeBuckets(rollouts, batchSize)
+    const stepCandidates = await generateCandidates(buckets)
 
     console.log(
-      `Batch ${step + 1}: Evaluating ${candidates.length} programs on ${bsize} examples.`
+      `Batch ${step + 1}: Evaluating ${stepCandidates.length} programs on ${batchSize} examples.`
     )
-    const candidateScoreLists = await evaluateOn(candidates, batch)
+    const candidateScoreLists = await evaluateOn(stepCandidates, batch)
     const candidateScores = candidateScoreLists.map(mean)
     console.log(
       `Scores after ${step + 1} batches: ${candidateScores}, Best: ${candidateScores.length ? Math.max(...candidateScores) : "N/A"}`
@@ -731,11 +763,13 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
     // Winner = argmax mean score, first max wins ties.
     if (candidateScores.length > 0) {
       const bestIdx = candidateScores.indexOf(Math.max(...candidateScores))
-      winningPrograms.push(at(candidates, bestIdx, "candidates").clone())
+      const winner = at(stepCandidates, bestIdx, "candidates").clone()
+      winningPrograms.push(winner)
+      await onImprovement?.(winner)
     }
 
     // Register ALL candidates into the pool.
-    for (const [idx, candidate] of candidates.entries()) {
+    for (const [idx, candidate] of stepCandidates.entries()) {
       programs.push(candidate)
       programScores.push(at(candidateScoreLists, idx, "candidate scores"))
     }
@@ -748,10 +782,10 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
     await runStep(step)
   }
 
-  // Final selection: numCandidates+1 programs evenly spaced across the winner
+  // Final selection: candidates+1 programs evenly spaced across the winner
   // timeline, always including the untouched student and the last winner.
   const m = winningPrograms.length - 1
-  const n = numCandidates + 1
+  const n = candidates + 1
   const spacing =
     m < 1
       ? Array.from({ length: n }, () => 0)
@@ -761,9 +795,9 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
   const finalists = finalIdxs.map((i) => at(winningPrograms, i, "winners"))
 
   console.log(
-    `VALIDATION: Evaluating ${finalists.length} programs on the full trainset.`
+    `VALIDATION: Evaluating ${finalists.length} programs on the full trainingSet.`
   )
-  const finalistScores = await evaluateOn(finalists, trainset)
+  const finalistScores = await evaluateOn(finalists, trainingSet)
   const finalScores = finalistScores.map(mean)
 
   const candidateData = finalists
@@ -775,13 +809,43 @@ export const simba = async <TInput extends Fields, TOutput extends Fields>(
 
   // First max wins ties — favors the less-evolved program.
   const bestIdx = finalScores.indexOf(Math.max(...finalScores))
+  const bestScore = Math.max(...finalScores)
   console.log(
-    `Final trainset scores: ${finalScores}, Best: ${Math.max(...finalScores)} (at index ${bestIdx})`
+    `Final trainingSet scores: ${finalScores}, Best: ${bestScore} (at index ${bestIdx})`
   )
 
   return {
     candidates: candidateData,
     program: at(finalists, bestIdx, "finalists").clone(),
+    score: bestScore,
     trialLogs,
+  }
+}
+
+/**
+ * Stochastic Introspective Mini-Batch Ascent: evolves step descriptions
+ * (appended rules) and few-shot examples via mini-batch search.
+ */
+export const simba = async <TSteps extends StepMap>(
+  workflow: CommittedWorkflow<TSteps>,
+  config: SIMBAConfig
+): Promise<{ score: number; workflow: CommittedWorkflow<TSteps> }> => {
+  const { metric, savePrompts, trainingSet, ...options } = config
+  const result = await simbaProgram(
+    workflowToProgram(workflow),
+    [...trainingSet],
+    {
+      ...options,
+      batchSize: config.batchSize ?? Math.min(32, trainingSet.length),
+      metric: metric ?? exactMatch,
+      onImprovement: async (program) => {
+        await savePrompts(promptsOf(program))
+      },
+    }
+  )
+  await savePrompts(promptsOf(result.program))
+  return {
+    score: result.score,
+    workflow: programToWorkflow(result.program, workflow),
   }
 }

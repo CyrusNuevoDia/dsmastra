@@ -1,61 +1,50 @@
 import type { Fields } from "@/fields"
-import type { AnyPredictor, RunContext } from "@/predictor"
+import type { AnyTunableStep, RunContext } from "@/step"
 
-/**
- * A training example: inputs plus the expected output fields.
- *
- * Parameterised by the program it trains so that `program.run(example.inputs)`
- * typechecks on its own. Both sides default to `Fields`, which is what a program
- * built from named predictors actually consumes, so plain `Example` still means
- * what it always did.
- */
-export type Example<TInput = Fields, TOutput = Fields> = {
-  inputs: TInput
-  outputs: TOutput
-}
+export type { Example } from "@/step"
 
 export type ProgramForward<TInput, TOutput> = (
-  call: (predictorName: string, inputs: Fields) => Promise<Fields>,
-  input: TInput
+  call: (stepId: string, inputData: Fields) => Promise<Fields>,
+  inputData: TInput
 ) => Promise<TOutput>
 
 /**
- * The unit SIMBA optimizes: a set of named predictors plus a forward function
- * that wires them together. Cloning deep-copies predictor state (instructions,
- * demos) while sharing the forward function and models.
+ * The unit the optimizers work on internally: a set of tunable steps plus a
+ * forward function that wires them together. Cloning deep-copies step prompt
+ * state (description, examples) while sharing the forward function and models.
  */
 export type Program<TInput = Fields, TOutput = Fields> = {
   clone: () => Program<TInput, TOutput>
   code: string
-  predictors: AnyPredictor[]
-  run: (input: TInput, ctx?: RunContext) => Promise<TOutput>
+  run: (inputData: TInput, ctx?: RunContext) => Promise<TOutput>
+  steps: AnyTunableStep[]
 }
 
 export const createProgram = <TInput, TOutput>(config: {
   forward: ProgramForward<TInput, TOutput>
-  predictors: AnyPredictor[]
+  steps: AnyTunableStep[]
 }): Program<TInput, TOutput> => {
   const { forward } = config
   const code = forward.toString()
 
-  const make = (predictors: AnyPredictor[]): Program<TInput, TOutput> => {
-    const byName = new Map(predictors.map((p) => [p.name, p]))
+  const make = (steps: AnyTunableStep[]): Program<TInput, TOutput> => {
+    const byId = new Map(steps.map((step) => [step.id, step]))
     return {
-      clone: () => make(predictors.map((predictor) => predictor.clone())),
+      clone: () => make(steps.map((step) => step.clone())),
       code,
-      predictors,
-      run: (input, ctx) => {
-        const call = async (predictorName: string, inputs: Fields) => {
-          const predictor = byName.get(predictorName)
-          if (!predictor) {
-            throw new Error(`Unknown predictor: ${predictorName}`)
+      run: (inputData, ctx) => {
+        const call = async (stepId: string, stepInputData: Fields) => {
+          const step = byId.get(stepId)
+          if (!step) {
+            throw new Error(`Unknown step: ${stepId}`)
           }
-          return await predictor.call(inputs, ctx)
+          return await step.execute({ inputData: stepInputData }, ctx)
         }
-        return forward(call, input)
+        return forward(call, inputData)
       },
+      steps,
     }
   }
 
-  return make(config.predictors)
+  return make(config.steps)
 }

@@ -1,15 +1,15 @@
 import { at, get, pop, prop } from "@/collections"
 import type { Fields } from "@/fields"
-import type { TraceStep } from "@/predictor"
 import type { Example } from "@/program"
 import { shuffle, weightedChoice, weightedChoiceStrict } from "@/random"
 import type { RNG } from "@/random"
+import type { TraceStep } from "@/step"
 
 export type { RNG } from "@/random"
 
 /**
- * A candidate is a map of component (predictor) name → instruction text,
- * exactly upstream's dict[str, str]. Demos live on the program's predictors
+ * A candidate is a map of component (step) name → instruction text,
+ * exactly upstream's dict[str, str]. Few-shot examples live on the program's steps
  * (bootstrapFewShot pre-pass) and flow through build_program untouched.
  */
 export type Candidate = Record<string, string>
@@ -30,7 +30,7 @@ export type GEPATraceStep = TraceStep & {
 }
 
 export type EvaluationBatch<TInput = Fields, TOutput = Fields> = {
-  outputs: (TOutput | null)[]
+  outputData: (TOutput | null)[]
   scores: number[]
   trajectories?: Trajectory<TInput, TOutput>[]
 }
@@ -68,15 +68,15 @@ export type GEPAAdapter<TInput = Fields, TOutput = Fields> = {
 
 export type GEPAState = {
   i: number
-  namedPredictorIdToUpdateNextForProgramCandidate: number[]
-  numFullDSEvals: number
-  numMetricCallsByDiscovery: number[]
-  paretoFrontValset: Map<number, number>
+  stepIdToUpdateNextForCandidate: number[]
+  fullDSEvalsCount: number
+  metricCallCountsByDiscovery: number[]
+  paretoFrontValidationSet: Map<number, number>
   parentProgramForCandidate: (number | null)[][]
   progCandidateValSubscores: Map<number, number>[]
-  programAtParetoFrontValset: Map<number, Set<number>>
+  programAtParetoFrontValidationSet: Map<number, Set<number>>
   programCandidates: Candidate[]
-  totalNumEvals: number
+  totalEvalsCount: number
 }
 
 // --- Small helpers ----------------------------------------------------------
@@ -87,7 +87,7 @@ const toSubscores = (scores: number[]): Map<number, number> =>
   new Map(scores.map((score, valId) => [valId, score]))
 
 /**
- * Per-instance frontier update after a candidate's full valset eval. Strict
+ * Per-instance frontier update after a candidate's full validationSet eval. Strict
  * improvement replaces the set; an exact float tie (no epsilon) adds to it.
  */
 export const updateParetoFront = (
@@ -117,32 +117,26 @@ const addCandidate = (
   candidate: Candidate,
   parents: (number | null)[],
   subscores: Map<number, number>,
-  valsetSize: number
+  validationSetSize: number
 ): number => {
   const idx = state.programCandidates.length
   state.programCandidates.push(candidate)
   state.parentProgramForCandidate.push(parents)
   state.progCandidateValSubscores.push(subscores)
-  state.numMetricCallsByDiscovery.push(state.totalNumEvals)
-  state.namedPredictorIdToUpdateNextForProgramCandidate.push(
+  state.metricCallCountsByDiscovery.push(state.totalEvalsCount)
+  state.stepIdToUpdateNextForCandidate.push(
     Math.max(
       0,
       ...parents
         .filter((p): p is number => p !== null)
-        .map((p) =>
-          at(
-            state.namedPredictorIdToUpdateNextForProgramCandidate,
-            p,
-            "predictor cursors"
-          )
-        )
+        .map((p) => at(state.stepIdToUpdateNextForCandidate, p, "step cursors"))
     )
   )
-  state.totalNumEvals += valsetSize
-  state.numFullDSEvals += 1
+  state.totalEvalsCount += validationSetSize
+  state.fullDSEvalsCount += 1
   updateParetoFront(
-    state.paretoFrontValset,
-    state.programAtParetoFrontValset,
+    state.paretoFrontValidationSet,
+    state.programAtParetoFrontValidationSet,
     idx,
     subscores
   )
@@ -453,7 +447,7 @@ export const proposeMerge = (
   valOverlapFloor = MERGE_VAL_OVERLAP_FLOOR
 ): MergeProposal | null => {
   const survivors = removeDominatedPrograms(
-    state.programAtParetoFrontValset,
+    state.programAtParetoFrontValidationSet,
     aggScores
   )
   if (survivors.length < 2 || state.parentProgramForCandidate.length < 3) {
@@ -577,10 +571,17 @@ export type MergeOutcome = "accepted" | "none" | "rejected"
 export const runMergeIteration = async <TInput, TOutput>(
   adapter: GEPAAdapter<TInput, TOutput>,
   state: GEPAState,
-  options: { rng: RNG; valset: Example<TInput, TOutput>[] },
+  options: {
+    onAccepted?: (
+      candidate: Candidate,
+      subscores: Map<number, number>
+    ) => Promise<void>
+    rng: RNG
+    validationSet: Example<TInput, TOutput>[]
+  },
   memory: MergeMemory
 ): Promise<MergeOutcome> => {
-  const { rng, valset } = options
+  const { rng, validationSet } = options
   const aggScores = state.progCandidateValSubscores.map(aggregateScore)
   const proposal = proposeMerge(state, aggScores, rng, memory)
   if (!proposal) {
@@ -605,9 +606,11 @@ export const runMergeIteration = async <TInput, TOutput>(
     subscoresJ.has(valId)
   )
   const subsample = buildMergeSubsample(sharedIds, subscoresI, subscoresJ, rng)
-  const batch = subsample.map((valId) => at(valset, valId, "valset"))
+  const batch = subsample.map((valId) =>
+    at(validationSet, valId, "validationSet")
+  )
   const mergedEval = await adapter.evaluate(batch, proposal.candidate, false)
-  state.totalNumEvals += batch.length
+  state.totalEvalsCount += batch.length
   const sumMerged = sum(mergedEval.scores)
   const sumI = sum(
     subsample.map((valId) => get(subscoresI, valId, "subscores I"))
@@ -618,14 +621,20 @@ export const runMergeIteration = async <TInput, TOutput>(
   if (sumMerged < Math.max(sumI, sumJ)) {
     return "rejected"
   }
-  const fullEval = await adapter.evaluate(valset, proposal.candidate, false)
+  const fullEval = await adapter.evaluate(
+    validationSet,
+    proposal.candidate,
+    false
+  )
+  const subscores = toSubscores(fullEval.scores)
   addCandidate(
     state,
     proposal.candidate,
     [proposal.parentI, proposal.parentJ],
-    toSubscores(fullEval.scores),
-    valset.length
+    subscores,
+    validationSet.length
   )
+  await options.onAccepted?.(proposal.candidate, subscores)
   console.log(
     `GEPA iteration ${state.i}: accepted merge of ${proposal.parentI} and ${proposal.parentJ}`
   )
@@ -639,14 +648,16 @@ export type EngineOptions<TInput = Fields, TOutput = Fields> = {
   componentSelector: "all" | "roundRobin"
   maxMergeInvocations: number
   maxMetricCalls: number
+  /** Called whenever an accepted candidate becomes the new aggregate-score best. */
+  onImprovement?: (candidate: Candidate) => Promise<void>
   perfectScore: number
   reflectionMinibatchSize: number
   rng: RNG
   seedCandidate: Candidate
   skipPerfectScore: boolean
-  trainset: Example<TInput, TOutput>[]
+  trainingSet: Example<TInput, TOutput>[]
   useMerge: boolean
-  valset: Example<TInput, TOutput>[]
+  validationSet: Example<TInput, TOutput>[]
 }
 
 const selectParent = (
@@ -658,7 +669,7 @@ const selectParent = (
     return argmax(aggScores)
   }
   return selectParetoParent(
-    state.programAtParetoFrontValset,
+    state.programAtParetoFrontValidationSet,
     aggScores,
     options.rng
   )
@@ -668,32 +679,36 @@ export const runGEPA = async <TInput, TOutput>(
   adapter: GEPAAdapter<TInput, TOutput>,
   options: EngineOptions<TInput, TOutput>
 ): Promise<GEPAState> => {
-  const { rng, trainset, valset } = options
+  const { rng, trainingSet, validationSet } = options
   const componentNames = Object.keys(options.seedCandidate)
 
-  const seedEval = await adapter.evaluate(valset, options.seedCandidate, false)
+  const seedEval = await adapter.evaluate(
+    validationSet,
+    options.seedCandidate,
+    false
+  )
   const state: GEPAState = {
+    fullDSEvalsCount: 1,
     i: -1,
-    namedPredictorIdToUpdateNextForProgramCandidate: [0],
-    numFullDSEvals: 1,
-    numMetricCallsByDiscovery: [0],
+    metricCallCountsByDiscovery: [0],
     parentProgramForCandidate: [[null]],
-    paretoFrontValset: new Map(),
+    paretoFrontValidationSet: new Map(),
     progCandidateValSubscores: [toSubscores(seedEval.scores)],
-    programAtParetoFrontValset: new Map(),
+    programAtParetoFrontValidationSet: new Map(),
     programCandidates: [options.seedCandidate],
-    totalNumEvals: valset.length,
+    stepIdToUpdateNextForCandidate: [0],
+    totalEvalsCount: validationSet.length,
   }
   updateParetoFront(
-    state.paretoFrontValset,
-    state.programAtParetoFrontValset,
+    state.paretoFrontValidationSet,
+    state.programAtParetoFrontValidationSet,
     0,
     at(state.progCandidateValSubscores, 0, "val subscores")
   )
 
   const sampler = createEpochShuffledSampler(
     rng,
-    trainset.length,
+    trainingSet.length,
     options.reflectionMinibatchSize
   )
   const mergeMemory: MergeMemory = {
@@ -704,14 +719,28 @@ export const runGEPA = async <TInput, TOutput>(
   let totalMergesTested = 0
   let lastIterFoundNewProgram = false
 
+  let bestAgg = aggregateScore(
+    at(state.progCandidateValSubscores, 0, "val subscores")
+  )
+  const noteImprovement = async (
+    candidate: Candidate,
+    subscores: Map<number, number>
+  ): Promise<void> => {
+    const agg = aggregateScore(subscores)
+    if (agg > bestAgg) {
+      bestAgg = agg
+      await options.onImprovement?.(candidate)
+    }
+  }
+
   const runReflection = async (): Promise<void> => {
     const parentIdx = selectParent(state, options)
     const parent = at(state.programCandidates, parentIdx, "candidates")
 
     const minibatchIds = sampler(state.i)
-    const batch = minibatchIds.map((id) => at(trainset, id, "trainset"))
+    const batch = minibatchIds.map((id) => at(trainingSet, id, "trainingSet"))
     const parentEval = await adapter.evaluate(batch, parent, true)
-    state.totalNumEvals += batch.length
+    state.totalEvalsCount += batch.length
 
     if (!parentEval.trajectories || parentEval.trajectories.length === 0) {
       return
@@ -729,14 +758,14 @@ export const runGEPA = async <TInput, TOutput>(
     } else {
       // The cursor advances on the parent even if the proposal is rejected.
       const cursor = at(
-        state.namedPredictorIdToUpdateNextForProgramCandidate,
+        state.stepIdToUpdateNextForCandidate,
         parentIdx,
-        "predictor cursors"
+        "step cursors"
       )
       components = [
         at(componentNames, cursor % componentNames.length, "component names"),
       ]
-      state.namedPredictorIdToUpdateNextForProgramCandidate[parentIdx] =
+      state.stepIdToUpdateNextForCandidate[parentIdx] =
         (cursor + 1) % componentNames.length
     }
 
@@ -773,18 +802,14 @@ export const runGEPA = async <TInput, TOutput>(
     // Python evaluates children with capture_traces=True (used only for
     // logging upstream, but it keeps the adapter call shape identical).
     const childEval = await adapter.evaluate(batch, child, true)
-    state.totalNumEvals += batch.length
+    state.totalEvalsCount += batch.length
 
     // Strict > on SUMS (not means) for reflection acceptance.
     if (sum(childEval.scores) > sum(parentEval.scores)) {
-      const fullEval = await adapter.evaluate(valset, child, false)
-      addCandidate(
-        state,
-        child,
-        [parentIdx],
-        toSubscores(fullEval.scores),
-        valset.length
-      )
+      const fullEval = await adapter.evaluate(validationSet, child, false)
+      const subscores = toSubscores(fullEval.scores)
+      addCandidate(state, child, [parentIdx], subscores, validationSet.length)
+      await noteImprovement(child, subscores)
       lastIterFoundNewProgram = true
       if (totalMergesTested < options.maxMergeInvocations) {
         mergesDue += 1
@@ -795,7 +820,7 @@ export const runGEPA = async <TInput, TOutput>(
     }
   }
 
-  while (state.totalNumEvals < options.maxMetricCalls) {
+  while (state.totalEvalsCount < options.maxMetricCalls) {
     state.i += 1
     if (options.useMerge && mergesDue > 0 && lastIterFoundNewProgram) {
       lastIterFoundNewProgram = false
@@ -803,7 +828,7 @@ export const runGEPA = async <TInput, TOutput>(
       const outcome = await runMergeIteration(
         adapter,
         state,
-        { rng, valset },
+        { onAccepted: noteImprovement, rng, validationSet },
         mergeMemory
       )
       if (outcome === "accepted") {

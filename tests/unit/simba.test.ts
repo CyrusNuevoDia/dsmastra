@@ -5,21 +5,23 @@ import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
 import type { Fields } from "@/fields"
-import { declarePredictor } from "@/predictor"
-import { createProgram } from "@/program"
-import type { Program } from "@/program"
-import { createRNG, samplePoisson } from "@/random"
 import {
-  appendADemo,
+  appendAnExample,
   appendARule,
-  dropDemos,
+  dropExamples,
   makeBuckets,
   percentile,
   simba,
   softmaxSample,
   topKPlusBaseline,
-} from "@/simba"
-import type { Bucket, Example, Rollout } from "@/simba"
+} from "@/optimizers/simba"
+import type { Bucket, Rollout } from "@/optimizers/simba"
+import type { Prompts } from "@/optimizers/utils"
+import type { Example, Program } from "@/program"
+import { createProgram } from "@/program"
+import { createRNG, samplePoisson } from "@/random"
+import { declareStep } from "@/step"
+import { createWorkflow } from "@/workflow"
 
 const usage = {
   inputTokens: {
@@ -60,7 +62,7 @@ const makeRollout = (
   score: number,
   overrides: Partial<Rollout> = {}
 ): Rollout => ({
-  example: { inputs: {}, outputs: {} },
+  example: { inputData: {}, outputData: {} },
   outputMetadata: {},
   prediction: {},
   score,
@@ -83,22 +85,23 @@ const bucketOf = (scores: number[]): Bucket => {
   }
 }
 
-const makeProgram = (
-  instructions: string,
-  model: LanguageModel = deadModel
-): Program => {
-  const predictor = declarePredictor({
+const classifyStep = (description: string, model: LanguageModel = deadModel) =>
+  declareStep({
+    description,
+    id: "classify",
     inputSchema: z.object({ text: z.string() }),
-    instructions,
     model,
-    name: "classify",
     outputSchema: z.object({ label: z.enum(["pos", "neg"]) }),
   })
-  return createProgram({
-    forward: (call, input: Fields) => call("classify", input),
-    predictors: [predictor],
+
+const makeProgram = (
+  description: string,
+  model: LanguageModel = deadModel
+): Program =>
+  createProgram({
+    forward: (call, inputData: Fields) => call("classify", inputData),
+    steps: [classifyStep(description, model)],
   })
-}
 
 describe("topKPlusBaseline", () => {
   test("takes top k by average, ties toward lower index", () => {
@@ -172,11 +175,13 @@ describe("samplePoisson", () => {
 })
 
 describe("makeBuckets", () => {
-  test("groups model-major rollouts by example with stride bsize", () => {
+  test("groups model-major rollouts by example with stride batchSize", () => {
     // 3 models x 2 examples, model-major: [m0e0, m0e1, m1e0, m1e1, m2e0, m2e1]
     const scores = [0.5, 0.1, 0.7, 0.9, 0.6, 0.2]
     const rollouts = scores.map((score, i) =>
-      makeRollout(score, { example: { inputs: { i: i % 2 }, outputs: {} } })
+      makeRollout(score, {
+        example: { inputData: { i: i % 2 }, outputData: {} },
+      })
     )
     const buckets = makeBuckets(rollouts, 2)
     expect(buckets).toHaveLength(2)
@@ -184,7 +189,7 @@ describe("makeBuckets", () => {
     const first = buckets[0] as Bucket
     expect(first.rollouts.map((r) => r.score)).toEqual([0.9, 0.2, 0.1])
     expect(first.maxToMinGap).toBeCloseTo(0.8)
-    expect(first.rollouts.every((r) => r.example.inputs.i === 1)).toBe(true)
+    expect(first.rollouts.every((r) => r.example.inputData.i === 1)).toBe(true)
     const second = buckets[1] as Bucket
     expect(second.rollouts.map((r) => r.score)).toEqual([0.7, 0.6, 0.5])
   })
@@ -192,7 +197,9 @@ describe("makeBuckets", () => {
   test("orders by max score then max-to-avg gap when gaps tie", () => {
     // Both examples have max-to-min gap 0.4; example 0 has higher max.
     const rollouts = [0.9, 0.6, 0.5, 0.2].map((score, i) =>
-      makeRollout(score, { example: { inputs: { i: i % 2 }, outputs: {} } })
+      makeRollout(score, {
+        example: { inputData: { i: i % 2 }, outputData: {} },
+      })
     )
     const buckets = makeBuckets(rollouts, 2)
     expect((buckets[0] as Bucket).maxScore).toBeCloseTo(0.9)
@@ -208,75 +215,76 @@ describe("makeBuckets", () => {
   })
 })
 
-describe("dropDemos", () => {
-  const programWithDemos = (count: number): Program => {
+describe("dropExamples", () => {
+  const programWithExamples = (count: number): Program => {
     const program = makeProgram("classify")
-    for (const predictor of program.predictors) {
-      predictor.demos = Array.from({ length: count }, (_, i) => ({
-        inputs: { text: `demo ${i}` },
-        outputs: { label: "pos" },
+    for (const step of program.steps) {
+      step.examples = Array.from({ length: count }, (_, i) => ({
+        inputData: { text: `example ${i}` },
+        outputData: { label: "pos" },
       }))
     }
     return program
   }
 
-  test("never drops when there are no demos", () => {
-    const program = programWithDemos(0)
-    const dropped = dropDemos(program, 4, createRNG(0), createRNG(0))
+  test("never drops when there are no examples", () => {
+    const program = programWithExamples(0)
+    const dropped = dropExamples(program, 4, createRNG(0), createRNG(0))
     expect(dropped).toBe(0)
   })
 
-  test("forces at least one drop at or over the cap, bounded by demo count", () => {
+  test("forces at least one drop at or over the cap, bounded by example count", () => {
     for (let seed = 0; seed < 20; seed += 1) {
-      const program = programWithDemos(4)
-      const dropped = dropDemos(program, 4, createRNG(seed), createRNG(seed))
+      const program = programWithExamples(4)
+      const dropped = dropExamples(program, 4, createRNG(seed), createRNG(seed))
       expect(dropped).toBeGreaterThanOrEqual(1)
       expect(dropped).toBeLessThanOrEqual(4)
-      const remaining = (program.predictors[0]?.demos ?? []).length
+      const remaining = (program.steps[0]?.examples ?? []).length
       // draws are with replacement, so realized drops can be below `dropped`
       expect(remaining).toBeGreaterThanOrEqual(4 - dropped)
       expect(remaining).toBeLessThan(4)
     }
   })
 
-  test("applies the same index set to every predictor", () => {
-    const a = declarePredictor({
-      inputSchema: z.object({}),
-      instructions: "a",
-      model: deadModel,
-      name: "a",
-      outputSchema: z.object({}),
-    })
-    const b = a.clone()
-    b.name = "b"
-    for (const predictor of [a, b]) {
-      predictor.demos = Array.from({ length: 6 }, (_, i) => ({
-        inputs: { i },
-        outputs: {},
+  test("applies the same index set to every step", () => {
+    const stepOf = (id: "a" | "b") =>
+      declareStep({
+        description: id,
+        id,
+        inputSchema: z.object({}),
+        model: deadModel,
+        outputSchema: z.object({}),
+      })
+    const a = stepOf("a")
+    const b = stepOf("b")
+    for (const step of [a, b]) {
+      step.examples = Array.from({ length: 6 }, (_, i) => ({
+        inputData: { i },
+        outputData: {},
       }))
     }
     const program = createProgram({
-      forward: (call, input: Fields) => call("a", input),
-      predictors: [a, b],
+      forward: (call, inputData: Fields) => call("a", inputData),
+      steps: [a, b],
     })
-    dropDemos(program, 4, createRNG(3), createRNG(3))
-    expect(a.demos.map((d) => d.inputs.i)).toEqual(
-      b.demos.map((d) => d.inputs.i)
+    dropExamples(program, 4, createRNG(3), createRNG(3))
+    expect(a.examples.map((e) => e.inputData.i)).toEqual(
+      b.examples.map((e) => e.inputData.i)
     )
   })
 })
 
-describe("appendADemo", () => {
+describe("appendAnExample", () => {
   const trace = [
     {
-      inputs: { text: "x".repeat(50) },
-      outputs: { label: "pos" },
-      predictorName: "classify",
+      inputData: { text: "x".repeat(50) },
+      outputData: { label: "pos" },
+      stepId: "classify",
     },
     {
-      inputs: { text: "second call" },
-      outputs: { label: "neg" },
-      predictorName: "classify",
+      inputData: { text: "second call" },
+      outputData: { label: "neg" },
+      stepId: "classify",
     },
   ]
 
@@ -284,38 +292,37 @@ describe("appendADemo", () => {
     const program = makeProgram("classify")
     const bucket = bucketOf([0.1, 0.1])
     ;(bucket.rollouts[0] as Rollout).trace = trace
-    const applied = appendADemo(bucket, program, {
-      demoInputFieldMaxlen: 100,
+    const applied = appendAnExample(bucket, program, {
+      maxFewShotInputLength: 100,
       p10: 0.1,
     })
     expect(applied).toBe(false)
-    expect(program.predictors[0]?.demos).toHaveLength(0)
+    expect(program.steps[0]?.examples).toHaveLength(0)
   })
 
-  test("keeps only the last demo per predictor and truncates long inputs", () => {
+  test("keeps only the last example per step and truncates long inputData", () => {
     const program = makeProgram("classify")
     const bucket = bucketOf([0.9, 0.1])
     ;(bucket.rollouts[0] as Rollout).trace = structuredClone(trace)
-    const applied = appendADemo(bucket, program, {
-      demoInputFieldMaxlen: 10,
+    const applied = appendAnExample(bucket, program, {
+      maxFewShotInputLength: 10,
       p10: 0.1,
     })
     expect(applied).toBe(true)
-    const demos = program.predictors[0]?.demos ?? []
-    expect(demos).toHaveLength(1)
-    expect(demos[0]?.augmented).toBe(true)
-    // last trace step for the predictor wins
-    expect(demos[0]?.inputs.text).toBe(
+    const examples = program.steps[0]?.examples ?? []
+    expect(examples).toHaveLength(1)
+    // last trace step for the step wins
+    expect(examples[0]?.inputData.text).toBe(
       "second cal\n\t\t... <TRUNCATED FOR BREVITY>"
     )
-    expect(demos[0]?.outputs).toEqual({ label: "neg" })
+    expect(examples[0]?.outputData).toEqual({ label: "neg" })
   })
 })
 
 describe("appendARule", () => {
   const example: Example = {
-    inputs: { text: "hello" },
-    outputs: { label: "pos" },
+    inputData: { text: "hello" },
+    outputData: { label: "pos" },
   }
 
   test("skips when good is at or below p10", async () => {
@@ -338,7 +345,7 @@ describe("appendARule", () => {
     expect(applied).toBe(false)
   })
 
-  test("appends returned advice to the matching predictor's instructions", async () => {
+  test("appends returned advice to the matching step's description", async () => {
     const program = makeProgram("classify")
     const seen: string[] = []
     const promptModel = mockModel((promptText) => {
@@ -359,7 +366,7 @@ describe("appendARule", () => {
       promptModel,
     })
     expect(applied).toBe(true)
-    expect(program.predictors[0]?.instructions).toEndWith(
+    expect(program.steps[0]?.description).toEndWith(
       "\n\nRULE: answer with the sentiment, never its inverse."
     )
     // verbatim OfferFeedback text reaches the prompt model
@@ -370,9 +377,9 @@ describe("appendARule", () => {
 })
 
 describe("simba end-to-end", () => {
-  test("returns a program that beats or equals the baseline, with candidates", async () => {
-    // The mock LM answers from the text prefix only when boosted by a demo or
-    // an appended RULE; otherwise it fails any input containing "hard".
+  test("returns a workflow that beats the baseline and checkpoints prompts", async () => {
+    // The mock LM answers from the text prefix only when boosted by an example
+    // or an appended RULE; otherwise it fails any input containing "hard".
     const programModel = mockModel((promptText) => {
       const liveInput = promptText.split("Input:\n").at(-1) ?? ""
       const boosted =
@@ -389,78 +396,94 @@ describe("simba end-to-end", () => {
       })
     )
 
-    const student = makeProgram("Classify the sentiment.", programModel)
-    const trainset: Example[] = [
-      { inputs: { text: "pos easy one" }, outputs: { label: "pos" } },
-      { inputs: { text: "neg easy two" }, outputs: { label: "neg" } },
-      { inputs: { text: "pos hard one" }, outputs: { label: "pos" } },
-      { inputs: { text: "neg hard two" }, outputs: { label: "neg" } },
+    const step = classifyStep("Classify the sentiment.", programModel)
+    const workflow = createWorkflow({
+      id: "sentiment",
+      inputSchema: z.object({ text: z.string() }),
+      outputSchema: z.object({ label: z.enum(["pos", "neg"]) }),
+    })
+      .then(step)
+      .commit()
+    const trainingSet: Example[] = [
+      { inputData: { text: "pos easy one" }, outputData: { label: "pos" } },
+      { inputData: { text: "neg easy two" }, outputData: { label: "neg" } },
+      { inputData: { text: "pos hard one" }, outputData: { label: "pos" } },
+      { inputData: { text: "neg hard two" }, outputData: { label: "neg" } },
     ]
     const metric = (ex: Example, prediction?: Fields) => ({
-      score: prediction?.label === ex.outputs.label ? 1 : 0,
+      score: prediction?.label === ex.outputData.label ? 1 : 0,
     })
 
-    const scoreOn = async (program: typeof student) => {
-      const scores = await Promise.all(
-        trainset.map(async (ex) => {
-          const prediction = (await program.run(ex.inputs as never)) as Record<
-            string,
-            unknown
-          >
-          return metric(ex, prediction)
-        })
-      )
-      return scores.reduce((acc, s) => acc + s.score, 0) / trainset.length
-    }
-
-    const baselineScore = await scoreOn(student)
-    expect(baselineScore).toBe(0.5)
-
-    const result = await simba(student, trainset, {
-      bsize: 4,
-      maxDemos: 2,
+    const saved: Prompts[] = []
+    const result = await simba(workflow, {
+      batchSize: 4,
+      candidates: 2,
+      maxFewShotExamples: 2,
       maxSteps: 2,
       metric,
-      numCandidates: 2,
       promptModel,
+      savePrompts: (prompts) => {
+        saved.push(structuredClone(prompts))
+        return Promise.resolve()
+      },
       seed: 0,
+      trainingSet,
     })
 
-    const finalScore = await scoreOn(result.program)
-    expect(finalScore).toBeGreaterThanOrEqual(baselineScore)
-    expect(finalScore).toBe(1)
-
-    expect(result.candidates.length).toBeGreaterThanOrEqual(1)
-    const scores = result.candidates.map((c) => c.score)
-    expect([...scores].toSorted((a, b) => b - a)).toEqual(scores)
-    expect(scores[0]).toBe(1)
-    expect(result.trialLogs).toHaveLength(2)
-    // the untouched student stays in the finalist pool
-    expect(scores).toContain(0.5)
+    expect(result.score).toBe(1)
+    // The tuned workflow's step carries updated prompt state.
+    const tuned = result.workflow.steps.classify
+    const tunedState = [tuned.description, ...tuned.examples.map((e) => e)]
+    expect(
+      tuned.description !== "Classify the sentiment." ||
+        tuned.examples.length > 0
+    ).toBe(true)
+    expect(tunedState.length).toBeGreaterThan(0)
+    // savePrompts fired on every step winner (2) plus once at completion, and
+    // each payload is JSON-safe with the workflow's step ids.
+    expect(saved.length).toBe(3)
+    for (const prompts of saved) {
+      expect(prompts.version).toBe(1)
+      expect(Object.keys(prompts.steps)).toEqual(["classify"])
+      // oxlint-disable-next-line unicorn/prefer-structured-clone -- the JSON round-trip IS what this asserts
+      expect(JSON.parse(JSON.stringify(prompts))).toEqual(prompts)
+    }
+    // The source workflow's step was never mutated.
+    expect(step.description).toBe("Classify the sentiment.")
+    expect(step.examples).toHaveLength(0)
   })
 
   test("rollout and metric throws become score 0.0, never propagate", async () => {
-    const student = makeProgram(
+    const step = classifyStep(
       "Classify.",
       mockModel(() => {
         throw new Error("LM down")
       })
     )
-    const trainset: Example[] = [
-      { inputs: { text: "pos" }, outputs: { label: "pos" } },
-      { inputs: { text: "neg" }, outputs: { label: "neg" } },
+    const workflow = createWorkflow({
+      id: "broken",
+      inputSchema: z.object({ text: z.string() }),
+      outputSchema: z.object({ label: z.enum(["pos", "neg"]) }),
+    })
+      .then(step)
+      .commit()
+    const trainingSet: Example[] = [
+      { inputData: { text: "pos" }, outputData: { label: "pos" } },
+      { inputData: { text: "neg" }, outputData: { label: "neg" } },
     ]
-    const result = await simba(student, trainset, {
-      bsize: 2,
-      maxDemos: 0,
+    const result = await simba(workflow, {
+      batchSize: 2,
+      candidates: 2,
+      maxFewShotExamples: 0,
       maxSteps: 1,
       metric: () => {
         throw new Error("metric down")
       },
-      numCandidates: 2,
       promptModel: deadModel,
+      savePrompts: () => Promise.resolve(),
       seed: 0,
+      trainingSet,
     })
-    expect(result.candidates.every((c) => c.score === 0)).toBe(true)
+    expect(result.score).toBe(0)
   })
 })

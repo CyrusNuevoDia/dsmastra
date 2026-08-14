@@ -1,4 +1,5 @@
 import type { Fields } from "@/fields"
+import type { Example } from "@/step"
 
 /**
  * What every metric hands back: a score, plus whatever else the metric wants to
@@ -13,3 +14,17 @@ export type MetricResult = { score: number } & Fields
 
 /** A metric's return, or a promise of one. */
 export type MetricOutput = MetricResult | Promise<MetricResult>
+
+export type Metric<TInput = Fields, TOutput = Fields> = (
+  example: Example<TInput, TOutput>,
+  prediction: TOutput | undefined
+) => MetricOutput
+
+/** Every expected field must match the prediction exactly for a score of 1. */
+export const exactMatch: Metric = (example, prediction) => ({
+  score: Object.entries(example.outputData).every(
+    ([key, value]) => prediction?.[key] === value
+  )
+    ? 1
+    : 0,
+})
