@@ -1,9 +1,14 @@
+---
+name: typescript
+description: TypeScript conventions for this repo — function shape, naming, types, arktype/es-toolkit usage, the Node/Bun runtime boundary, and tsc v7 caveats. Use when writing or reviewing any TypeScript in src/, ext/, tests/, or scripts/.
+---
+
 # TypeScript style
 
 How TypeScript is written in this repo — `src/`, `ext/`, `tests/`, and
 `scripts/` alike. Formatting and mechanical lint are ultracite's job
 (`just fmt`, never hand-fix); this doc covers the conventions a formatter
-can't see. Bun-only idioms for `scripts/` live in [bun.md](./bun.md).
+can't see. Bun-only idioms for `scripts/` live in [bun.md](./references/bun.md).
 
 ## Runtime boundary
 
@@ -23,8 +28,8 @@ const parseableChangesetPaths = (changesets: ChangedFile[]) =>
     changesets
       .filter((changeset) => changeset.status !== "D")
       .map(currentPath)
-      .filter(isChangesetPath)
-  ).toSorted()
+      .filter(isChangesetPath),
+  ).toSorted();
 ```
 
 Anything needing a block body — statements, guards, early returns — is a
@@ -37,8 +42,8 @@ breaks narrowing at every call site:
 
 ```ts
 function fail(message: string): never {
-  console.error(message)
-  process.exit(1)
+  console.error(message);
+  process.exit(1);
 }
 ```
 
