@@ -3,8 +3,11 @@
   "type": "module",
   "module": "src/index.ts",
   "scripts": {
-    "check": "ultracite check",
-    "fix": "ultracite fix"
+    "check": "just check",
+    "fmt": "just fmt",
+    "lint": "just lint",
+    "build": "just build",
+    "test": "just test"
   },
   "dependencies": {
     "@ai-sdk/openai": "^4.0.41",
@@ -13,9 +16,11 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.8",
+    "@oxlint/plugins": "1.78.0",
     "@types/bun": "^1.2.19",
-    "ultracite": "^7.10.3"
+    "oxfmt": "0.63.0",
+    "oxlint": "1.78.0",
+    "ultracite": "^7.10.4"
   },
   "peerDependencies": {
     "typescript": "^5"
