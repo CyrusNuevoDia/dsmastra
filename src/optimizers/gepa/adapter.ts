@@ -3,7 +3,6 @@ import type { LanguageModel } from "ai"
 
 import { at } from "@/collections"
 import type { Fields } from "@/fields"
-import type { MetricOutput, MetricResult } from "@/metrics"
 import type {
   Candidate,
   EvaluationBatch,
@@ -21,6 +20,8 @@ import {
   renderSideInfo,
   stringifyFields,
 } from "@/prompting"
+import type { MetricOutput, MetricResult } from "@/scorers"
+import type { ScoreTarget } from "@/step"
 
 /** A metric result that names the feedback field GEPA's reflection LM reads. */
 export type ScoreWithFeedback = MetricResult & { feedback?: string }
@@ -36,7 +37,9 @@ export type GEPAMetric<TInput = Fields, TOutput = Fields> = (
   prediction: TOutput | null,
   trace: GEPATraceStep[] | null,
   stepId?: string,
-  stepTrace?: GEPATraceStep[]
+  stepTrace?: GEPATraceStep[],
+  /** The rollout's Mastra trace linkage, when the engine produced one. */
+  target?: ScoreTarget
 ) => MetricOutput
 
 export type ReflectionModel =
@@ -45,6 +48,12 @@ export type ReflectionModel =
 
 const defaultFeedback = (score: number) =>
   `This trajectory got a score of ${score}.`
+
+/** The rollout's RunContext view: trace capture in, trace linkage out. */
+type RolloutContext = {
+  target?: ScoreTarget
+  trace: GEPATraceStep[]
+}
 
 export const runFeedbackMetric = async <TInput, TOutput>(
   metric: GEPAMetric<TInput, TOutput>,
@@ -163,17 +172,24 @@ export const createProgramAdapter = <TInput, TOutput>(
     const trajectories = await Promise.all(
       batch.map(async (example): Promise<Trajectory<TInput, TOutput>> => {
         const trace: GEPATraceStep[] = []
+        const ctx: RolloutContext = { trace }
         let prediction: TOutput | null = null
         try {
-          prediction = await built.run(example.inputData, {
-            trace,
-          })
+          prediction = await built.run(example.inputData, ctx)
         } catch (error) {
           console.warn(error)
         }
         let score = failureScore
         try {
-          ;({ score } = await metric(example, prediction, trace))
+          // ctx.target was written by the engine runner during the rollout.
+          ;({ score } = await metric(
+            example,
+            prediction,
+            trace,
+            undefined,
+            undefined,
+            ctx.target
+          ))
         } catch (error) {
           console.warn(error)
         }

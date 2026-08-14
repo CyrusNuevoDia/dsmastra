@@ -1,22 +1,18 @@
+import type { AnyWorkflow } from "@mastra/core/workflows"
 import { generateText, Output } from "ai"
 import type { LanguageModel } from "ai"
 import { z } from "zod"
 
 import { at, first, last } from "@/collections"
 import type { Fields } from "@/fields"
-import { exactMatch } from "@/metrics"
-import type { Metric } from "@/metrics"
-import {
-  programToWorkflow,
-  promptsOf,
-  workflowToProgram,
-} from "@/optimizers/utils"
-import type { SavePrompts } from "@/optimizers/utils"
+import { applyProgram, promptsOf, workflowToProgram } from "@/optimizers/utils"
+import type { Prompts, SavePrompts } from "@/optimizers/utils"
 import type { Example, Program } from "@/program"
 import { inspectModules, serializeField } from "@/prompting"
 import { createRNG, samplePoisson, shuffle, weightedChoice } from "@/random"
+import { resolveScorer, scorerMetric } from "@/scorers"
+import type { Metric, ScorerRef } from "@/scorers"
 import type { RunContext, TraceStep } from "@/step"
-import type { CommittedWorkflow, StepMap } from "@/workflow"
 
 export type SIMBAConfig = {
   batchSize?: number
@@ -25,12 +21,14 @@ export type SIMBAConfig = {
   maxFewShotExamples?: number
   maxFewShotInputLength?: number
   maxSteps?: number
-  /** Defaults to exact match on every expected field. */
-  metric?: Metric
   /** LM used to write rules; defaults to the first step's model. */
   promptModel?: LanguageModel
   samplingTemperature?: number
   savePrompts: SavePrompts
+  /** The optimization objective: a Mastra scorer, or its registration key on
+   * the workflow's Mastra instance. Its `reason` rides along as reward info
+   * for SIMBA's reflection. */
+  scorer: ScorerRef
   seed?: number
   teacherSettings?: { model: LanguageModel; temperature?: number }
   trainingSet: readonly Example[]
@@ -466,12 +464,10 @@ const runRollout = async <TInput, TOutput>(
   ctx: RunContext
 ): Promise<Rollout<TInput, TOutput>> => {
   const trace: TraceStep[] = []
+  const runCtx: RunContext = { ...ctx, trace }
   let prediction: TOutput | undefined
   try {
-    prediction = await program.run(example.inputData, {
-      ...ctx,
-      trace,
-    })
+    prediction = await program.run(example.inputData, runCtx)
   } catch (error) {
     console.warn(error)
   }
@@ -479,9 +475,11 @@ const runRollout = async <TInput, TOutput>(
   let score = 0
   let outputMetadata: Fields = {}
   try {
+    // runCtx.target was written by the engine runner during the rollout.
     const { score: metricScore, ...metadata } = await metric(
       example,
-      prediction
+      prediction,
+      runCtx.target
     )
     score = metricScore
     outputMetadata = metadata
@@ -763,26 +761,33 @@ export const simbaProgram = async <
  * Stochastic Introspective Mini-Batch Ascent: evolves step descriptions
  * (appended rules) and few-shot examples via mini-batch search.
  */
-export const simba = async <TSteps extends StepMap>(
-  workflow: CommittedWorkflow<TSteps>,
+export const simba = async (
+  workflow: AnyWorkflow,
   config: SIMBAConfig
-): Promise<{ score: number; workflow: CommittedWorkflow<TSteps> }> => {
-  const { metric, savePrompts, trainingSet, ...options } = config
+): Promise<{ candidates: [Prompts, { score: number }][]; score: number }> => {
+  const { savePrompts, scorer, trainingSet, ...options } = config
   const result = await simbaProgram(
     workflowToProgram(workflow),
     [...trainingSet],
     {
       ...options,
       batchSize: config.batchSize ?? Math.min(32, trainingSet.length),
-      metric: metric ?? exactMatch,
+      metric: scorerMetric(resolveScorer(workflow, scorer)),
       onImprovement: async (program) => {
         await savePrompts(promptsOf(program))
       },
     }
   )
   await savePrompts(promptsOf(result.program))
+  // The winner's prompt state lands in place on the caller's workflow.
+  applyProgram(workflow, result.program)
   return {
+    // Every finalist as a JSON-safe snapshot paired with its full-trainingSet
+    // score, best first.
+    candidates: result.candidates.map(({ program, score }) => [
+      promptsOf(program),
+      { score },
+    ]),
     score: result.score,
-    workflow: programToWorkflow(result.program, workflow),
   }
 }

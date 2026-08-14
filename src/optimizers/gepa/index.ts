@@ -1,21 +1,19 @@
+import type { AnyWorkflow } from "@mastra/core/workflows"
+
 import { at, first } from "@/collections"
 import type { Fields } from "@/fields"
-import { exactMatch } from "@/metrics"
-import type { Metric } from "@/metrics"
 import { bootstrapFewShotProgram } from "@/optimizers/bootstrap"
 import { createProgramAdapter } from "@/optimizers/gepa/adapter"
 import type { GEPAMetric, ReflectionModel } from "@/optimizers/gepa/adapter"
 import { aggregateScore, argmax, runGEPA } from "@/optimizers/gepa/engine"
 import type { Candidate, GEPAState } from "@/optimizers/gepa/engine"
-import {
-  programToWorkflow,
-  promptsOf,
-  workflowToProgram,
-} from "@/optimizers/utils"
-import type { SavePrompts } from "@/optimizers/utils"
+import { applyProgram, promptsOf, workflowToProgram } from "@/optimizers/utils"
+import type { Prompts, SavePrompts } from "@/optimizers/utils"
 import type { Example, Program } from "@/program"
 import { createRNG } from "@/random"
-import type { CommittedWorkflow, StepMap } from "@/workflow"
+import { resolveScorer, scorerMetric } from "@/scorers"
+import type { MetricOutput, ScorerRef } from "@/scorers"
+import type { ScoreTarget } from "@/step"
 
 // --- Budget -----------------------------------------------------------------
 
@@ -87,19 +85,22 @@ export type GEPAProgramConfig<TInput = Fields, TOutput = Fields> = EngineTuning<
 }
 
 export type GEPAConfig = EngineTuning<Fields, Fields> & {
-  /** Exactly one of `auto`, `maxFullEvals`, `maxMetricCalls` must be set. */
+  /** Exactly one of `auto`, `maxFullEvals`, `maxScorerCalls` must be set. */
   auto?: GEPAAuto
   /** When > 0, a bootstrapFewShot pre-pass installs few-shot examples first. */
   maxFewShotExamples?: number
   /** Labeled backfill cap for the pre-pass; defaults to maxFewShotExamples. */
   maxLabeledExamples?: number
   maxFullEvals?: number
-  maxMetricCalls?: number
-  /** Defaults to exact match on every expected field. */
-  metric?: Metric
+  /** Budget cap counted in scorer runs — DSPy's maxMetricCalls. */
+  maxScorerCalls?: number
   /** LM used to propose new descriptions; defaults to the first step's model. */
   reflectionModel?: ReflectionModel
   savePrompts: SavePrompts
+  /** The optimization objective: a Mastra scorer, or its registration key on
+   * the workflow's Mastra instance. Its `reason` (generateReason step) feeds
+   * GEPA's reflection LM as feedback. */
+  scorer: ScorerRef
   trainingSet: readonly Example[]
 }
 
@@ -282,21 +283,59 @@ export const gepaProgram = async <TInput, TOutput>(
  * (DSPy-style teleprompter composition); its metric calls are not billed to
  * GEPA's budget, matching DSPy.
  */
-export const gepa = async <TSteps extends StepMap>(
-  workflow: CommittedWorkflow<TSteps>,
+export const gepa = async (
+  workflow: AnyWorkflow,
   config: GEPAConfig
-): Promise<{ score: number; workflow: CommittedWorkflow<TSteps> }> => {
+): Promise<{ candidates: [Prompts, { score: number }][]; score: number }> => {
   const {
     maxFewShotExamples = 0,
     maxLabeledExamples,
-    metric: configMetric,
+    maxScorerCalls,
     reflectionModel,
     savePrompts,
+    scorer,
     trainingSet,
     ...tuning
   } = config
-  const metric = configMetric ?? exactMatch
   const examples = [...trainingSet]
+  const budgetKnobs = [tuning.auto, tuning.maxFullEvals, maxScorerCalls].filter(
+    (value) => value !== undefined
+  )
+  if (budgetKnobs.length !== 1) {
+    throw new Error(
+      "Exactly one of auto, maxFullEvals, maxScorerCalls must be set"
+    )
+  }
+  const metric = scorerMetric(resolveScorer(workflow, scorer))
+
+  // One scorer run per rollout: GEPA scores each rollout, then asks again for
+  // the selected step's feedback — the prediction object identifies its
+  // rollout, so the first result (score + reason-as-feedback) is reused.
+  // Rejections are evicted so a transient scorer failure isn't cached.
+  const cache = new WeakMap<object, Promise<Awaited<MetricOutput>>>()
+  const cachedMetric = (
+    gold: Example,
+    prediction: Fields | null,
+    target?: ScoreTarget
+  ): MetricOutput => {
+    if (prediction === null) {
+      return metric(gold, undefined, target)
+    }
+    const hit = cache.get(prediction)
+    if (hit) {
+      return hit
+    }
+    const pending = (async () => {
+      try {
+        return await metric(gold, prediction, target)
+      } catch (error) {
+        cache.delete(prediction)
+        throw error
+      }
+    })()
+    cache.set(prediction, pending)
+    return pending
+  }
 
   let student = workflowToProgram(workflow)
   if (maxFewShotExamples > 0) {
@@ -305,15 +344,16 @@ export const gepa = async <TSteps extends StepMap>(
       // A TOTAL cap per step, so the labeled backfill shares it instead of
       // DSPy's default 16 — unless the caller raises it explicitly.
       maxLabeledExamples: maxLabeledExamples ?? maxFewShotExamples,
-      // Same contract on both sides, so the user's metric passes straight through.
-      metric: (gold, prediction) => metric(gold, prediction ?? undefined),
+      metric: (gold, prediction) => cachedMetric(gold, prediction),
     })
   }
 
   const result = await gepaProgram(student, examples, {
     ...tuning,
-    // Any `feedback` the metric reported rides along — GEPA's reflection reads it.
-    metric: (gold, prediction) => metric(gold, prediction ?? undefined),
+    ...(maxScorerCalls !== undefined && { maxMetricCalls: maxScorerCalls }),
+    // The scorer's `reason` rides along as `feedback` — GEPA's reflection reads it.
+    metric: (gold, prediction, _trace, _stepId, _stepTrace, target) =>
+      cachedMetric(gold, prediction, target),
     onImprovement: async (program) => {
       await savePrompts(promptsOf(program))
     },
@@ -321,12 +361,31 @@ export const gepa = async <TSteps extends StepMap>(
       reflectionModel ?? first(student.steps, "workflow steps").model,
   })
   await savePrompts(promptsOf(result.program))
+  // The winner's prompt state lands in place on the caller's workflow.
+  applyProgram(workflow, result.program)
   return {
+    // Every candidate GEPA tried, as a JSON-safe snapshot paired with its
+    // validation aggregate score. Candidates are description-only; the
+    // snapshot carries the student's (possibly pre-pass-installed) examples.
+    candidates: result.candidates.map((candidate, idx) => {
+      const snapshot = student.clone()
+      for (const step of snapshot.steps) {
+        const description = candidate[step.id]
+        if (description !== undefined) {
+          step.description = description
+        }
+      }
+      return [
+        promptsOf(snapshot),
+        {
+          score: at(result.validationAggregateScores, idx, "aggregate scores"),
+        },
+      ]
+    }),
     score: at(
       result.validationAggregateScores,
       result.bestIdx,
       "aggregate scores"
     ),
-    workflow: programToWorkflow(result.program, workflow),
   }
 }

@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test"
 
+import { createScorer } from "@mastra/core/evals"
+import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { createWorkflow, declareStep, gepa } from "@/index"
+import { declareStep, gepa } from "@/index"
 import type { Example } from "@/index"
 
 import { model } from "../_helpers"
@@ -33,24 +35,37 @@ test(
       .then(step)
       .commit()
 
-    const { score, workflow: tuned } = await gepa(workflow, {
+    const doubling = createScorer({
+      description: "Exact match on y, with corrective feedback.",
+      id: "doubling",
+    })
+      .generateScore(({ run }) => {
+        const gold = run.groundTruth as { y: number }
+        const prediction = run.output as { y?: number } | undefined
+        return prediction?.y === gold.y ? 1 : 0
+      })
+      .generateReason(({ run }) => {
+        const input = run.input as { x: number }
+        const gold = run.groundTruth as { y: number }
+        const prediction = run.output as { y?: number } | undefined
+        return prediction?.y === gold.y
+          ? `Correct: for x=${input.x}, y=${gold.y}.`
+          : `Wrong: for x=${input.x} the answer should be y=${gold.y}, but the assistant returned y=${prediction?.y}.`
+      })
+
+    const { score } = await gepa(workflow, {
       // Few-shot pre-pass first, then description evolution — one call.
       maxFewShotExamples: 2,
-      maxMetricCalls: 60,
-      metric: (gold, prediction) => ({
-        feedback:
-          prediction?.y === gold.outputData.y
-            ? `Correct: for x=${gold.inputData.x}, y=${gold.outputData.y}.`
-            : `Wrong: for x=${gold.inputData.x} the answer should be y=${gold.outputData.y}, but the assistant returned y=${prediction?.y}.`,
-        score: prediction?.y === gold.outputData.y ? 1 : 0,
-      }),
+      maxScorerCalls: 60,
       reflectionModel: model,
       savePrompts: () => Promise.resolve(),
+      scorer: doubling,
       seed: 0,
       trainingSet,
     })
 
-    const tunedStep = tuned.steps.math
+    // Tuning is in place: the caller's own step reference carries the result.
+    const tunedStep = step
     console.log(`\n=== BEFORE ===\n${BAD_DESCRIPTION}`)
     console.log(`\n=== AFTER (score ${score}) ===\n${tunedStep.description}`)
     console.log("\n=== FEW-SHOT EXAMPLES (max 2) ===")

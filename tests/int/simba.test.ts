@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test"
 
 import { openai } from "@ai-sdk/openai"
+import { createScorer } from "@mastra/core/evals"
+import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { createWorkflow, declareStep, simba } from "@/index"
-import type { Metric } from "@/index"
+import { declareStep, simba } from "@/index"
 
 // A temperature-capable (non-reasoning) model: SIMBA's rollout sampling and
 // the rule strategy both need it.
@@ -33,19 +34,40 @@ const numbers: Record<string, number> = {
 
 // Graded: 1.0 for the spelled-out answer, 0.5 for the right number in the
 // wrong format, 0 otherwise.
-const metric: Metric = (example, prediction) => {
+const grade = (
+  expected: string,
+  prediction: Record<string, unknown> | undefined
+): { reason?: string; score: number } => {
   const answer = String(prediction?.answer ?? "")
     .trim()
     .toLowerCase()
-  const expected = example.outputData.answer as string
   if (answer === expected) {
     return { score: 1 }
   }
   if (Number(answer) === numbers[expected]) {
-    return { feedback: "Numerically right, but not spelled out.", score: 0.5 }
+    return { reason: "Numerically right, but not spelled out.", score: 0.5 }
   }
   return { score: 0 }
 }
+
+const spelledOutScorer = createScorer({
+  description: "Graded exact match on the spelled-out answer.",
+  id: "spelled-out",
+})
+  .generateScore(
+    ({ run }) =>
+      grade(
+        (run.groundTruth as { answer: string }).answer,
+        run.output as Record<string, unknown>
+      ).score
+  )
+  .generateReason(
+    ({ run, score }) =>
+      grade(
+        (run.groundTruth as { answer: string }).answer,
+        run.output as Record<string, unknown>
+      ).reason ?? `This trajectory got a score of ${score}.`
+  )
 
 test(
   "SIMBA teaches the answer-format convention",
@@ -68,34 +90,35 @@ test(
       .then(step)
       .commit()
 
-    const score = async (workflow: typeof wf) => {
+    // The optimizer tunes the caller's own step in place, so scoring reads
+    // the live step before and after.
+    const score = async () => {
       const scores = await Promise.all(
         trainingSet.map(async (ex) => {
-          const prediction = await workflow.steps.math.execute({
+          const prediction = await step.execute({
             inputData: ex.inputData,
           })
-          const result = await metric(ex, prediction)
-          return result.score
+          return grade(ex.outputData.answer, prediction).score
         })
       )
-      return scores.reduce((acc, s) => acc + s, 0) / trainingSet.length
+      return scores.reduce((acc: number, s) => acc + s, 0) / trainingSet.length
     }
 
-    const before = await score(wf)
+    const before = await score()
     expect(before).toBeLessThan(1)
 
-    const { workflow: tuned } = await simba(wf, {
+    await simba(wf, {
       batchSize: trainingSet.length,
       candidates: 3,
       maxFewShotExamples: 2,
       maxSteps: 3,
-      metric,
       savePrompts: () => Promise.resolve(),
+      scorer: spelledOutScorer,
       seed: 0,
       trainingSet,
     })
 
-    const after = await score(tuned)
+    const after = await score()
     console.log(`SIMBA int test: before=${before}, after=${after}`)
     expect(after).toBeGreaterThan(before)
   },

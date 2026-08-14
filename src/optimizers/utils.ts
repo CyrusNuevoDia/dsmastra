@@ -1,8 +1,11 @@
+import { RequestContext } from "@mastra/core/request-context"
+import type { AnyWorkflow, SingleStepEntry, Step } from "@mastra/core/workflows"
+
 import type { Fields } from "@/fields"
-import { createProgram } from "@/program"
 import type { Program } from "@/program"
-import type { AnyTunableStep, Example } from "@/step"
-import type { AnyStep, CommittedWorkflow, StepMap } from "@/workflow"
+import type { Metric } from "@/scorers"
+import type { AnyTunableStep, Example, RunContext } from "@/step"
+import { RUN_CONTEXT_KEY } from "@/step"
 
 /**
  * The tuned prompt state of a workflow: everything an optimizer changes and
@@ -22,59 +25,212 @@ export type Prompts = {
 // oxlint-disable-next-line anti-slop/no-unknown-returns -- deliberately permissive: callers may return whatever their storage layer returns (a write result, a DB row); the optimizers only await it
 export type SavePrompts = (prompts: Prompts) => Promise<unknown>
 
-const isTunableStep = (step: AnyStep): step is AnyTunableStep =>
+const isTunableStep = (step: Step): step is Step & AnyTunableStep =>
   "description" in step && "examples" in step && "clone" in step
 
-/** Narrow a workflow's steps to tunable ones, in insertion order. */
-export const tunableSteps = (workflow: CommittedWorkflow): AnyTunableStep[] =>
-  Object.values(workflow.steps).map((step) => {
-    if (!isTunableStep(step)) {
-      throw new Error(
-        `Step ${step.id} was not built with declareStep, so it cannot be optimized`
-      )
-    }
-    return step
-  })
+const singleEntrySteps = (entry: SingleStepEntry): Step[] =>
+  entry.type === "step" ? [entry.step] : []
 
-/** Steps run in insertion order, each feeding its output to the next. */
-export const workflowToProgram = (
-  workflow: CommittedWorkflow
-): Program<Fields, Fields> => {
-  const steps = tunableSteps(workflow).map((step) => step.clone())
-  return createProgram({
-    forward: async (call, inputData: Fields) => {
-      let data = inputData
-      for (const step of steps) {
-        // oxlint-disable-next-line no-await-in-loop -- sequential pipeline
-        data = await call(step.id, data)
+/**
+ * A workflow's tunable steps in graph order, read from Mastra's step graph.
+ * The walk descends into parallel, branch, loop, and foreach entries; steps
+ * that weren't built with `declareStep` (agents, tools, mappings, plain steps,
+ * nested workflows) pass through untouched — the engine runs them, the
+ * optimizers just don't tune them. Steps inside a nested workflow are opaque.
+ */
+export const tunableSteps = (workflow: AnyWorkflow): AnyTunableStep[] =>
+  workflow.stepGraph
+    .flatMap((entry) => {
+      switch (entry.type) {
+        case "parallel":
+        case "conditional": {
+          return entry.steps.flatMap(singleEntrySteps)
+        }
+        case "loop":
+        case "foreach": {
+          return singleEntrySteps(entry.step)
+        }
+        default: {
+          return "step" in entry ? [entry.step] : []
+        }
       }
-      return data
-    },
-    steps,
-  })
+    })
+    .filter((step) => isTunableStep(step))
+
+// --- The candidate gate -------------------------------------------------------
+//
+// Engine rollouts execute the workflow's LIVE steps, so a candidate's prompt
+// state must be installed on them before its rollouts run — and two candidates
+// must never be in flight at once. The gate serializes across holders (one
+// candidate's step array identifies it) while letting one holder's rollouts
+// run concurrently.
+
+type CandidateSteps = AnyTunableStep[]
+
+type Gate = {
+  count: number
+  holder: CandidateSteps | null
+  wake: (() => void)[]
+}
+
+const gates = new WeakMap<AnyWorkflow, Gate>()
+
+const acquire = async (
+  workflow: AnyWorkflow,
+  holder: CandidateSteps
+): Promise<{ fresh: boolean; gate: Gate }> => {
+  let gate = gates.get(workflow)
+  if (!gate) {
+    gate = { count: 0, holder: null, wake: [] }
+    gates.set(workflow, gate)
+  }
+  while (gate.count > 0 && gate.holder !== holder) {
+    const { promise, resolve } = Promise.withResolvers()
+    gate.wake.push(resolve)
+    // oxlint-disable-next-line no-await-in-loop -- waiting for the gate to clear is the point
+    await promise
+  }
+  const fresh = gate.holder !== holder
+  gate.holder = holder
+  gate.count += 1
+  return { fresh, gate }
+}
+
+const releaseGate = (gate: Gate): void => {
+  gate.count -= 1
+  if (gate.count === 0) {
+    // Forget the holder: a candidate mutated between evaluation waves (SIMBA
+    // strategies edit step state in place) must reinstall, not be trusted as
+    // already current.
+    gate.holder = null
+    for (const wake of gate.wake.splice(0)) {
+      wake()
+    }
+  }
 }
 
 /**
- * Rebuild a workflow from a tuned program. The program's steps ARE real
- * tunable steps, so the map is just re-keyed by id; carrying them over keeps
- * the workflow re-optimizable.
+ * Wrap a workflow as a Program whose rollouts run through Mastra's engine —
+ * any graph shape works, and every run shows up in Mastra observability. Each
+ * clone carries its own prompt state (a candidate); `run` installs that state
+ * onto the live steps under the gate, starts an engine run with the
+ * RunContext smuggled through the request context, and maps a non-success
+ * run to a throw (callers score it as a failure).
  */
-export const programToWorkflow = <TSteps extends StepMap>(
-  program: Program<Fields, Fields>,
-  source: CommittedWorkflow<TSteps>
-): CommittedWorkflow<TSteps> => {
-  const tunedSteps: StepMap = {}
-  for (const stepId of Object.keys(source.steps)) {
-    const tuned = program.steps.find((step) => step.id === stepId)
-    if (!tuned) {
-      throw new Error(`Tuned program lost step ${stepId}`)
-    }
-    tunedSteps[stepId] = tuned
+export const workflowToProgram = (
+  workflow: AnyWorkflow
+): Program<Fields, Fields> => {
+  const liveSteps = tunableSteps(workflow)
+  if (liveSteps.length === 0) {
+    throw new Error(
+      `Workflow ${workflow.id} has no declareStep steps to optimize`
+    )
   }
-  // SAFETY: the loop writes exactly one entry per key of `source.steps`, so the
-  // rebuilt map has precisely the keys `TSteps` declares — the optimizer
-  // replaces each step's prompt state, never the set of steps.
-  return { steps: tunedSteps as TSteps }
+  const code = `workflow ${workflow.id}: ${liveSteps
+    .map((step) => step.id)
+    .join(" -> ")}`
+
+  const make = (steps: AnyTunableStep[]): Program<Fields, Fields> => ({
+    clone: () => make(steps.map((step) => step.clone())),
+    code,
+    run: async (inputData: Fields, ctx?: RunContext): Promise<Fields> => {
+      const { fresh, gate } = await acquire(workflow, steps)
+      try {
+        if (fresh) {
+          const byId = new Map(steps.map((step) => [step.id, step]))
+          for (const live of liveSteps) {
+            const candidate = byId.get(live.id)
+            if (!candidate) {
+              throw new Error(`Candidate program lost step ${live.id}`)
+            }
+            live.description = candidate.description
+            live.examples = structuredClone(candidate.examples)
+          }
+        }
+        // Live-eval scorers attached to steps are disabled for the rollout:
+        // the optimizer scores through its own scorer, and letting both run
+        // would double every evaluation (Mastra's runEvals does the same).
+        const run = await workflow.createRun({ disableScorers: true })
+        const result = await run.start({
+          inputData,
+          requestContext: new RequestContext([[RUN_CONTEXT_KEY, ctx]]),
+        })
+        if (result.status !== "success") {
+          throw result.status === "failed" && result.error instanceof Error
+            ? result.error
+            : new Error(
+                `Workflow ${workflow.id} run ended with status ${result.status}`
+              )
+        }
+        if (ctx) {
+          // Trace linkage for the scorer: scores attach to this rollout's
+          // trace in Mastra observability when tracing is configured.
+          ctx.target = { spanId: result.spanId, traceId: result.traceId }
+        }
+        // SAFETY: a successful run's `result` was produced by the workflow's
+        // final step and validated against its output schema by the engine;
+        // `Fields` is the optimizers' untyped view of that same record.
+        return result.result as Fields
+      } finally {
+        releaseGate(gate)
+      }
+    },
+    steps,
+  })
+
+  return make(liveSteps.map((step) => step.clone()))
+}
+
+/**
+ * Write a tuned program's prompt state back onto the workflow's live steps.
+ * Mutates in place on purpose: the caller's own step references — and any
+ * Mastra instance the workflow is registered with — see the tuned prompts
+ * immediately, and the same workflow instance stays re-optimizable.
+ */
+export const applyProgram = <TWorkflow extends AnyWorkflow>(
+  workflow: TWorkflow,
+  program: Program<Fields, Fields>
+): TWorkflow => {
+  for (const step of tunableSteps(workflow)) {
+    const tuned = program.steps.find((candidate) => candidate.id === step.id)
+    if (!tuned) {
+      throw new Error(`Tuned program lost step ${step.id}`)
+    }
+    step.description = tuned.description
+    step.examples = structuredClone(tuned.examples)
+  }
+  return workflow
+}
+
+/**
+ * Mean metric score of a program over a set of examples, rollouts running
+ * concurrently through the program (and so through Mastra's engine for
+ * workflow-backed programs). A failed rollout or metric throw scores 0, same
+ * as the optimizers' own rollout handling. Deliberate divergence from DSPy,
+ * which leaves its few-shot compilers unscored (the evaluation in
+ * `BootstrapFewShot._bootstrap` is commented out upstream).
+ */
+export const evaluateProgram = async (
+  program: Program<Fields, Fields>,
+  examples: readonly Example[],
+  metric: Metric
+): Promise<number> => {
+  const scores = await Promise.all(
+    examples.map(async (example) => {
+      const ctx: RunContext = {}
+      try {
+        const prediction = await program.run(example.inputData, ctx)
+        const { score } = await metric(example, prediction, ctx.target)
+        return score
+      } catch (error) {
+        console.warn(error)
+        return 0
+      }
+    })
+  )
+  return (
+    scores.reduce((sum, score) => sum + score, 0) / Math.max(scores.length, 1)
+  )
 }
 
 /** Snapshot a program's tuned prompt state as a JSON-safe payload. */
@@ -92,19 +248,20 @@ export const promptsOf = (program: Program<Fields, Fields>): Prompts => ({
 })
 
 /**
- * Apply saved prompts to a workflow, returning a new workflow with the state
- * installed — the input is never mutated. Throws when the prompts' step ids
- * don't exactly match the workflow's, so a stale snapshot fails loudly instead
- * of half-applying. Parsing and storage are the caller's problem.
+ * Apply saved prompts to a workflow's live steps, in place, and return the
+ * same workflow. Throws when the prompts' step ids don't exactly match the
+ * workflow's, so a stale snapshot fails loudly instead of half-applying.
+ * Parsing and storage are the caller's problem.
  */
-export const loadPrompts = <TSteps extends StepMap>(
-  workflow: CommittedWorkflow<TSteps>,
+export const loadPrompts = <TWorkflow extends AnyWorkflow>(
+  workflow: TWorkflow,
   prompts: Prompts
-): CommittedWorkflow<TSteps> => {
-  const workflowIds = Object.keys(workflow.steps)
+): TWorkflow => {
+  const steps = tunableSteps(workflow)
+  const workflowIds = steps.map((step) => step.id)
   const promptIds = Object.keys(prompts.steps)
   const missing = workflowIds.filter((id) => !(id in prompts.steps))
-  const unknown = promptIds.filter((id) => !(id in workflow.steps))
+  const unknown = promptIds.filter((id) => !workflowIds.includes(id))
   if (missing.length > 0 || unknown.length > 0) {
     throw new Error(
       `Prompts do not match the workflow's steps${
@@ -112,18 +269,13 @@ export const loadPrompts = <TSteps extends StepMap>(
       }${unknown.length > 0 ? `; unknown: ${unknown.join(", ")}` : ""}`
     )
   }
-  const tunedSteps: StepMap = {}
-  for (const step of tunableSteps(workflow)) {
+  for (const step of steps) {
     const saved = prompts.steps[step.id]
     if (!saved) {
       throw new Error(`Prompts lost step ${step.id}`)
     }
-    const tuned = step.clone()
-    tuned.description = saved.description
-    tuned.examples = structuredClone(saved.examples)
-    tunedSteps[step.id] = tuned
+    step.description = saved.description
+    step.examples = structuredClone(saved.examples)
   }
-  // SAFETY: same invariant as `programToWorkflow` — one entry per key of
-  // `workflow.steps`, so the map carries precisely the keys `TSteps` declares.
-  return { steps: tunedSteps as TSteps }
+  return workflow
 }

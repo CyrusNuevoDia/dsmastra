@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
+import { createWorkflow } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
@@ -21,7 +22,8 @@ import type { Example, Program } from "@/program"
 import { createProgram } from "@/program"
 import { createRNG, samplePoisson } from "@/random"
 import { declareStep } from "@/step"
-import { createWorkflow } from "@/workflow"
+
+import { fakeScorer } from "./helpers"
 
 const usage = {
   inputTokens: {
@@ -410,9 +412,9 @@ describe("simba end-to-end", () => {
       { inputData: { text: "pos hard one" }, outputData: { label: "pos" } },
       { inputData: { text: "neg hard two" }, outputData: { label: "neg" } },
     ]
-    const metric = (ex: Example, prediction?: Fields) => ({
-      score: prediction?.label === ex.outputData.label ? 1 : 0,
-    })
+    const scorer = fakeScorer((gold, prediction) =>
+      prediction?.label === gold.outputData.label ? 1 : 0
+    )
 
     const saved: Prompts[] = []
     const result = await simba(workflow, {
@@ -420,25 +422,31 @@ describe("simba end-to-end", () => {
       candidates: 2,
       maxFewShotExamples: 2,
       maxSteps: 2,
-      metric,
       promptModel,
       savePrompts: (prompts) => {
         saved.push(structuredClone(prompts))
         return Promise.resolve()
       },
+      scorer,
       seed: 0,
       trainingSet,
     })
 
     expect(result.score).toBe(1)
-    // The tuned workflow's step carries updated prompt state.
-    const tuned = result.workflow.steps.classify
-    const tunedState = [tuned.description, ...tuned.examples.map((e) => e)]
+    // Tuning lands in place: the caller's own step reference carries the
+    // updated prompt state.
     expect(
-      tuned.description !== "Classify the sentiment." ||
-        tuned.examples.length > 0
+      step.description !== "Classify the sentiment." || step.examples.length > 0
     ).toBe(true)
-    expect(tunedState.length).toBeGreaterThan(0)
+    // Finalists come back as [snapshot, { score }] pairs, best first, and the
+    // top-level score is the winner's.
+    expect(result.candidates.length).toBeGreaterThanOrEqual(1)
+    for (const [snapshot, { score: candidateScore }] of result.candidates) {
+      expect(snapshot.version).toBe(1)
+      expect(Object.keys(snapshot.steps)).toEqual(["classify"])
+      expect(candidateScore).toBeGreaterThanOrEqual(0)
+    }
+    expect(result.candidates[0]?.[1].score).toBe(result.score)
     // savePrompts fired on every step winner (2) plus once at completion, and
     // each payload is JSON-safe with the workflow's step ids.
     expect(saved.length).toBe(3)
@@ -448,9 +456,6 @@ describe("simba end-to-end", () => {
       // oxlint-disable-next-line unicorn/prefer-structured-clone -- the JSON round-trip IS what this asserts
       expect(JSON.parse(JSON.stringify(prompts))).toEqual(prompts)
     }
-    // The source workflow's step was never mutated.
-    expect(step.description).toBe("Classify the sentiment.")
-    expect(step.examples).toHaveLength(0)
   })
 
   test("rollout and metric throws become score 0.0, never propagate", async () => {
@@ -476,11 +481,11 @@ describe("simba end-to-end", () => {
       candidates: 2,
       maxFewShotExamples: 0,
       maxSteps: 1,
-      metric: () => {
-        throw new Error("metric down")
-      },
       promptModel: deadModel,
       savePrompts: () => Promise.resolve(),
+      scorer: fakeScorer(() => {
+        throw new Error("scorer down")
+      }),
       seed: 0,
       trainingSet,
     })

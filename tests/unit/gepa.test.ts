@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test"
 
+import type { RequestContext } from "@mastra/core/request-context"
+import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
 import type { Fields } from "@/fields"
@@ -25,8 +27,10 @@ import type { Prompts } from "@/optimizers/utils"
 import { createProgram } from "@/program"
 import type { Example, Program } from "@/program"
 import { extractInstructionText } from "@/prompting"
-import type { AnyTunableStep } from "@/step"
-import { createWorkflow } from "@/workflow"
+import type { AnyTunableStep, RunContext } from "@/step"
+import { RUN_CONTEXT_KEY } from "@/step"
+
+import { fakeScorer } from "./helpers"
 
 const zero = () => 0
 
@@ -450,32 +454,49 @@ test("rejected merge still bills its subsample eval", async () => {
 
 // --- Adapter: evaluate never throws ------------------------------------------
 
-const makeMathStep = (id: string): AnyTunableStep => {
-  const step: AnyTunableStep = {
-    clone: () => {
-      const cloned = makeMathStep(id)
-      cloned.description = step.description
-      cloned.examples = structuredClone(step.examples)
-      return cloned
+const makeMathStep = (id: string) => {
+  const inputSchema = z.object({ x: z.number() })
+  const outputSchema = z.object({ y: z.number() })
+  const execute = (
+    params: {
+      inputData: { x: number }
+      requestContext?: RequestContext
     },
-    description: "identity",
-    examples: [],
-    execute: ({ inputData }, ctx) => {
-      const x = inputData.x as number
-      if (x === 3 && !step.description.includes("double")) {
-        throw new Error("boom")
-      }
-      const y = step.description.includes("double") ? x * 2 : x
-      ctx?.trace?.push({ inputData, outputData: { y }, stepId: id })
-      return Promise.resolve({ y })
-    },
-    id,
-    inputSchema: z.object({ x: z.number() }),
-    model: "stub" as never,
-    outputSchema: z.object({ y: z.number() }),
-    settings: {},
+    directCtx?: RunContext
+  ): Promise<{ y: number }> => {
+    const ctx =
+      directCtx ??
+      (params.requestContext?.get(RUN_CONTEXT_KEY) as RunContext | undefined)
+    const { inputData } = params
+    const { x } = inputData
+    // oxlint-disable-next-line no-use-before-define -- read at call time, after construction, so tuned descriptions are seen live
+    const doubles = tunable.description.includes("double")
+    if (x === 3 && !doubles) {
+      throw new Error("boom")
+    }
+    const y = doubles ? x * 2 : x
+    ctx?.trace?.push({ inputData, outputData: { y }, stepId: id })
+    return Promise.resolve({ y })
   }
-  return step
+  const tunable = Object.assign(
+    createStep({ execute, id, inputSchema, outputSchema }),
+    {
+      clone: () => {
+        const cloned = makeMathStep(id)
+        cloned.description = tunable.description
+        cloned.examples = structuredClone(tunable.examples)
+        return cloned
+      },
+      description: "identity",
+      examples: [] as Example[],
+      execute,
+      inputSchema,
+      model: "stub" as never,
+      outputSchema,
+      settings: {},
+    }
+  )
+  return tunable
 }
 
 const makeMathProgram = (): Program =>
@@ -586,22 +607,24 @@ test("autoBudget guards throw", () => {
   expect(() => autoBudget(1, 2, 4, 35, 0)).toThrow()
 })
 
-test("gepa budget knobs: exactly one of auto, maxFullEvals, maxMetricCalls", async () => {
+test("gepa budget knobs: exactly one of auto, maxFullEvals, maxScorerCalls", async () => {
   const savePrompts = () => Promise.resolve()
+  const scorer = fakeScorer(() => 0)
   await expect(
-    gepa(mathWorkflow(), { savePrompts, trainingSet: examples(2) })
+    gepa(mathWorkflow(), { savePrompts, scorer, trainingSet: examples(2) })
   ).rejects.toThrow(
-    "Exactly one of auto, maxFullEvals, maxMetricCalls must be set"
+    "Exactly one of auto, maxFullEvals, maxScorerCalls must be set"
   )
   await expect(
     gepa(mathWorkflow(), {
       maxFullEvals: 1,
-      maxMetricCalls: 1,
+      maxScorerCalls: 1,
       savePrompts,
+      scorer,
       trainingSet: examples(2),
     })
   ).rejects.toThrow(
-    "Exactly one of auto, maxFullEvals, maxMetricCalls must be set"
+    "Exactly one of auto, maxFullEvals, maxScorerCalls must be set"
   )
 })
 
@@ -612,28 +635,45 @@ test("gepa workflow: few-shot pre-pass runs un-billed, savePrompts checkpoints a
   }))
   let metricCalls = 0
   const saved: Prompts[] = []
-  const { score, workflow: tuned } = await gepa(mathWorkflow(), {
+  const mathStep = makeMathStep("math")
+  const workflow = createWorkflow({
+    id: "math",
+    inputSchema: z.object({ x: z.number() }),
+    outputSchema: z.object({ y: z.number() }),
+  })
+    .then(mathStep)
+    .commit()
+  const { candidates, score } = await gepa(workflow, {
     // Budget of 1: GEPA's own loop never runs (the seed eval exhausts it) —
     // yet the pre-pass still bootstrapped examples, proving its metric calls
     // are not billed against GEPA's budget.
     maxFewShotExamples: 2,
-    maxMetricCalls: 1,
-    metric: (gold, prediction) => {
-      metricCalls += 1
-      return { score: prediction?.y === gold.outputData.y ? 1 : 0 }
-    },
+    maxScorerCalls: 1,
     reflectionModel: () => Promise.resolve(""),
     savePrompts: (prompts) => {
       saved.push(structuredClone(prompts))
       return Promise.resolve()
     },
+    scorer: fakeScorer((gold, prediction) => {
+      metricCalls += 1
+      return prediction?.y === gold.outputData.y ? 1 : 0
+    }),
     trainingSet,
   })
   // Identity math step: x∈[4..7] all fail (y=x ≠ 2x)? No — identity returns
   // y=x, expected 2x, so bootstrap accepts none and backfills labeled ones.
-  const tunedStep = tuned.steps.math as AnyTunableStep
+  const tunedStep = mathStep
   expect(tunedStep.examples.length).toBeGreaterThan(0)
   expect(score).toBe(0)
+  // Each candidate pairs its snapshot with its validation score, and the
+  // top-level score is the winner's.
+  expect(candidates.length).toBeGreaterThanOrEqual(1)
+  for (const [snapshot, { score: candidateScore }] of candidates) {
+    expect(snapshot.version).toBe(1)
+    expect(Object.keys(snapshot.steps)).toEqual(["math"])
+    expect(Number.isNaN(candidateScore)).toBe(false)
+  }
+  expect(Math.max(...candidates.map(([, s]) => s.score))).toBe(score)
   // Final savePrompts always fires, carrying the tuned state.
   expect(saved.length).toBeGreaterThanOrEqual(1)
   const last = saved.at(-1) as Prompts

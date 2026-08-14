@@ -1,5 +1,7 @@
+import type { RequestContext } from "@mastra/core/request-context"
 import type { InferPublicSchema } from "@mastra/core/schema"
 import { createStep } from "@mastra/core/workflows"
+import type { Step } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
 import { generateText, Output } from "ai"
 import type { z } from "zod"
@@ -23,10 +25,24 @@ export type TraceStep = {
   stepId: string
 }
 
+/**
+ * The request-context key rollouts use to hand a RunContext to steps executed
+ * by Mastra's engine.
+ */
+export const RUN_CONTEXT_KEY = "dsmastra"
+
+/** A rollout's Mastra trace linkage, for attaching scores to it in Studio. */
+export type ScoreTarget = {
+  spanId?: string
+  traceId?: string
+}
+
 /** Per-run overrides and trace capture, threaded through a whole program run. */
 export type RunContext = {
   model?: LanguageModel
   seed?: number
+  /** Written by the engine runner after a successful run — see workflowToProgram. */
+  target?: ScoreTarget
   temperature?: number
   trace?: TraceStep[]
 }
@@ -58,6 +74,10 @@ export type StepConfig<
   inputSchema: TInputSchema
   model: LanguageModel
   outputSchema: TOutputSchema
+  /** Mastra live-eval scorers, forwarded to the step verbatim. Optimizer
+   * rollouts disable these (they run with `disableScorers`) and score through
+   * the optimizer's own scorer instead. */
+  scorers?: Step["scorers"]
 }
 
 /**
@@ -89,6 +109,7 @@ export type TunableStep<
   inputSchema: TInputSchema
   model: LanguageModel
   outputSchema: TOutputSchema
+  scorers?: Step["scorers"]
   settings: StepSettings
 }
 
@@ -108,6 +129,7 @@ export const declareStep = <
     inputSchema,
     model,
     outputSchema,
+    scorers,
     ...settings
   } = config
 
@@ -136,22 +158,51 @@ export const declareStep = <
     return outputData
   }
 
+  // One execute serves both callers. Mastra's engine passes its own params
+  // object, recognizable by the requestContext it always carries — there the
+  // input is re-parsed and the RunContext (rollout overrides + trace capture)
+  // is read from the reserved request-context key. The optimizers call with
+  // bare inputData and an explicit RunContext.
+  const runStep = (
+    params: {
+      inputData: z.infer<TInputSchema>
+      requestContext?: RequestContext
+    },
+    ctx?: RunContext
+  ): Promise<z.infer<TOutputSchema>> => {
+    if (params.requestContext) {
+      // SAFETY: only dsmastra's own rollout executor writes this key, and it
+      // always writes a RunContext (or nothing at all).
+      const engineCtx = params.requestContext.get(RUN_CONTEXT_KEY) as
+        | RunContext
+        | undefined
+      return execute(
+        { inputData: inputSchema.parse(params.inputData) },
+        engineCtx
+      )
+    }
+    return execute(params, ctx)
+  }
+
   const step = createStep({
     description,
-    execute: async ({ inputData }) => {
-      const outputData = await execute({
-        inputData: inputSchema.parse(inputData),
-      })
-      // SAFETY: `outputData` came back from `execute`, which parses it through
-      // `config.outputSchema` — the very schema Mastra derives its expected step
-      // output from. Both sides agree on the runtime shape; the assertion only
-      // bridges zod's `output<T>` and Mastra's `InferPublicSchema<T>`, two
-      // spellings of that same type that TS cannot equate while `T` is generic.
-      return outputData as InferPublicSchema<TOutputSchema>
-    },
+    // SAFETY: `runStep` resolves through `execute`, which parses its result
+    // with `config.outputSchema` — the very schema Mastra derives its expected
+    // step output from. Both sides agree on the runtime shape; the assertion
+    // only bridges zod's `output<T>` and Mastra's `InferPublicSchema<T>`, two
+    // spellings of that same type that TS cannot equate while `T` is generic.
+    execute: async ({ inputData, requestContext }) =>
+      // SAFETY: the engine's inputData is typed via InferPublicSchema, zod's
+      // own output type under another name; runStep re-parses it with the
+      // schema before use, so the assertion never outruns validation.
+      (await runStep({
+        inputData: inputData as z.infer<TInputSchema>,
+        requestContext,
+      })) as InferPublicSchema<TOutputSchema>,
     id,
     inputSchema,
     outputSchema,
+    scorers,
   })
 
   // Mastra's step stores the schemas re-wrapped as standard-schema objects and
@@ -168,13 +219,15 @@ export const declareStep = <
         inputSchema,
         model: tunable.model,
         outputSchema,
+        scorers: tunable.scorers,
       }),
     description,
     examples: structuredClone(examples ?? []),
-    execute,
+    execute: runStep,
     inputSchema,
     model,
     outputSchema,
+    scorers,
     settings,
   })
 

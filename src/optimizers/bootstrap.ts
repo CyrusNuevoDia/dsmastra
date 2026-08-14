@@ -2,9 +2,9 @@ import type { LanguageModel } from "ai"
 
 import { at, last } from "@/collections"
 import type { Fields } from "@/fields"
-import type { MetricOutput } from "@/metrics"
 import type { Example, Program } from "@/program"
 import { createRNG, sample, shuffle } from "@/random"
+import type { MetricOutput } from "@/scorers"
 import type { RunContext, TraceStep } from "@/step"
 
 /**

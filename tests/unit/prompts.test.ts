@@ -1,21 +1,24 @@
 import { expect, test } from "bun:test"
 
+import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
 import { loadPrompts } from "@/optimizers/utils"
 import type { Prompts } from "@/optimizers/utils"
-import { createWorkflow } from "@/workflow"
 
 import { fakeStep } from "./helpers"
 
-const makeWorkflow = () =>
-  createWorkflow({
+const makeWorkflow = () => {
+  const step = fakeStep("solve", (inputData) => inputData)
+  const workflow = createWorkflow({
     id: "wf",
-    inputSchema: z.object({}),
-    outputSchema: z.object({}),
+    inputSchema: z.record(z.string(), z.unknown()),
+    outputSchema: z.record(z.string(), z.unknown()),
   })
-    .then(fakeStep("solve", (inputData) => inputData))
+    .then(step)
     .commit()
+  return { step, workflow }
+}
 
 const solvePrompts = {
   description: "tuned description",
@@ -27,28 +30,27 @@ const prompts: Prompts = {
   version: 1,
 }
 
-test("loadPrompts applies saved state to a new workflow without mutating the source", () => {
-  const workflow = makeWorkflow()
+test("loadPrompts applies saved state onto the workflow's live steps", () => {
+  const { step, workflow } = makeWorkflow()
   const restored = loadPrompts(workflow, prompts)
-  expect(restored).not.toBe(workflow)
-  expect(restored.steps.solve?.description).toBe("tuned description")
-  expect(restored.steps.solve?.examples).toEqual(solvePrompts.examples)
-  // The source workflow's step is untouched.
-  expect(workflow.steps.solve?.description).toBe("solve")
-  expect(workflow.steps.solve?.examples).toEqual([])
+  // In-place: the same workflow comes back and the caller's own step
+  // reference carries the tuned state.
+  expect(restored).toBe(workflow)
+  expect(step.description).toBe("tuned description")
+  expect(step.examples).toEqual(solvePrompts.examples)
 })
 
 test("prompts survive a JSON round-trip", () => {
-  const workflow = makeWorkflow()
+  const { step, workflow } = makeWorkflow()
   // oxlint-disable-next-line unicorn/prefer-structured-clone -- the JSON round-trip IS what this test verifies
   const revived = JSON.parse(JSON.stringify(prompts)) as Prompts
   expect(revived).toEqual(prompts)
-  const restored = loadPrompts(workflow, revived)
-  expect(restored.steps.solve?.description).toBe("tuned description")
+  loadPrompts(workflow, revived)
+  expect(step.description).toBe("tuned description")
 })
 
 test("loadPrompts throws on step-id mismatch in either direction", () => {
-  const workflow = makeWorkflow()
+  const { workflow } = makeWorkflow()
   expect(() => loadPrompts(workflow, { steps: {}, version: 1 })).toThrow(
     "missing: solve"
   )
@@ -58,4 +60,25 @@ test("loadPrompts throws on step-id mismatch in either direction", () => {
       version: 1,
     })
   ).toThrow("unknown: stray")
+})
+
+test("loadPrompts reaches tunable steps inside a parallel section", () => {
+  const left = fakeStep("left", (inputData) => inputData)
+  const right = fakeStep("right", (inputData) => inputData)
+  const parallelWorkflow = createWorkflow({
+    id: "wf-parallel",
+    inputSchema: z.record(z.string(), z.unknown()),
+    outputSchema: z.record(z.string(), z.unknown()),
+  })
+    .parallel([left, right])
+    .commit()
+  loadPrompts(parallelWorkflow, {
+    steps: {
+      left: { description: "tuned left", examples: [] },
+      right: { description: "tuned right", examples: [] },
+    },
+    version: 1,
+  })
+  expect(left.description).toBe("tuned left")
+  expect(right.description).toBe("tuned right")
 })
