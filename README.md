@@ -72,9 +72,10 @@ Bun-only (see `.mise.toml` — run `mise trust && mise install` if you're missin
 
 ```sh
 bun install
-bun test              # unit tests
-bun test tests/*.int.test.ts   # integration tests; need OPENAI_API_KEY in .env
-bun run check         # lint (ultracite/biome)
+just test             # unit tests (tests/unit), run concurrently
+just test-int         # integration tests (tests/int); need OPENAI_API_KEY in .env
+just check            # format check + lint + typecheck + unit tests
+just fmt              # format
 ```
 
 The `dspy/` directory is a reference clone of DSPy used for tracing the original optimizer implementations; it's not part of the package.
