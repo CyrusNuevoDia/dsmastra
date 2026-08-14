@@ -1,9 +1,20 @@
-import type { Example } from "@/simba"
+import type { TraceStep } from "@/predictor"
+import type { Example } from "@/program"
+import {
+  type RNG,
+  shuffle,
+  weightedChoice,
+  weightedChoiceStrict,
+} from "@/random"
 
-/** A candidate is a map of component (predictor) name → instruction text. */
+export type { RNG } from "@/random"
+
+/**
+ * A candidate is a map of component (predictor) name → instruction text,
+ * exactly upstream's dict[str, str]. Demos live on the program's predictors
+ * (bootstrapFewShot pre-pass) and flow through build_program untouched.
+ */
 export type Candidate = Record<string, string>
-
-export type RNG = () => number
 
 export type Trajectory = {
   example: Example
@@ -16,11 +27,8 @@ export type Trajectory = {
  * Trace steps as GEPA sees them. `parseFailure` carries the model's raw
  * response when the output couldn't be parsed into the expected format.
  */
-export type GEPATraceStep = {
-  inputs: Record<string, unknown>
-  outputs: Record<string, unknown>
+export type GEPATraceStep = TraceStep & {
   parseFailure?: string
-  predictorName: string
 }
 
 export type EvaluationBatch = {
@@ -62,7 +70,6 @@ export type GEPAAdapter = {
 
 export type GEPAState = {
   i: number
-  listOfNamedPredictors: string[]
   namedPredictorIdToUpdateNextForProgramCandidate: number[]
   numFullDSEvals: number
   numMetricCallsByDiscovery: number[]
@@ -86,30 +93,6 @@ export function aggregateScore(subscores: Map<number, number>): number {
     return Number.NEGATIVE_INFINITY
   }
   return sum([...subscores.values()]) / subscores.size
-}
-
-export function weightedChoice<T>(rng: RNG, items: T[], weights: number[]): T {
-  const total = sum(weights)
-  if (total <= 0 || !Number.isFinite(total)) {
-    return items[Math.floor(rng() * items.length)] as T
-  }
-  let r = rng() * total
-  for (const [idx, weight] of weights.entries()) {
-    r -= weight
-    if (r <= 0) {
-      return items[idx] as T
-    }
-  }
-  return items.at(-1) as T
-}
-
-function shuffle<T>(rng: RNG, items: T[]): void {
-  for (let i = items.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(rng() * (i + 1))
-    const a = items[i] as T
-    items[i] = items[j] as T
-    items[j] = a
-  }
 }
 
 /** argmax with lowest-index-wins ties. */
@@ -163,10 +146,12 @@ export function removeDominatedPrograms(
       members.add(idx)
     }
   }
+  // Stable sort by score alone: exact-score ties keep front-iteration
+  // encounter order, matching Python's sorted(programs, key=score).
   const ascending = [...members].sort(
     (a, b) =>
       (aggScores[a] ?? Number.NEGATIVE_INFINITY) -
-        (aggScores[b] ?? Number.NEGATIVE_INFINITY) || a - b
+      (aggScores[b] ?? Number.NEGATIVE_INFINITY)
   )
   const dominated = new Set<number>()
   let changed = true
@@ -226,27 +211,32 @@ export function createEpochShuffledSampler(
   const reshuffle = () => {
     shuffled = Array.from({ length: trainSize }, (_, i) => i)
     shuffle(rng, shuffled)
-    const counts = new Map<number, number>(shuffled.map((id) => [id, 1]))
+    // Counter insertion order = first-occurrence order in the shuffled list;
+    // Python pads with most_common()[::-1][0][0] — among the least-frequent
+    // ids, the one whose first occurrence is LATEST.
+    const counts = new Map<number, number>()
+    for (const id of shuffled) {
+      counts.set(id, (counts.get(id) ?? 0) + 1)
+    }
     while (shuffled.length % bsize !== 0) {
-      let pick = shuffled[0] as number
+      let pick = -1
+      let pickCount = Number.POSITIVE_INFINITY
       for (const [id, count] of counts) {
-        const pickCount = counts.get(pick) as number
-        if (count < pickCount || (count === pickCount && id < pick)) {
+        if (count <= pickCount) {
           pick = id
+          pickCount = count
         }
       }
       shuffled.push(pick)
-      counts.set(pick, (counts.get(pick) as number) + 1)
+      counts.set(pick, pickCount + 1)
     }
   }
 
   return (iteration: number): number[] => {
-    if (shuffled.length === 0) {
-      reshuffle()
-    }
     const base = iteration * bsize
-    const currEpoch = Math.floor(base / shuffled.length)
-    if (currEpoch > epoch) {
+    const currEpoch =
+      epoch === -1 ? 0 : Math.floor(base / Math.max(shuffled.length, 1))
+    if (shuffled.length === 0 || currEpoch > epoch) {
       epoch = currEpoch
       reshuffle()
     }
@@ -313,6 +303,7 @@ export function buildMergedCandidate(
 }
 
 export type MergeProposal = {
+  ancestor: number
   candidate: Candidate
   parentI: number
   parentJ: number
@@ -321,12 +312,14 @@ export type MergeProposal = {
 export type MergeMemory = {
   /** Merged candidates already produced, keyed per pair. */
   producedByPair: Set<string>
-  /** Ancestor triplets already tried — recorded before acceptance. */
+  /** Ancestor triplets already tried — recorded for the returned proposal only, before acceptance. */
   triedTriplets: Set<string>
 }
 
-const MERGE_OUTER_RETRIES = 10
-const MERGE_INNER_RETRIES = 10
+export const tripletKey = (ancestor: number, i: number, j: number) =>
+  `${ancestor}|${i}|${j}`
+
+const MERGE_MAX_ATTEMPTS = 10
 
 function candidateKey(candidate: Candidate): string {
   return JSON.stringify(
@@ -335,25 +328,23 @@ function candidateKey(candidate: Candidate): string {
 }
 
 /**
- * Ancestor-triplet search: sample two non-ancestral frontier survivors, find a
- * common ancestor that (a) doesn't outscore either descendant, (b) has a
- * component exactly one descendant changed, (c) wasn't already tried for the
- * pair — then build the merged candidate.
+ * One pair-sampling attempt loop (Python's find_common_ancestor_pair): sample
+ * two distinct non-ancestral survivors, then pick ONE aggregate-score-weighted
+ * common ancestor among those that (a) don't outscore either descendant,
+ * (b) have a component exactly one descendant changed, (c) aren't a tried
+ * triplet. No eligible ancestor → resample the pair.
  */
-export function proposeMerge(
+function findCommonAncestorPair(
   state: GEPAState,
   aggScores: number[],
+  survivors: number[],
   rng: RNG,
   memory: MergeMemory
-): MergeProposal | null {
-  const survivors = removeDominatedPrograms(
-    state.programAtParetoFrontValset,
-    aggScores
-  )
-  if (survivors.length < 2) {
-    return null
-  }
-  for (let outer = 0; outer < MERGE_OUTER_RETRIES; outer += 1) {
+): [number, number, number] | null {
+  for (let attempt = 0; attempt < MERGE_MAX_ATTEMPTS; attempt += 1) {
+    if (survivors.length < 2) {
+      return null
+    }
     const first = survivors[Math.floor(rng() * survivors.length)] as number
     const rest = survivors.filter((idx) => idx !== first)
     const second = rest[Math.floor(rng() * rest.length)] as number
@@ -364,9 +355,12 @@ export function proposeMerge(
     if (ancestorsI.has(j) || ancestorsJ.has(i)) {
       continue
     }
-    const common = [...ancestorsI].filter((idx) => ancestorsJ.has(idx))
-    for (let inner = 0; inner < MERGE_INNER_RETRIES; inner += 1) {
-      const eligible = common.filter((anc) => {
+    const eligible = [...ancestorsI]
+      .filter((idx) => ancestorsJ.has(idx))
+      .filter((anc) => {
+        if (memory.triedTriplets.has(tripletKey(anc, i, j))) {
+          return false
+        }
         const ancScore = aggScores[anc] ?? Number.NEGATIVE_INFINITY
         if (
           ancScore > (aggScores[i] ?? Number.NEGATIVE_INFINITY) ||
@@ -377,41 +371,85 @@ export function proposeMerge(
         const ancestor = state.programCandidates[anc] as Candidate
         const ci = state.programCandidates[i] as Candidate
         const cj = state.programCandidates[j] as Candidate
-        const hasLoneChange = Object.keys(ancestor).some((component) => {
+        return Object.keys(ancestor).some((component) => {
           const anc_ = ancestor[component]
           const di = ci[component]
           const dj = cj[component]
           return di !== dj && (anc_ === di || anc_ === dj)
         })
-        if (!hasLoneChange) {
-          return false
-        }
-        return !memory.triedTriplets.has(`${anc}|${i}|${j}`)
       })
-      if (eligible.length === 0) {
-        break
-      }
-      const ancestor = weightedChoice(
-        rng,
-        eligible,
-        eligible.map((anc) => aggScores[anc] ?? 0)
-      )
-      memory.triedTriplets.add(`${ancestor}|${i}|${j}`)
-      const merged = buildMergedCandidate(
-        state.programCandidates[ancestor] as Candidate,
-        state.programCandidates[i] as Candidate,
-        state.programCandidates[j] as Candidate,
-        aggScores[i] ?? Number.NEGATIVE_INFINITY,
-        aggScores[j] ?? Number.NEGATIVE_INFINITY,
-        rng
-      )
-      const pairKey = `${i}|${j}|${candidateKey(merged)}`
-      if (memory.producedByPair.has(pairKey)) {
-        continue
-      }
-      memory.producedByPair.add(pairKey)
-      return { candidate: merged, parentI: i, parentJ: j }
+    if (eligible.length === 0) {
+      continue
     }
+    // rng.choices parity: an all-zero weight total throws and aborts the run.
+    const ancestor = weightedChoiceStrict(
+      rng,
+      eligible,
+      eligible.map((anc) => aggScores[anc] ?? 0)
+    )
+    return [i, j, ancestor]
+  }
+  return null
+}
+
+/**
+ * Ancestor-triplet merge search (Python's
+ * sample_and_attempt_merge_programs_by_common_predictors): every failure —
+ * no triplet, duplicate merged candidate, insufficient val overlap —
+ * resamples a fresh pair rather than giving up. The tried-triplet memo is
+ * recorded by the CALLER for the returned proposal only.
+ */
+export function proposeMerge(
+  state: GEPAState,
+  aggScores: number[],
+  rng: RNG,
+  memory: MergeMemory,
+  valOverlapFloor = MERGE_VAL_OVERLAP_FLOOR
+): MergeProposal | null {
+  const survivors = removeDominatedPrograms(
+    state.programAtParetoFrontValset,
+    aggScores
+  )
+  if (survivors.length < 2 || state.parentProgramForCandidate.length < 3) {
+    return null
+  }
+  for (let attempt = 0; attempt < MERGE_MAX_ATTEMPTS; attempt += 1) {
+    const triplet = findCommonAncestorPair(
+      state,
+      aggScores,
+      survivors,
+      rng,
+      memory
+    )
+    if (!triplet) {
+      continue
+    }
+    const [i, j, ancestor] = triplet
+    if (memory.triedTriplets.has(tripletKey(ancestor, i, j))) {
+      continue
+    }
+    const merged = buildMergedCandidate(
+      state.programCandidates[ancestor] as Candidate,
+      state.programCandidates[i] as Candidate,
+      state.programCandidates[j] as Candidate,
+      aggScores[i] ?? Number.NEGATIVE_INFINITY,
+      aggScores[j] ?? Number.NEGATIVE_INFINITY,
+      rng
+    )
+    const pairKey = `${i}|${j}|${candidateKey(merged)}`
+    if (memory.producedByPair.has(pairKey)) {
+      continue
+    }
+    const subscoresI = state.progCandidateValSubscores[i] as Map<number, number>
+    const subscoresJ = state.progCandidateValSubscores[j] as Map<number, number>
+    const sharedIds = [...subscoresI.keys()].filter((valId) =>
+      subscoresJ.has(valId)
+    )
+    if (sharedIds.length < valOverlapFloor) {
+      continue
+    }
+    memory.producedByPair.add(pairKey)
+    return { ancestor, candidate: merged, parentI: i, parentJ: j }
   }
   return null
 }
@@ -451,15 +489,32 @@ export function buildMergeSubsample(
       tied.push(valId)
     }
   }
-  const chosen = [
-    ...sampleUpTo(rng, iBetter, MERGE_PER_BUCKET),
-    ...sampleUpTo(rng, jBetter, MERGE_PER_BUCKET),
-    ...sampleUpTo(rng, tied, MERGE_PER_BUCKET),
-  ]
-  const unused = sharedIds.filter((valId) => !chosen.includes(valId))
-  chosen.push(...sampleUpTo(rng, unused, MERGE_SUBSAMPLE_SIZE - chosen.length))
-  while (chosen.length < MERGE_SUBSAMPLE_SIZE) {
-    chosen.push(sharedIds[Math.floor(rng() * sharedIds.length)] as number)
+  const chosen: number[] = []
+  for (const bucket of [iBetter, jBetter, tied]) {
+    if (chosen.length >= MERGE_SUBSAMPLE_SIZE) {
+      break
+    }
+    const available = bucket.filter((valId) => !chosen.includes(valId))
+    const take = Math.min(
+      available.length,
+      MERGE_PER_BUCKET,
+      MERGE_SUBSAMPLE_SIZE - chosen.length
+    )
+    if (take > 0) {
+      chosen.push(...sampleUpTo(rng, available, take))
+    }
+  }
+  const remaining = MERGE_SUBSAMPLE_SIZE - chosen.length
+  if (remaining > 0) {
+    const unused = sharedIds.filter((valId) => !chosen.includes(valId))
+    if (unused.length >= remaining) {
+      chosen.push(...sampleUpTo(rng, unused, remaining))
+    } else if (sharedIds.length > 0) {
+      // Last resort: sample WITH replacement from all shared ids.
+      for (let k = 0; k < remaining; k += 1) {
+        chosen.push(sharedIds[Math.floor(rng() * sharedIds.length)] as number)
+      }
+    }
   }
   return chosen.slice(0, MERGE_SUBSAMPLE_SIZE)
 }
@@ -484,6 +539,11 @@ export async function runMergeIteration(
   if (!proposal) {
     return "none"
   }
+  // The tried-triplet memo is recorded for the returned proposal only,
+  // before its subsample eval and acceptance decision.
+  memory.triedTriplets.add(
+    tripletKey(proposal.ancestor, proposal.parentI, proposal.parentJ)
+  )
   const subscoresI = state.progCandidateValSubscores[proposal.parentI] as Map<
     number,
     number
@@ -495,9 +555,6 @@ export async function runMergeIteration(
   const sharedIds = [...subscoresI.keys()].filter((valId) =>
     subscoresJ.has(valId)
   )
-  if (sharedIds.length < MERGE_VAL_OVERLAP_FLOOR) {
-    return "none"
-  }
   const subsample = buildMergeSubsample(sharedIds, subscoresI, subscoresJ, rng)
   const batch = subsample.map((valId) => valset[valId] as Example)
   const mergedEval = await adapter.evaluate(batch, proposal.candidate, false)
@@ -604,7 +661,6 @@ export async function runGEPA(
   const seedEval = await adapter.evaluate(valset, options.seedCandidate, false)
   const state: GEPAState = {
     i: -1,
-    listOfNamedPredictors: componentNames,
     namedPredictorIdToUpdateNextForProgramCandidate: [0],
     numFullDSEvals: 1,
     numMetricCallsByDiscovery: [0],
@@ -684,8 +740,10 @@ export async function runGEPA(
       reflectiveDataset,
       componentsWithData
     )
+    // Python keeps empty extracted text as a real proposal; only an empty
+    // proposal DICT skips the round.
     const applicable = Object.entries(newTexts).filter(
-      ([name, text]) => name in parent && text.length > 0
+      ([name]) => name in parent
     )
     if (applicable.length === 0) {
       return
@@ -695,7 +753,9 @@ export async function runGEPA(
       child[name] = text
     }
 
-    const childEval = await adapter.evaluate(batch, child, false)
+    // Python evaluates children with capture_traces=True (used only for
+    // logging upstream, but it keeps the adapter call shape identical).
+    const childEval = await adapter.evaluate(batch, child, true)
     state.totalNumEvals += batch.length
 
     // Strict > on SUMS (not means) for reflection acceptance.
@@ -721,7 +781,6 @@ export async function runGEPA(
   while (state.totalNumEvals < options.maxMetricCalls) {
     state.i += 1
     if (options.useMerge && mergesDue > 0 && lastIterFoundNewProgram) {
-      // A merge iteration never also runs reflection, accepted or not.
       lastIterFoundNewProgram = false
       // biome-ignore lint/performance/noAwaitInLoops: iterations are inherently sequential
       const outcome = await runMergeIteration(
@@ -734,7 +793,11 @@ export async function runGEPA(
         mergesDue -= 1
         totalMergesTested += 1
       }
-      continue
+      // A PRODUCED merge proposal ends the iteration whether accepted or
+      // rejected; a fruitless search falls through to reflection.
+      if (outcome !== "none") {
+        continue
+      }
     }
     await runReflection()
   }

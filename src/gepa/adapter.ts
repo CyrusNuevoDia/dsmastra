@@ -1,5 +1,5 @@
 import { generateText, type LanguageModel } from "ai"
-import { z } from "zod"
+import type { z } from "zod"
 import type {
   Candidate,
   EvaluationBatch,
@@ -10,8 +10,8 @@ import type {
   RNG,
   Trajectory,
 } from "@/gepa/engine"
-import type { Program } from "@/program"
-import type { Example } from "@/simba"
+import { schemaProperties } from "@/predictor"
+import type { Example, Program } from "@/program"
 
 export type ScoreWithFeedback = { feedback?: string; score: number }
 
@@ -60,51 +60,55 @@ const PARSE_FAILURE_FEEDBACK_PREFIX =
   "Your output failed to parse. Follow this structure:\n"
 
 function expectedStructure(outputSchema: z.ZodType | undefined): string {
-  if (!outputSchema) {
-    return ""
-  }
-  try {
-    const jsonSchema = z.toJSONSchema(outputSchema) as {
-      properties?: Record<string, { type?: string }>
-    }
-    return Object.entries(jsonSchema.properties ?? {})
-      .map(([name, prop]) => `${name}: ${prop.type ?? "unknown"}`)
-      .join("\n")
-  } catch {
-    return ""
-  }
+  return Object.entries(schemaProperties(outputSchema))
+    .map(([name, prop]) => `${name}: ${prop.type ?? "unknown"}`)
+    .join("\n")
 }
 
 const MAX_HEADER_DEPTH = 6
 
-function renderValue(value: unknown, depth: number): string[] {
-  const header = "#".repeat(Math.min(depth, MAX_HEADER_DEPTH))
+/**
+ * Byte-for-byte port of the Python renderer: scalars end with a blank line
+ * (`value\n\n`), headers with a single newline, empty dicts/lists add a bare
+ * newline, and the depth cap applies on recursion.
+ */
+function renderValue(value: unknown, level: number): string {
+  const header = "#".repeat(level)
+  const nextLevel = Math.min(level + 1, MAX_HEADER_DEPTH)
   if (Array.isArray(value)) {
-    return value.flatMap((item, k) => [
-      `${header} Item ${k + 1}`,
-      ...renderValue(item, depth + 1),
-    ])
+    let s = ""
+    for (const [k, item] of value.entries()) {
+      s += `${header} Item ${k + 1}\n${renderValue(item, nextLevel)}`
+    }
+    if (value.length === 0) {
+      s += "\n"
+    }
+    return s
   }
   if (value !== null && typeof value === "object") {
-    return Object.entries(value as Record<string, unknown>).flatMap(
-      ([key, sub]) => [`${header} ${key}`, ...renderValue(sub, depth + 1)]
-    )
+    const entries = Object.entries(value as Record<string, unknown>)
+    let s = ""
+    for (const [key, sub] of entries) {
+      s += `${header} ${key}\n${renderValue(sub, nextLevel)}`
+    }
+    if (entries.length === 0) {
+      s += "\n"
+    }
+    return s
   }
-  return [String(value).trim()]
+  return `${String(value).trim()}\n\n`
 }
 
 /** Markdown rendering of the reflective dataset for `<side_info>`. */
 export function renderSideInfo(examples: ReflectiveExample[]): string {
   return examples
-    .map((example, n) =>
-      [
-        `# Example ${n + 1}`,
-        ...Object.entries(example).flatMap(([key, value]) => [
-          `## ${key}`,
-          ...renderValue(value, 3),
-        ]),
-      ].join("\n")
-    )
+    .map((example, n) => {
+      let s = `# Example ${n + 1}\n`
+      for (const [key, value] of Object.entries(example)) {
+        s += `## ${key}\n${renderValue(value, 3)}`
+      }
+      return s
+    })
     .join("\n\n")
 }
 
@@ -134,29 +138,38 @@ Provide the new instructions within \`\`\` blocks.`
 }
 
 const LANGUAGE_TAG = /^\S*\n/
+const LEADING_FENCE = /^```\S*\n?/
 
 /**
- * Fenced-block extraction: text between the first and last fences with a
- * leading language tag stripped; fall back to stripping a lone leading or
- * trailing fence, else the whole trimmed response.
+ * Byte-for-byte port of Python's output_extractor (which receives the
+ * response pre-stripped): text between the first and last fences with a
+ * leading language tag stripped; incomplete blocks fall back to stripping a
+ * leading fence (+ optional language tag and newline) or a trailing fence,
+ * else the whole trimmed response.
  */
 export function extractInstructionText(response: string): string {
-  const trimmed = response.trim()
-  const first = trimmed.indexOf("```")
-  const last = trimmed.lastIndexOf("```")
-  if (first !== -1 && last > first) {
-    return trimmed
-      .slice(first + 3, last)
-      .replace(LANGUAGE_TAG, "")
-      .trim()
+  const lmOut = response.trim()
+  const start = lmOut.indexOf("```") + 3
+  const end = lmOut.lastIndexOf("```")
+  if (start >= end) {
+    if (lmOut.startsWith("```")) {
+      const match = LEADING_FENCE.exec(lmOut)
+      if (match) {
+        return lmOut.slice(match[0].length).trim()
+      }
+      return lmOut
+    }
+    if (lmOut.endsWith("```")) {
+      return lmOut.slice(0, -3).trim()
+    }
+    return lmOut
   }
-  if (trimmed.startsWith("```")) {
-    return trimmed.slice(3).replace(LANGUAGE_TAG, "").trim()
+  let content = lmOut.slice(start, end)
+  const tag = LANGUAGE_TAG.exec(content)
+  if (tag) {
+    content = content.slice(tag[0].length)
   }
-  if (trimmed.endsWith("```")) {
-    return trimmed.slice(0, -3).trim()
-  }
-  return trimmed
+  return content.trim()
 }
 
 // --- Program adapter ---------------------------------------------------------
@@ -189,6 +202,9 @@ export function createProgramAdapter(
           return text
         }
 
+  // Instructions only, exactly like upstream build_program — the clone keeps
+  // whatever demos the student's predictors already carry (e.g. from a
+  // bootstrapFewShot pre-pass).
   const buildProgram = (candidate: Candidate): Program<never, unknown> => {
     const built = program.clone()
     for (const predictor of built.predictors) {
@@ -213,7 +229,7 @@ export function createProgramAdapter(
         const trace: GEPATraceStep[] = []
         let prediction: Record<string, unknown> | null = null
         try {
-          prediction = (await built.run(example.input as never, {
+          prediction = (await built.run(example.inputs as never, {
             trace,
           })) as Record<string, unknown>
         } catch (error) {
@@ -354,13 +370,17 @@ export function createProgramAdapter(
       )
       // biome-ignore lint/performance/noAwaitInLoops: sequential LM calls per component
       const response = await proposeText(prompt)
-      const text = extractInstructionText(response)
-      if (text.length > 0) {
-        texts[componentName] = text
-      }
+      // Python stores even an empty extraction — an empty-string instruction
+      // becomes a real child; only an empty proposal dict skips the round.
+      texts[componentName] = extractInstructionText(response)
     }
     return texts
   }
 
-  return { buildProgram, evaluate, makeReflectiveDataset, proposeNewTexts }
+  return {
+    buildProgram,
+    evaluate,
+    makeReflectiveDataset,
+    proposeNewTexts,
+  }
 }

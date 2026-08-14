@@ -10,8 +10,8 @@ import {
   type GEPAState,
   runGEPA,
 } from "@/gepa/engine"
-import type { Program } from "@/program"
-import { createRNG, type Example } from "@/simba"
+import type { Example, Program } from "@/program"
+import { createRNG } from "@/random"
 
 // --- Budget -----------------------------------------------------------------
 
@@ -147,6 +147,8 @@ export async function gepa<TInput, TOutput>(
   }
 
   const program = student as Program<never, unknown>
+  // Instruction text only, like upstream; the student's demos stay on its
+  // predictors and reach every candidate through buildProgram's clone.
   const seedCandidate: Candidate = Object.fromEntries(
     program.predictors.map((p) => [p.name, p.instructions])
   )

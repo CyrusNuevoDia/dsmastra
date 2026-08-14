@@ -1,19 +1,29 @@
 import type { z } from "zod"
+import { bootstrapFewShot } from "@/bootstrap"
 import { gepa } from "@/gepa"
 import type { AnyPredictor } from "@/predictor"
-import { createProgram, type Program } from "@/program"
+import { createProgram, type Example, type Program } from "@/program"
 import { type Metric, simba } from "@/simba"
 
+export {
+  type BootstrapConfig,
+  bootstrapFewShot,
+  labeledFewShot,
+} from "@/bootstrap"
 export { type GEPAConfig, type GEPAResult, gepa } from "@/gepa"
 export { declareStep } from "@/predictor"
+export type { Example } from "@/program"
 
 /**
  * A step as seen by the workflow builder. `never` on the input side keeps any
  * concretely-typed step assignable here without widening it to `any`.
+ * `predictor` is present on steps built by `declareStep` and is what
+ * `optimize` tunes.
  */
 export type StepLike<TInput = never, TOutput = unknown> = {
   execute: (params: { inputData: TInput }) => Promise<TOutput>
   id: string
+  predictor?: AnyPredictor
 }
 
 export type AnyStep = StepLike<never, unknown>
@@ -87,37 +97,28 @@ export const SIMBA = (config: OptimizerConfig): Optimizer => ({
   ...config,
 })
 
-export type Example = {
-  expected: Record<string, unknown>
-  input: Record<string, unknown>
-}
-
 /** Every expected field must match the prediction exactly for a score of 1. */
 const exactMatchMetric = (
   example: Example,
   prediction: Record<string, unknown> | null | undefined
 ) =>
-  Object.entries(example.expected).every(
+  Object.entries(example.outputs).every(
     ([key, value]) => prediction?.[key] === value
   )
     ? 1
     : 0
 
 /** Steps run in insertion order, each feeding its output to the next. */
-function workflowToProgram(workflow: CommittedWorkflow): {
-  predictors: AnyPredictor[]
-  program: Program<Record<string, unknown>, Record<string, unknown>>
-} {
-  const steps = Object.values(workflow.steps) as (AnyStep & {
-    predictor?: AnyPredictor
-  })[]
-  const predictors = steps.map((step) => {
+function workflowToProgram(
+  workflow: CommittedWorkflow
+): Program<Record<string, unknown>, Record<string, unknown>> {
+  const predictors = Object.values(workflow.steps).map((step) => {
     if (!step.predictor) {
       throw new Error(`Step ${step.id} has no predictor to optimize`)
     }
     return step.predictor
   })
-  const program = createProgram({
+  return createProgram({
     forward: async (call, input: Record<string, unknown>) => {
       let data = input
       for (const predictor of predictors) {
@@ -128,7 +129,6 @@ function workflowToProgram(workflow: CommittedWorkflow): {
     },
     predictors,
   })
-  return { predictors, program }
 }
 
 function programToSteps(
@@ -141,10 +141,12 @@ function programToSteps(
     if (!tuned) {
       throw new Error(`Tuned program lost predictor ${stepId}`)
     }
+    // Carrying the tuned predictor keeps the step re-optimizable.
     tunedSteps[stepId] = {
       execute: ({ inputData }: { inputData: Record<string, unknown> }) =>
         tuned.call(inputData as never) as Promise<Record<string, unknown>>,
       id: stepId,
+      predictor: tuned,
     }
   }
   return tunedSteps
@@ -156,7 +158,7 @@ export async function optimize<TSteps extends StepMap>(
   workflow: CommittedWorkflow<TSteps>,
   options: { trainset: readonly Example[] }
 ): Promise<CommittedWorkflow<TSteps>> {
-  const { predictors, program } = workflowToProgram(workflow)
+  const program = workflowToProgram(workflow)
   const stepIds = Object.keys(workflow.steps)
   const metric = optimizer.metric ?? exactMatchMetric
 
@@ -172,14 +174,40 @@ export async function optimize<TSteps extends StepMap>(
     return { steps: programToSteps(result.program, stepIds) as TSteps }
   }
 
-  // GEPA is instruction-only: maxDemos is ignored; maxSteps maps to full evals.
-  const result = await gepa(program, [...options.trainset], {
+  // Demos come from a BootstrapFewShot pre-pass (DSPy-style teleprompter
+  // composition): bootstrap installs demos on the predictors, then GEPA
+  // evolves instructions on the demo-carrying program. Bootstrap metric calls
+  // are not billed to GEPA's budget, matching DSPy.
+  let student = program
+  if (optimizer.maxDemos > 0) {
+    student = await bootstrapFewShot(program, [...options.trainset], {
+      maxBootstrappedDemos: optimizer.maxDemos,
+      // The wrapper's maxDemos is a TOTAL cap per predictor, so the labeled
+      // backfill shares it instead of DSPy's default 16.
+      maxLabeledDemos: optimizer.maxDemos,
+      metric: async (gold, prediction, _trace) => {
+        const output = await metric(gold, prediction ?? undefined)
+        return typeof output === "number" ? output : output.score
+      },
+    })
+  }
+
+  // maxSteps maps to full evals.
+  const result = await gepa(student, [...options.trainset], {
     maxFullEvals: optimizer.maxSteps,
+    // Feedback strings pass through — GEPA's reflection consumes them.
     metric: async (gold, prediction) => {
       const output = await metric(gold, prediction ?? undefined)
-      return typeof output === "number" ? output : { score: output.score }
+      if (typeof output === "number") {
+        return output
+      }
+      const { feedback, score } = output
+      return {
+        score,
+        ...(typeof feedback === "string" ? { feedback } : {}),
+      }
     },
-    reflectionLM: (predictors[0] as AnyPredictor).model,
+    reflectionLM: (program.predictors[0] as AnyPredictor).model,
     seed: optimizer.seed,
   })
   return { steps: programToSteps(result.program, stepIds) as TSteps }

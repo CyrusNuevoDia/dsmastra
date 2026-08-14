@@ -16,7 +16,7 @@ import {
   selectParetoParent,
   updateParetoFront,
 } from "@/gepa/engine"
-import type { Predictor } from "@/predictor"
+import type { Demo, Predictor } from "@/predictor"
 import { createProgram, type Program } from "@/program"
 import type { Example } from "@/simba"
 
@@ -24,8 +24,8 @@ const zero = () => 0
 
 function examples(n: number): Example[] {
   return Array.from({ length: n }, (_, id) => ({
-    expected: {},
-    input: { id },
+    inputs: { id },
+    outputs: {},
   }))
 }
 
@@ -121,6 +121,14 @@ test("epoch-shuffled sampler: windows, least-frequent padding, reshuffle boundar
   expect(sampler(3)).toEqual([1, 2])
 })
 
+test("sampler padding tie-break: least-frequent id with the LATEST first occurrence", () => {
+  // rng()=0.9 leaves [0,1,2] unshuffled; among the all-tied counts Python's
+  // most_common()[::-1] picks the latest-inserted id (2), not the lowest.
+  const sampler = createEpochShuffledSampler(() => 0.9, 3, 2)
+  expect(sampler(0)).toEqual([0, 1])
+  expect(sampler(1)).toEqual([2, 2])
+})
+
 // --- Instruction extraction --------------------------------------------------
 
 test("instruction extraction edge cases", () => {
@@ -134,6 +142,9 @@ test("instruction extraction edge cases", () => {
   expect(extractInstructionText("New instructions\n```")).toBe(
     "New instructions"
   )
+  // Python's leading-fence regex has an optional newline: "```x" is consumed
+  // entirely as fence + language tag, leaving an empty instruction.
+  expect(extractInstructionText("```x")).toBe("")
 })
 
 // --- Engine: acceptance, cursor, budget --------------------------------------
@@ -221,7 +232,10 @@ test("accepted child: full eval billed, discovery snapshot, cursor inheritance",
   )
   const state = await runGEPA(adapter, engineOptions({ maxMetricCalls: 14 }))
   expect(state.programCandidates.length).toBe(2)
-  expect(state.programCandidates[1]).toEqual({ c1: "better", c2: "s2" })
+  expect(state.programCandidates[1]).toEqual({
+    c1: "better",
+    c2: "s2",
+  })
   expect(state.parentProgramForCandidate[1]).toEqual([0])
   // Snapshot taken BEFORE billing the full eval: 4 seed + 3 + 3 = 10.
   expect(state.numMetricCallsByDiscovery[1]).toBe(10)
@@ -235,6 +249,35 @@ test("accepted child: full eval billed, discovery snapshot, cursor inheritance",
       ...(state.programAtParetoFrontValset.get(valId) as Set<number>),
     ]).toEqual([1])
   }
+})
+
+test("empty proposed text still produces a real child that gets evaluated", async () => {
+  // Python keeps an empty extraction as a proposal; only an empty proposal
+  // dict skips the round — so the child minibatch eval is still billed.
+  const adapter = scriptedAdapter(
+    () => 0.5,
+    () => ""
+  )
+  const state = await runGEPA(adapter, engineOptions({ maxMetricCalls: 16 }))
+  expect(state.programCandidates.length).toBe(1) // equal sums → rejected
+  // 4 seed + 2 iterations × (3 parent + 3 child) = 16, child evals included.
+  expect(state.totalNumEvals).toBe(16)
+})
+
+test("a fruitless merge search falls through to reflection in the same iteration", async () => {
+  const adapter = scriptedAdapter(
+    (candidate) => (candidate.c1 === "better" ? 1 : 0.5),
+    () => "better"
+  )
+  const state = await runGEPA(adapter, engineOptions({ maxMetricCalls: 26 }))
+  // Iteration 0 accepts (14 evals) and schedules a merge. Iteration 1's
+  // merge search finds only one frontier survivor → no proposal → the SAME
+  // iteration still runs reflection (parent minibatch billed, then the
+  // all-perfect skip). Every iteration after the first therefore bills 3:
+  // 14, 17, 20, 23, 26 → five iterations, ending at i=4 (burning the merge
+  // iteration would end at i=5).
+  expect(state.totalNumEvals).toBe(26)
+  expect(state.i).toBe(4)
 })
 
 test("budget is checked at the top of the loop only (bounded overshoot)", async () => {
@@ -255,9 +298,11 @@ function mergeLineageState(): GEPAState {
     { c1: "A", c2: "s" },
     { c1: "s", c2: "B" },
   ]
+  // The seed scores 0.25 everywhere: a zero-score ancestor would abort the
+  // run upstream (random.choices raises on an all-zero weight total).
   const subscore = (idx: number, valId: number): number => {
     if (idx === 0) {
-      return 0
+      return 0.25
     }
     const strongHalf = idx === 1 ? valId <= 2 : valId >= 3
     return strongHalf ? 1 : 0
@@ -278,7 +323,6 @@ function mergeLineageState(): GEPAState {
   }
   return {
     i: 0,
-    listOfNamedPredictors: ["c1", "c2"],
     namedPredictorIdToUpdateNextForProgramCandidate: [0, 0, 0],
     numFullDSEvals: 3,
     numMetricCallsByDiscovery: [0, 6, 12],
@@ -297,15 +341,30 @@ test("merge candidate construction on a hand-built lineage", () => {
     producedByPair: new Set<string>(),
     triedTriplets: new Set<string>(),
   }
-  const aggScores = [0, 0.5, 0.5]
+  const aggScores = [0.25, 0.5, 0.5]
   const proposal = proposeMerge(state, aggScores, zero, memory)
   expect(proposal).not.toBeNull()
   expect(proposal?.parentI).toBe(1)
   expect(proposal?.parentJ).toBe(2)
+  expect(proposal?.ancestor).toBe(0)
   // Per-component rule: each lone divergence from the ancestor wins.
   expect(proposal?.candidate).toEqual({ c1: "A", c2: "B" })
-  // The triplet is memoized before any acceptance decision.
-  expect(memory.triedTriplets.has("0|1|2")).toBe(true)
+  // The tried-triplet memo is the CALLER's job (recorded for the returned
+  // proposal only) — the search itself must not memoize.
+  expect(memory.triedTriplets.size).toBe(0)
+})
+
+test("all-zero ancestor weights abort the run (random.choices parity)", () => {
+  const state = mergeLineageState()
+  const memory = {
+    producedByPair: new Set<string>(),
+    triedTriplets: new Set<string>(),
+  }
+  // Ancestor aggregate 0 → weight total 0 → throws, like Python under
+  // raise_on_exception=True.
+  expect(() => proposeMerge(state, [0, 0.5, 0.5], zero, memory)).toThrow(
+    "Total of weights must be greater than zero"
+  )
 })
 
 test("merge subsample is balanced across better/worse/tied buckets", () => {
@@ -326,14 +385,15 @@ function mergeScoreAdapter(
 ): GEPAAdapter {
   return scriptedAdapter(
     (candidate, example) => {
-      const valId = example.input.id as number
-      if (candidate.c1 === "A" && candidate.c2 === "B") {
+      const valId = example.inputs.id as number
+      const { c1, c2 } = candidate
+      if (c1 === "A" && c2 === "B") {
         return mergedScore(valId)
       }
-      if (candidate.c1 === "A") {
+      if (c1 === "A") {
         return valId <= 2 ? 1 : 0
       }
-      if (candidate.c2 === "B") {
+      if (c2 === "B") {
         return valId >= 3 ? 1 : 0
       }
       return 0
@@ -359,6 +419,8 @@ test("merge acceptance is non-strict >= on subsample sums", async () => {
   expect(outcome).toBe("accepted")
   expect(state.programCandidates.length).toBe(4)
   expect(state.parentProgramForCandidate[3]).toEqual([1, 2])
+  // The triplet is memoized before the acceptance decision.
+  expect(memory.triedTriplets.has("0|1|2")).toBe(true)
   // 18 + 5 (subsample) + 6 (full valset eval) = 29.
   expect(state.totalNumEvals).toBe(29)
 })
@@ -403,6 +465,7 @@ function makeMathPredictor(name: string): MathPredictor {
     clone: () => {
       const cloned = makeMathPredictor(name)
       cloned.instructions = predictor.instructions
+      cloned.demos = structuredClone(predictor.demos)
       return cloned
     },
     demos: [],
@@ -439,24 +502,41 @@ test("evaluate never throws per example: failures score failureScore with null o
     warnOnScoreMismatch: true,
   })
   const batch: Example[] = [
-    { expected: { y: 1 }, input: { x: 1 } },
-    { expected: { y: 6 }, input: { x: 3 } },
+    { inputs: { x: 1 }, outputs: { y: 1 } },
+    { inputs: { x: 3 }, outputs: { y: 6 } },
   ]
   const result = await adapter.evaluate(batch, { math: "identity" }, false)
   expect(result.outputs).toEqual([{ y: 1 }, null])
   expect(result.scores).toEqual([1, -1])
 })
 
+// --- Demos flow through instruction-only candidates --------------------------
+
+test("student demos survive gepa untouched; candidates stay instruction-only", async () => {
+  const demo: Demo = { augmented: true, inputs: { x: 5 }, outputs: { y: 10 } }
+  const program = makeMathProgram()
+  ;(program.predictors[0] as Predictor).demos = [demo]
+  const result = await gepa(program, examples(3), {
+    maxMetricCalls: 1, // seed eval alone exceeds this → loop never runs
+    metric: () => 0,
+    reflectionLM: () => Promise.resolve(""),
+  })
+  // The candidate is a bare instruction map, exactly upstream's dict[str, str].
+  expect(result.candidates[0]).toEqual({ math: "identity" })
+  // The rebuilt best program still carries the pre-installed demos.
+  expect(result.program.predictors[0]?.demos).toEqual([demo])
+})
+
 // --- End-to-end toy run ------------------------------------------------------
 
 test("gepa e2e: budget enforced, best candidate beats or matches the seed", async () => {
   const trainset: Example[] = Array.from({ length: 6 }, (_, i) => ({
-    expected: { y: (i + 1) * 2 },
-    input: { x: i + 1 },
+    inputs: { x: i + 1 },
+    outputs: { y: (i + 1) * 2 },
   }))
   const result = await gepa(makeMathProgram(), trainset, {
     maxMetricCalls: 60,
-    metric: (gold, prediction) => (prediction?.y === gold.expected.y ? 1 : 0),
+    metric: (gold, prediction) => (prediction?.y === gold.outputs.y ? 1 : 0),
     reflectionLM: () =>
       Promise.resolve("```\nAlways double the input: return y = x * 2.\n```"),
     seed: 1,

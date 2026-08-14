@@ -2,6 +2,8 @@
 
 Authoritative flow of DSPy's GEPA optimizer, traced from `dspy/dspy/teleprompt/gepa/` plus the external `gepa` engine package (github.com/gepa-ai/gepa, which `GEPA.compile` delegates to via `gepa.optimize()`), written so we can replicate it in `src/`. GEPA evolves a pool of candidates — each candidate is a `{componentName: instructionText}` map — by reflective mutation: sample a parent from the Pareto frontier of per-validation-instance winners, run it on a small train minibatch with trace capture, feed the traces plus metric feedback to a reflection LM that rewrites one component's instructions, and keep the child only if its minibatch score improves. Accepted children get a full valset eval and can later be merged (crossover) with other frontier survivors.
 
+**Demos.** GEPA is strictly instruction-only: a candidate is a `{componentName: instructionText}` map and `build_program` swaps instructions only. Few-shot demos are not part of the search space — they come from composing teleprompters the DSPy way: run `bootstrapFewShot` (`src/bootstrap.ts`, ported from `dspy.teleprompt.bootstrap`) first to install demos on the program's predictors, then run GEPA on that demo-carrying program. Because `build_program` clones the student, the installed demos flow through every candidate untouched, and bootstrap's metric calls are never billed to GEPA's budget (the `n*5` "bootstrap allowance" in `auto_budget` is only an estimate line-item). The workflow-level `optimize()` wrapper does exactly this pre-pass when its `maxDemos > 0`.
+
 ## Source files
 
 DSPy wrapper (in-repo):
@@ -92,7 +94,9 @@ The engine is generic; the DSPy adapter supplies three operations. A port should
 ```text
 while total_num_evals < max_metric_calls:      // checked at top only
 ├─ A. merge attempt? (only if use_merge && merges_due > 0 && last iteration accepted a candidate)
-│     └─ whether accepted or rejected, the iteration ends here — no reflection this round
+│     └─ if a merge proposal was PRODUCED (accepted or rejected), the iteration ends here —
+│        no reflection this round; a fruitless search (no pair/ancestor/overlap found)
+│        falls through to reflection in the SAME iteration
 ├─ B. reflective mutation
 │  ├─ 1. parent = sample from Pareto frontier (see below)
 │  ├─ 2. minibatch = next reflection_minibatch_size train ids (epoch-shuffled, sequential)
@@ -103,7 +107,8 @@ while total_num_evals < max_metric_calls:      // checked at top only
 │  ├─ 5. build reflective dataset for that component; skip round if empty
 │  ├─ 6. reflection LM proposes new instruction text (one LM call per component, sequential)
 │  ├─ 7. child = parent with the proposed component text(s) replaced
-│  │     (empty proposal → skip round, no child eval; proposed names must already exist)
+│  │     (an empty proposal DICT → skip round, no child eval; an empty extracted STRING
+│  │      is kept and becomes a real child; proposed names must already exist)
 │  ├─ 8. eval child on the SAME minibatch                     (+bsize metric calls)
 │  ├─ 9. accept iff sum(child scores) > sum(parent scores)    (strict, sums not means)
 │  └─ 10. if accepted: full valset eval                       (+len(valset) calls)
@@ -131,7 +136,7 @@ Parent sampling (`"pareto"` strategy):
 
 ### Minibatch sampler (epoch-shuffled)
 
-- Per epoch: `shuffled = rng.shuffle(allTrainIds)`, then pad the tail to a multiple of `bsize` by repeatedly appending the currently least-frequently-used id (tracking per-id counts across padding).
+- Per epoch: `shuffled = rng.shuffle(allTrainIds)`, then pad the tail to a multiple of `bsize` by repeatedly appending the currently least-frequently-used id (tracking per-id counts across padding; ties break toward the id whose first occurrence is LATEST in the shuffled order — `most_common()[::-1]`).
 - Per iteration: `base = (iteration * bsize) % len(shuffled)`; serve `shuffled[base : base + bsize]`. Reshuffle when the un-offset `iteration * bsize` crosses an epoch boundary (`floor(base / len) > epoch`) or the trainset size changed. Repeat calls within one iteration offset by `callsThisIteration * bsize` without reshuffling.
 
 ### Reflective dataset
@@ -171,7 +176,7 @@ Read all the assistant responses and the corresponding feedback. Identify all ni
 Provide the new instructions within ``` blocks.
 ````
 
-`<side_info>` rendering: examples joined by `"\n\n"`, each as
+`<side_info>` rendering: examples joined by `"\n\n"`; headers end with a single `\n`, every scalar renders as `str(value).strip()` followed by a BLANK line (`\n\n`), and an empty dict/list contributes a bare `\n`. Each example:
 
 ```text
 # Example {n}
@@ -181,16 +186,16 @@ Provide the new instructions within ``` blocks.
 {str(value).strip()}
 ```
 
-**Output extraction**: take the text between the first and last ` ``` ` fences, stripping a leading language tag (`^\S*\n`), then trim. If there's no complete fenced block: strip a leading fence + language tag if the response starts with one, or a trailing fence if it ends with one, else use the whole trimmed response.
+**Output extraction** (the LM response is stripped first): take the text between the first and last ` ``` ` fences, stripping a leading language tag (`^\S*\n`), then trim. If there's no complete fenced block: strip a leading fence + language tag with OPTIONAL newline (`^```\S*\n?` — so a bare ` ```lang ` collapses to empty) if the response starts with a fence, or a trailing fence if it ends with one, else use the whole stripped response. Empty extractions are kept as real proposals.
 
 ### Merge (crossover)
 
 Attempted at the top of an iteration when the previous iteration accepted a candidate and `merges_due > 0`. `total_merges_tested` counts **accepted** merges and caps at `max_merge_invocations`; a rejected merge consumes neither counter (but does burn the iteration and its subsample eval).
 
-1. Pool = dominance-filtered frontier survivors. Sample two distinct candidates `i < j` (neither an ancestor of the other; up to 10 outer × 10 inner retries).
-2. Find a common ancestor (transitive closure over parent lineage) that (a) does not outscore either descendant (aggregate scores), (b) has at least one component where exactly one descendant changed it (`anc == one side && sides differ`), (c) wasn't already used for this pair. Pick among eligible ancestors weighted by aggregate score (`rng.choices` with score weights). Record the triplet as tried **immediately** — a rejected triplet is never retried.
-3. Build the merged candidate starting from a copy of the ancestor, per component: if the descendants agree, take that text; if only one differs from the ancestor, take the differing one's; if both differ, take the higher-aggregate-score descendant's (coin flip on exact tie). Skip if this exact merged candidate was already produced for this pair.
-4. Require ≥ 5 shared evaluated val ids between the parents (`merge_val_overlap_floor`). Build a 5-id eval subsample from the shared ids: partition into `i`-better / `j`-better / tied, take up to 2 (`max(1, ceil(5/3))`) from each bucket at random, top up from unused ids (sampling with replacement only as a last resort), truncate to 5.
+1. Pool = dominance-filtered frontier survivors (need ≥ 2, and ≥ 3 candidates overall). Search loop, up to 10 outer attempts, each of which resamples a FRESH pair on any failure: sample two distinct candidates `i < j` (up to 10 inner pair-sampling attempts; neither an ancestor of the other).
+2. For the sampled pair, find a common ancestor (transitive closure over parent lineage) that (a) does not outscore either descendant (aggregate scores), (b) has at least one component where exactly one descendant changed it (`anc == one side && sides differ`), (c) isn't an already-tried triplet. Pick ONE among eligible ancestors weighted by aggregate score (`rng.choices` with score weights — an all-zero weight total raises and, under `raise_on_exception`, aborts the whole run); no eligible ancestor → resample the pair. The tried-triplet memo is recorded only for the triplet actually RETURNED by the search — before its subsample eval and acceptance, so a rejected triplet is never retried, but triplets skipped mid-search remain available.
+3. Build the merged candidate starting from a copy of the ancestor, per component: if the descendants agree, take that text; if only one differs from the ancestor, take the differing one's; if both differ, take the higher-aggregate-score descendant's (coin flip on exact tie). Already produced this exact merged candidate for this pair, or < 5 shared evaluated val ids (`merge_val_overlap_floor`) → resample the pair.
+4. Build a 5-id eval subsample from the shared ids: partition into `i`-better / `j`-better / tied, take up to 2 (`max(1, ceil(5/3))`) from each bucket at random (capped by remaining capacity), top up from unused ids (sampling with replacement only as a last resort), truncate to 5.
 5. Eval the merged candidate on the subsample (no trace capture; bills metric calls). Accept iff `sum(merged) >= max(sum(parent_i on subsample), sum(parent_j on subsample))` — **non-strict `>=`**, unlike reflection's strict `>`. On accept: full valset eval, add to pool with `parents = [i, j]`, `merges_due--`, `total_merges_tested++`.
 
 ## State & result shapes
@@ -226,7 +231,7 @@ best_outputs_valset?: Map<valId, [idx, output][]>
 - One shared RNG drives parent selection, batch shuffling, and merge sampling; a second one picks trace steps in the reflective dataset. Distributions matter; exact Python streams don't.
 - Frontier updates and acceptance use exact float comparisons — no epsilon. Minibatch acceptance compares **sums**; frontier/best-candidate tracking uses **means** over val instances. Merge acceptance is `>=`; reflection acceptance is strict `>`.
 - The round-robin component cursor advances on the parent even when the proposal is rejected, and a new child inherits `max(parent cursors)`.
-- A merge iteration never also runs reflection, accepted or not.
+- A merge iteration that PRODUCES a proposal never also runs reflection, accepted or not — but a merge search that comes up empty falls through to reflection in the same iteration.
 - Every accepted candidate costs a full valset eval immediately — valset size is the main cost lever.
 - Failed rollouts must return `failure_score` rows, never throw; a thrown eval aborts the whole run.
 - Trace steps are matched to components by signature equality, not predictor name — after `with_instructions` the copies still compare equal because instructions are part of the signature being compared on both sides.
