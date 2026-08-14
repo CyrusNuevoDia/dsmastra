@@ -1,11 +1,9 @@
-import { generateObject } from "ai"
+import { generateText, Output } from "ai"
 import type { LanguageModel } from "ai"
 import { z } from "zod"
 
 import { at, first, last } from "@/collections"
 import type { Fields } from "@/fields"
-import type { JSONData } from "@/json"
-import { classifyJSON } from "@/json"
 import { exactMatch } from "@/metrics"
 import type { Metric } from "@/metrics"
 import {
@@ -336,39 +334,49 @@ const offerFeedbackSchema = (moduleNames: string[]) =>
       .describe(MODULE_ADVICE_DESCRIPTION),
   })
 
+/** A value that survives `JSON.stringify` unchanged. */
+type JSONData =
+  | JSONData[]
+  | boolean
+  | number
+  | string
+  | { [key: string]: JSONData }
+  | null
+
 /** Replace non-serializable values recursively, like dspy's recursive_mask. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is an open value until `classifyJSON` sorts it on the next line; that call is the boundary parse, and `JSONData` is the named type it returns
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is whatever the model produced and the schema accepted, so this genuinely meets an open value; `JSONData` is the named type it returns
 export const recursiveMask = (value: unknown): JSONData => {
-  const json = classifyJSON(value)
-  switch (json.kind) {
-    case "array": {
-      return json.items.map(recursiveMask)
+  if (value === null) {
+    return null
+  }
+  if (Array.isArray(value)) {
+    return value.map(recursiveMask)
+  }
+  /* oxlint-disable anti-slop/no-runtime-typeof -- this IS the parse step the rule asks for: an open value becomes `JSONData`, with anything unserializable replaced by a printable placeholder */
+  switch (typeof value) {
+    case "boolean":
+    case "number":
+    case "string": {
+      return value
     }
     case "object": {
       return Object.fromEntries(
-        json.entries.map(([k, v]) => [k, recursiveMask(v)])
+        Object.entries(value).map(([k, v]) => [k, recursiveMask(v)])
       )
     }
-    case "null": {
-      return null
-    }
-    case "primitive":
-    case "string": {
-      return json.value
-    }
     default: {
-      return json.description
+      return `<non-serializable: ${typeof value}>`
     }
   }
+  /* oxlint-enable anti-slop/no-runtime-typeof */
 }
 
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- same boundary as `recursiveMask`: the field value is open until `classifyJSON` sorts it
-const serializeField = (value: unknown): string => {
-  const json = classifyJSON(value)
-  return json.kind === "string"
-    ? json.value
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- same open boundary as `recursiveMask`: a field value is whatever the step produced
+const serializeField = (value: unknown): string =>
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- strings go into the prompt raw; everything else routes through `recursiveMask`, which is the parse
+  typeof value === "string"
+    ? value
     : JSON.stringify(recursiveMask(value), null, 2)
-}
 
 const fieldDescriptionLines = (schema: z.ZodType): string =>
   Object.entries(schemaProperties(schema))
@@ -411,12 +419,12 @@ export const offerFeedback = async (
     ([name, description]) =>
       `[[ ## ${name} ## ]]\n${description}\n\n${serializeField(fields[name])}`
   )
-  const { object } = await generateObject({
+  const { output } = await generateText({
     model: promptModel,
+    output: Output.object({ schema: offerFeedbackSchema(moduleNames) }),
     prompt: [OFFER_FEEDBACK_INSTRUCTIONS, ...sections].join("\n\n"),
-    schema: offerFeedbackSchema(moduleNames),
   })
-  return object
+  return output
 }
 
 /**

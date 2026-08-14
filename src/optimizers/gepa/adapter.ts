@@ -4,7 +4,6 @@ import type { z } from "zod"
 
 import { at } from "@/collections"
 import type { Fields } from "@/fields"
-import { classifyJSON } from "@/json"
 import type { MetricOutput, MetricResult } from "@/metrics"
 import type {
   Candidate,
@@ -58,10 +57,10 @@ export const runFeedbackMetric = async <TInput, TOutput>(
     stepId,
     stepTrace
   )
-  const feedback = classifyJSON(metadata.feedback)
+  const { feedback } = metadata
   return {
-    feedback:
-      feedback.kind === "string" ? feedback.value : defaultFeedback(score),
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- `feedback` is an optional field on an open metric result: the metric may omit it or return something else entirely, and the default string is the fallback
+    feedback: typeof feedback === "string" ? feedback : defaultFeedback(score),
     score,
   }
 }
@@ -86,7 +85,7 @@ const MAX_HEADER_DEPTH = 6
  * (`value\n\n`), headers with a single newline, empty dicts/lists add a bare
  * newline, and the depth cap applies on recursion.
  */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is open until `classifyJSON` sorts it below; that call is the boundary parse
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is whatever the model produced and the schema accepted, so the renderer genuinely meets an open value
 const renderValue = (value: unknown, level: number): string => {
   const header = "#".repeat(level)
   const nextLevel = Math.min(level + 1, MAX_HEADER_DEPTH)
@@ -100,9 +99,9 @@ const renderValue = (value: unknown, level: number): string => {
     }
     return s
   }
-  const json = classifyJSON(value)
-  if (json.kind === "object") {
-    const { entries } = json
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- objects nest into headers; every other JSON case renders as a scalar below
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value)
     let s = ""
     for (const [key, sub] of entries) {
       s += `${header} ${key}\n${renderValue(sub, nextLevel)}`

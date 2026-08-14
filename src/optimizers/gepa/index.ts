@@ -103,7 +103,7 @@ export type GEPAConfig = EngineTuning<Fields, Fields> & {
   trainingSet: readonly Example[]
 }
 
-const VALSET_SIZE_NOTE = 35
+const VALIDATION_SET_SIZE_NOTE = 35
 
 const resolveBudget = (
   config: {
@@ -152,18 +152,18 @@ const resolveBudget = (
 // --- Result -----------------------------------------------------------------
 
 export type GEPAProgramResult<TInput, TOutput> = {
-  /** argmax of valAggregateScores, lowest index winning ties. */
+  /** argmax of validationAggregateScores, lowest index winning ties. */
   bestIdx: number
   candidates: Candidate[]
   discoveryEvalCounts: number[]
-  fullValEvalsCount: number
+  fullValidationSetEvalsCount: number
   parents: (number | null)[][]
-  perValInstanceBestCandidates: Map<number, Set<number>>
+  perValidationInstanceBestCandidates: Map<number, Set<number>>
   program: Program<TInput, TOutput>
   seed: number
   totalMetricCalls: number
-  valAggregateScores: number[]
-  valSubscores: number[][]
+  validationAggregateScores: number[]
+  validationSubscores: number[][]
 }
 
 export const buildResult = <TInput, TOutput>(
@@ -172,30 +172,32 @@ export const buildResult = <TInput, TOutput>(
   seed: number,
   buildProgram: (candidate: Candidate) => Program<TInput, TOutput>
 ): GEPAProgramResult<TInput, TOutput> => {
-  const valAggregateScores = state.progCandidateValSubscores.map(aggregateScore)
-  const bestIdx = argmax(valAggregateScores)
+  const validationAggregateScores =
+    state.candidateValidationSubscores.map(aggregateScore)
+  const bestIdx = argmax(validationAggregateScores)
   return {
     bestIdx,
     candidates: state.programCandidates,
     discoveryEvalCounts: state.metricCallCountsByDiscovery,
-    fullValEvalsCount: state.fullDSEvalsCount,
+    fullValidationSetEvalsCount: state.fullValidationSetEvalsCount,
     parents: state.parentProgramForCandidate,
-    perValInstanceBestCandidates: state.programAtParetoFrontValidationSet,
+    perValidationInstanceBestCandidates:
+      state.programAtParetoFrontValidationSet,
     program: buildProgram(at(state.programCandidates, bestIdx, "candidates")),
     seed,
     totalMetricCalls: state.totalEvalsCount,
-    valAggregateScores,
-    valSubscores: Array.from(
+    validationAggregateScores,
+    validationSubscores: Array.from(
       { length: state.programCandidates.length },
       (_, idx) =>
         Array.from(
           { length: validationSetSize },
-          (_2, valId) =>
+          (_2, validationId) =>
             at(
-              state.progCandidateValSubscores,
+              state.candidateValidationSubscores,
               idx,
-              "candidate val subscores"
-            ).get(valId) ?? Number.NaN
+              "candidate validation subscores"
+            ).get(validationId) ?? Number.NaN
         )
     ),
   }
@@ -217,7 +219,7 @@ export const gepaProgram = async <TInput, TOutput>(
       "GEPA: no validationSet provided; using the trainingSet for validation."
     )
   }
-  if (validationSet.length > VALSET_SIZE_NOTE) {
+  if (validationSet.length > VALIDATION_SET_SIZE_NOTE) {
     console.warn(
       `GEPA: validationSet has ${validationSet.length} examples; every accepted candidate costs a full validationSet eval.`
     )
@@ -320,7 +322,11 @@ export const gepa = async <TSteps extends StepMap>(
   })
   await savePrompts(promptsOf(result.program))
   return {
-    score: at(result.valAggregateScores, result.bestIdx, "aggregate scores"),
+    score: at(
+      result.validationAggregateScores,
+      result.bestIdx,
+      "aggregate scores"
+    ),
     workflow: programToWorkflow(result.program, workflow),
   }
 }

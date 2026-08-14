@@ -233,13 +233,15 @@ test("accepted child: full eval billed, discovery snapshot, cursor inheritance, 
   // Snapshot taken BEFORE billing the full eval: 4 seed + 3 + 3 = 10.
   expect(state.metricCallCountsByDiscovery[1]).toBe(10)
   expect(state.totalEvalsCount).toBe(14)
-  expect(state.fullDSEvalsCount).toBe(2)
+  expect(state.fullValidationSetEvalsCount).toBe(2)
   // Child inherits max(parent cursors) = 1 (parent advanced c1 → c2).
   expect(state.stepIdToUpdateNextForCandidate[1]).toBe(1)
   // Frontier replaced by the strictly better child on every instance.
-  for (const valId of [0, 1, 2, 3]) {
+  for (const validationId of [0, 1, 2, 3]) {
     expect([
-      ...(state.programAtParetoFrontValidationSet.get(valId) as Set<number>),
+      ...(state.programAtParetoFrontValidationSet.get(
+        validationId
+      ) as Set<number>),
     ]).toEqual([1])
   }
   // The accepted child beat the seed's aggregate, so it checkpointed mid-run.
@@ -296,11 +298,11 @@ const mergeLineageState = (): GEPAState => {
   ]
   // The seed scores 0.25 everywhere: a zero-score ancestor would abort the
   // run upstream (random.choices raises on an all-zero weight total).
-  const subscore = (idx: number, valId: number): number => {
+  const subscore = (idx: number, validationId: number): number => {
     if (idx === 0) {
       return 0.25
     }
-    const strongHalf = idx === 1 ? valId <= 2 : valId >= 3
+    const strongHalf = idx === 1 ? validationId <= 2 : validationId >= 3
     return strongHalf ? 1 : 0
   }
   const subscores = candidates.map(
@@ -308,7 +310,8 @@ const mergeLineageState = (): GEPAState => {
       new Map(
         Array.from(
           { length: 6 },
-          (_2, valId) => [valId, subscore(idx, valId)] as [number, number]
+          (_2, validationId) =>
+            [validationId, subscore(idx, validationId)] as [number, number]
         )
       )
   )
@@ -318,12 +321,12 @@ const mergeLineageState = (): GEPAState => {
     updateParetoFront(front, frontPrograms, idx, scores)
   }
   return {
-    fullDSEvalsCount: 3,
+    candidateValidationSubscores: subscores,
+    fullValidationSetEvalsCount: 3,
     i: 0,
     metricCallCountsByDiscovery: [0, 6, 12],
     parentProgramForCandidate: [[null], [0], [0]],
     paretoFrontValidationSet: front,
-    progCandidateValSubscores: subscores,
     programAtParetoFrontValidationSet: frontPrograms,
     programCandidates: candidates,
     stepIdToUpdateNextForCandidate: [0, 0, 0],
@@ -367,30 +370,34 @@ test("merge subsample is balanced across better/worse/tied buckets", () => {
   const state = mergeLineageState()
   const sub = buildMergeSubsample(
     [0, 1, 2, 3, 4, 5],
-    state.progCandidateValSubscores[1] as Map<number, number>,
-    state.progCandidateValSubscores[2] as Map<number, number>,
+    state.candidateValidationSubscores[1] as Map<number, number>,
+    state.candidateValidationSubscores[2] as Map<number, number>,
     zero
   )
   expect(sub.length).toBe(5)
-  expect(sub.filter((valId) => valId <= 2).length).toBeGreaterThanOrEqual(2)
-  expect(sub.filter((valId) => valId >= 3).length).toBeGreaterThanOrEqual(2)
+  expect(
+    sub.filter((validationId) => validationId <= 2).length
+  ).toBeGreaterThanOrEqual(2)
+  expect(
+    sub.filter((validationId) => validationId >= 3).length
+  ).toBeGreaterThanOrEqual(2)
 })
 
 const mergeScoreAdapter = (
-  mergedScore: (valId: number) => number
+  mergedScore: (validationId: number) => number
 ): GEPAAdapter =>
   scriptedAdapter(
     (candidate, example) => {
-      const valId = example.inputData.id as number
+      const validationId = example.inputData.id as number
       const { c1, c2 } = candidate
       if (c1 === "A" && c2 === "B") {
-        return mergedScore(valId)
+        return mergedScore(validationId)
       }
       if (c1 === "A") {
-        return valId <= 2 ? 1 : 0
+        return validationId <= 2 ? 1 : 0
       }
       if (c2 === "B") {
-        return valId >= 3 ? 1 : 0
+        return validationId >= 3 ? 1 : 0
       }
       return 0
     },
@@ -404,7 +411,9 @@ test("merge acceptance is non-strict >= on subsample sums", async () => {
     triedTriplets: new Set<string>(),
   }
   // Merged scores exactly equal the better parent's on the subsample → accept.
-  const adapter = mergeScoreAdapter((valId) => (valId >= 3 ? 1 : 0))
+  const adapter = mergeScoreAdapter((validationId) =>
+    validationId >= 3 ? 1 : 0
+  )
   const outcome = await runMergeIteration(
     adapter,
     state,
@@ -427,7 +436,9 @@ test("rejected merge still bills its subsample eval", async () => {
     triedTriplets: new Set<string>(),
   }
   // Slightly below the better parent's sum → strictly less → reject.
-  const adapter = mergeScoreAdapter((valId) => (valId >= 4 ? 1 : 0))
+  const adapter = mergeScoreAdapter((validationId) =>
+    validationId >= 4 ? 1 : 0
+  )
   const outcome = await runMergeIteration(
     adapter,
     state,
@@ -538,10 +549,10 @@ test("gepa e2e: budget enforced, best candidate beats or matches the seed", asyn
   expect(result.totalMetricCalls).toBeLessThanOrEqual(60 + 6 + 2 * 3)
   expect(result.candidates.length).toBeGreaterThan(1)
   expect(result.bestIdx).toBeGreaterThan(0)
-  expect(result.valAggregateScores[result.bestIdx]).toBeGreaterThanOrEqual(
-    result.valAggregateScores[0] as number
-  )
-  expect(result.valAggregateScores[result.bestIdx]).toBe(1)
+  expect(
+    result.validationAggregateScores[result.bestIdx]
+  ).toBeGreaterThanOrEqual(result.validationAggregateScores[0] as number)
+  expect(result.validationAggregateScores[result.bestIdx]).toBe(1)
   // The returned program actually carries the improved description.
   expect(result.program.steps[0]?.description.includes("double")).toBe(true)
 })

@@ -69,11 +69,11 @@ export type GEPAAdapter<TInput = Fields, TOutput = Fields> = {
 export type GEPAState = {
   i: number
   stepIdToUpdateNextForCandidate: number[]
-  fullDSEvalsCount: number
+  fullValidationSetEvalsCount: number
   metricCallCountsByDiscovery: number[]
   paretoFrontValidationSet: Map<number, number>
   parentProgramForCandidate: (number | null)[][]
-  progCandidateValSubscores: Map<number, number>[]
+  candidateValidationSubscores: Map<number, number>[]
   programAtParetoFrontValidationSet: Map<number, Set<number>>
   programCandidates: Candidate[]
   totalEvalsCount: number
@@ -81,10 +81,10 @@ export type GEPAState = {
 
 // --- Small helpers ----------------------------------------------------------
 
-export const MERGE_VAL_OVERLAP_FLOOR = 5
+export const MERGE_VALIDATION_OVERLAP_FLOOR = 5
 
 const toSubscores = (scores: number[]): Map<number, number> =>
-  new Map(scores.map((score, valId) => [valId, score]))
+  new Map(scores.map((score, validationId) => [validationId, score]))
 
 /**
  * Per-instance frontier update after a candidate's full validationSet eval. Strict
@@ -96,13 +96,13 @@ export const updateParetoFront = (
   candidateIdx: number,
   subscores: Map<number, number>
 ): void => {
-  for (const [valId, score] of subscores) {
-    const prev = front.get(valId)
+  for (const [validationId, score] of subscores) {
+    const prev = front.get(validationId)
     if (prev === undefined || score > prev) {
-      front.set(valId, score)
-      frontPrograms.set(valId, new Set([candidateIdx]))
+      front.set(validationId, score)
+      frontPrograms.set(validationId, new Set([candidateIdx]))
     } else if (score === prev) {
-      frontPrograms.get(valId)?.add(candidateIdx)
+      frontPrograms.get(validationId)?.add(candidateIdx)
     }
   }
 }
@@ -122,7 +122,7 @@ const addCandidate = (
   const idx = state.programCandidates.length
   state.programCandidates.push(candidate)
   state.parentProgramForCandidate.push(parents)
-  state.progCandidateValSubscores.push(subscores)
+  state.candidateValidationSubscores.push(subscores)
   state.metricCallCountsByDiscovery.push(state.totalEvalsCount)
   state.stepIdToUpdateNextForCandidate.push(
     Math.max(
@@ -133,7 +133,7 @@ const addCandidate = (
     )
   )
   state.totalEvalsCount += validationSetSize
-  state.fullDSEvalsCount += 1
+  state.fullValidationSetEvalsCount += 1
   updateParetoFront(
     state.paretoFrontValidationSet,
     state.programAtParetoFrontValidationSet,
@@ -444,7 +444,7 @@ export const proposeMerge = (
   aggScores: number[],
   rng: RNG,
   memory: MergeMemory,
-  valOverlapFloor = MERGE_VAL_OVERLAP_FLOOR
+  valOverlapFloor = MERGE_VALIDATION_OVERLAP_FLOOR
 ): MergeProposal | null => {
   const survivors = removeDominatedPrograms(
     state.programAtParetoFrontValidationSet,
@@ -480,10 +480,18 @@ export const proposeMerge = (
     if (memory.producedByPair.has(pairKey)) {
       continue
     }
-    const subscoresI = at(state.progCandidateValSubscores, i, "val subscores")
-    const subscoresJ = at(state.progCandidateValSubscores, j, "val subscores")
-    const sharedIds = [...subscoresI.keys()].filter((valId) =>
-      subscoresJ.has(valId)
+    const subscoresI = at(
+      state.candidateValidationSubscores,
+      i,
+      "validation subscores"
+    )
+    const subscoresJ = at(
+      state.candidateValidationSubscores,
+      j,
+      "validation subscores"
+    )
+    const sharedIds = [...subscoresI.keys()].filter((validationId) =>
+      subscoresJ.has(validationId)
     )
     if (sharedIds.length < valOverlapFloor) {
       continue
@@ -517,15 +525,15 @@ export const buildMergeSubsample = (
   const iBetter: number[] = []
   const jBetter: number[] = []
   const tied: number[] = []
-  for (const valId of sharedIds) {
-    const si = get(subscoresI, valId, "subscores I")
-    const sj = get(subscoresJ, valId, "subscores J")
+  for (const validationId of sharedIds) {
+    const si = get(subscoresI, validationId, "subscores I")
+    const sj = get(subscoresJ, validationId, "subscores J")
     if (si > sj) {
-      iBetter.push(valId)
+      iBetter.push(validationId)
     } else if (sj > si) {
-      jBetter.push(valId)
+      jBetter.push(validationId)
     } else {
-      tied.push(valId)
+      tied.push(validationId)
     }
   }
   const chosen: number[] = []
@@ -533,7 +541,9 @@ export const buildMergeSubsample = (
     if (chosen.length >= MERGE_SUBSAMPLE_SIZE) {
       break
     }
-    const available = bucket.filter((valId) => !chosen.includes(valId))
+    const available = bucket.filter(
+      (validationId) => !chosen.includes(validationId)
+    )
     const take = Math.min(
       available.length,
       MERGE_PER_BUCKET,
@@ -545,7 +555,9 @@ export const buildMergeSubsample = (
   }
   const remaining = MERGE_SUBSAMPLE_SIZE - chosen.length
   if (remaining > 0) {
-    const unused = sharedIds.filter((valId) => !chosen.includes(valId))
+    const unused = sharedIds.filter(
+      (validationId) => !chosen.includes(validationId)
+    )
     if (unused.length >= remaining) {
       chosen.push(...sampleUpTo(rng, unused, remaining))
     } else if (sharedIds.length > 0) {
@@ -582,7 +594,7 @@ export const runMergeIteration = async <TInput, TOutput>(
   memory: MergeMemory
 ): Promise<MergeOutcome> => {
   const { rng, validationSet } = options
-  const aggScores = state.progCandidateValSubscores.map(aggregateScore)
+  const aggScores = state.candidateValidationSubscores.map(aggregateScore)
   const proposal = proposeMerge(state, aggScores, rng, memory)
   if (!proposal) {
     return "none"
@@ -593,30 +605,34 @@ export const runMergeIteration = async <TInput, TOutput>(
     tripletKey(proposal.ancestor, proposal.parentI, proposal.parentJ)
   )
   const subscoresI = at(
-    state.progCandidateValSubscores,
+    state.candidateValidationSubscores,
     proposal.parentI,
-    "val subscores"
+    "validation subscores"
   )
   const subscoresJ = at(
-    state.progCandidateValSubscores,
+    state.candidateValidationSubscores,
     proposal.parentJ,
-    "val subscores"
+    "validation subscores"
   )
-  const sharedIds = [...subscoresI.keys()].filter((valId) =>
-    subscoresJ.has(valId)
+  const sharedIds = [...subscoresI.keys()].filter((validationId) =>
+    subscoresJ.has(validationId)
   )
   const subsample = buildMergeSubsample(sharedIds, subscoresI, subscoresJ, rng)
-  const batch = subsample.map((valId) =>
-    at(validationSet, valId, "validationSet")
+  const batch = subsample.map((validationId) =>
+    at(validationSet, validationId, "validationSet")
   )
   const mergedEval = await adapter.evaluate(batch, proposal.candidate, false)
   state.totalEvalsCount += batch.length
   const sumMerged = sum(mergedEval.scores)
   const sumI = sum(
-    subsample.map((valId) => get(subscoresI, valId, "subscores I"))
+    subsample.map((validationId) =>
+      get(subscoresI, validationId, "subscores I")
+    )
   )
   const sumJ = sum(
-    subsample.map((valId) => get(subscoresJ, valId, "subscores J"))
+    subsample.map((validationId) =>
+      get(subscoresJ, validationId, "subscores J")
+    )
   )
   if (sumMerged < Math.max(sumI, sumJ)) {
     return "rejected"
@@ -664,7 +680,7 @@ const selectParent = (
   state: GEPAState,
   options: Pick<EngineOptions, "candidateSelectionStrategy" | "rng">
 ): number => {
-  const aggScores = state.progCandidateValSubscores.map(aggregateScore)
+  const aggScores = state.candidateValidationSubscores.map(aggregateScore)
   if (options.candidateSelectionStrategy === "currentBest") {
     return argmax(aggScores)
   }
@@ -688,12 +704,12 @@ export const runGEPA = async <TInput, TOutput>(
     false
   )
   const state: GEPAState = {
-    fullDSEvalsCount: 1,
+    candidateValidationSubscores: [toSubscores(seedEval.scores)],
+    fullValidationSetEvalsCount: 1,
     i: -1,
     metricCallCountsByDiscovery: [0],
     parentProgramForCandidate: [[null]],
     paretoFrontValidationSet: new Map(),
-    progCandidateValSubscores: [toSubscores(seedEval.scores)],
     programAtParetoFrontValidationSet: new Map(),
     programCandidates: [options.seedCandidate],
     stepIdToUpdateNextForCandidate: [0],
@@ -703,7 +719,7 @@ export const runGEPA = async <TInput, TOutput>(
     state.paretoFrontValidationSet,
     state.programAtParetoFrontValidationSet,
     0,
-    at(state.progCandidateValSubscores, 0, "val subscores")
+    at(state.candidateValidationSubscores, 0, "validation subscores")
   )
 
   const sampler = createEpochShuffledSampler(
@@ -720,7 +736,7 @@ export const runGEPA = async <TInput, TOutput>(
   let lastIterFoundNewProgram = false
 
   let bestAgg = aggregateScore(
-    at(state.progCandidateValSubscores, 0, "val subscores")
+    at(state.candidateValidationSubscores, 0, "validation subscores")
   )
   const noteImprovement = async (
     candidate: Candidate,

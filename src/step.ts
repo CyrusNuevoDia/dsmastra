@@ -1,7 +1,7 @@
 import type { InferPublicSchema } from "@mastra/core/schema"
 import { createStep } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
-import { generateObject } from "ai"
+import { generateText, Output } from "ai"
 import type { z } from "zod"
 
 import type { FieldSchema, Fields } from "@/fields"
@@ -134,18 +134,18 @@ export const declareStep = <
     { inputData }: { inputData: z.infer<TInputSchema> },
     ctx?: RunContext
   ): Promise<z.infer<TOutputSchema>> => {
-    const generated = await generateObject({
+    const generated = await generateText({
       ...tunable.settings,
       model: ctx?.model ?? tunable.model,
+      output: Output.object({ schema: tunable.outputSchema }),
       prompt: renderPrompt(tunable.description, tunable.examples, inputData),
-      schema: tunable.outputSchema,
       seed: ctx?.seed ?? tunable.settings.seed,
       temperature: ctx?.temperature ?? tunable.settings.temperature,
     })
-    // The AI SDK types `object` through a conditional it can't collapse while
+    // The AI SDK types `output` through a conditional it can't collapse while
     // the schema is still generic, so re-parse instead of asserting: this both
     // recovers the precise output type and re-checks what the model returned.
-    const outputData = tunable.outputSchema.parse(generated.object)
+    const outputData = tunable.outputSchema.parse(generated.output)
     ctx?.trace?.push({ inputData, outputData, stepId: tunable.id })
     return outputData
   }
