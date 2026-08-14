@@ -1,51 +1,69 @@
 import { expect, test } from "bun:test"
 import { z } from "zod"
-import { createWorkflow, declareStep, GEPA, optimize } from "@/index"
+import { gepa } from "@/gepa"
+import { declarePredictor } from "@/predictor"
+import { createProgram } from "@/program"
+import type { Example } from "@/simba"
 import { model } from "./_helpers"
 
-const trainset = [
-  { expected: { y: 2 }, input: { x: 1 } },
-  { expected: { y: 4 }, input: { x: 2 } },
-] as const
+const trainset: Example[] = [1, 2, 3, 5, 8, 13].map((x) => ({
+  expected: { y: x * 2 },
+  input: { x },
+}))
 
-test("GEPA improves arithmetic accuracy", async () => {
-  // Deliberately wrong prompt.
-  const badStep = declareStep({
-    id: "bad-math",
-    inputSchema: z.object({ x: z.number() }),
-    instructions: "Return y = x.", // should be x*2
-    model,
-    outputSchema: z.object({ y: z.number() }),
-  })
+const BAD_INSTRUCTIONS = "Return y = x."
 
-  const wf = createWorkflow({
-    id: "wf-bad",
-    inputSchema: z.object({ x: z.number() }),
-    outputSchema: z.object({ y: z.number() }),
-  })
-    .then(badStep)
-    .commit()
+test(
+  "GEPA improves arithmetic accuracy",
+  async () => {
+    const predictor = declarePredictor({
+      inputSchema: z.object({ x: z.number() }),
+      instructions: BAD_INSTRUCTIONS, // should be x*2
+      model,
+      name: "math",
+      outputSchema: z.object({ y: z.number() }),
+    })
+    const program = createProgram({
+      forward: (call, input: Record<string, unknown>) => call("math", input),
+      predictors: [predictor],
+    })
 
-  // Helper to measure accuracy
-  const accuracy = async (workflow: typeof wf) => {
-    const hits = await Promise.all(
-      trainset.map(async (ex) => {
-        const { y } = await workflow.steps["bad-math"].execute({
-          inputData: ex.input,
-        })
-        return y === ex.expected.y
-      })
+    const result = await gepa(program, trainset, {
+      maxMetricCalls: 60,
+      metric: (gold, prediction) => ({
+        feedback:
+          prediction?.y === gold.expected.y
+            ? `Correct: for x=${gold.input.x}, y=${gold.expected.y}.`
+            : `Wrong: for x=${gold.input.x} the answer should be y=${gold.expected.y}, but the assistant returned y=${prediction?.y}.`,
+        score: prediction?.y === gold.expected.y ? 1 : 0,
+      }),
+      reflectionLM: model,
+      seed: 0,
+    })
+
+    const before = result.candidates[0]?.math
+    const after = result.candidates[result.bestIdx]?.math
+    console.log(`\n=== BEFORE (score ${result.valAggregateScores[0]}) ===`)
+    console.log(before)
+    console.log(
+      `\n=== AFTER (score ${result.valAggregateScores[result.bestIdx]}) ===`
     )
-    return hits.filter(Boolean).length / trainset.length
-  }
+    console.log(after)
 
-  const baseAcc = await accuracy(wf)
-  expect(baseAcc).toBeLessThan(1)
+    expect(result.valAggregateScores[0]).toBeLessThan(1)
+    expect(result.bestIdx).toBeGreaterThan(0)
+    expect(result.valAggregateScores[result.bestIdx]).toBe(1)
 
-  const tuned = await optimize(GEPA({ maxDemos: 2, maxSteps: 4 }), wf, {
-    trainset,
-  })
-
-  const tunedAcc = await accuracy(tuned)
-  expect(tunedAcc).toBe(1) // must be perfect on tiny set
-})
+    // The tuned program actually behaves correctly.
+    const tuned = result.program
+    const outputs = await Promise.all(
+      trainset.map(
+        (example) => tuned.run(example.input as never) as Promise<{ y: number }>
+      )
+    )
+    for (const [i, example] of trainset.entries()) {
+      expect(outputs[i]?.y).toBe(example.expected.y as number)
+    }
+  },
+  { timeout: 300_000 }
+)

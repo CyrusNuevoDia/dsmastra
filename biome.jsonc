@@ -5,6 +5,16 @@
   "files": {
     "includes": ["!dspy"]
   },
+  "linter": {
+    "rules": {
+      "style": {
+        "useConsistentTypeDefinitions": {
+          "level": "error",
+          "options": { "style": "type" }
+        }
+      }
+    }
+  },
   // src/index.ts is the package entrypoint, so it is a barrel file by design.
   "overrides": [
     {
