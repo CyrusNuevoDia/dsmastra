@@ -1,91 +1,43 @@
 ---
 name: install-anti-slop
-description: Install and configure the anti-slop Oxlint plugin in a local TypeScript or JavaScript repository. Use whenever a user asks to add anti-slop lint rules, copy the anti-slop plugin, configure opinionated Oxlint rules, or migrate an existing local anti-slop setup.
+description: Install or migrate anti-slop lint rules through Ultracite's built-in Oxlint preset. Use when a TypeScript or JavaScript repository should enable anti-slop, replace a copied anti-slop plugin, adopt Ultracite 7.10.4 or newer, or wire Ultracite lint and format commands into a justfile.
 ---
 
 # Install anti-slop
 
-Install the bundled Oxlint plugin into the current repository and integrate it with the repository's existing lint setup. Preserve unrelated work and adapt to the project's package manager and configuration style.
+Use Ultracite's bundled `ultracite/oxlint/anti-slop` preset. Do not copy anti-slop source into the target repository or install `@oxlint/plugins`; Ultracite 7.10.4 and newer ship a self-contained plugin bundle.
 
 ## Procedure
 
 1. Inspect the repository before changing it:
-   - Read its agent instructions.
-   - Check `git status` and preserve unrelated changes.
-   - Identify the package manager from `packageManager` and lockfiles.
-   - Find Oxlint configuration (`oxlint.config.*`, `.oxlintrc*`, or a Vite+ config).
-   - Check whether anti-slop files or rules already exist. Do not overwrite them without reviewing the diff.
+   - Read its agent instructions and check `git status`.
+   - Detect the package manager from `packageManager` and lockfiles.
+   - Read the existing Oxlint, Oxfmt, package, and task-runner configuration.
+   - Find copied anti-slop plugins and project-specific rule overrides. Preserve unrelated work and intentional overrides.
 
-2. Copy the bundled plugin from this skill. Run from the target repository:
+2. Verify the current Ultracite release with `npm view ultracite version`. Install Ultracite 7.10.4 or newer with compatible `oxlint` and `oxfmt` development dependencies using the repository's package manager. Remove `@oxlint/plugins` when no other local plugin imports it.
 
-   ```bash
-   node <skill-directory>/scripts/install.mjs
-   ```
-
-   This creates `tools/oxlint/anti-slop/`. Pass another relative destination as the first argument when the repository has an established tooling layout. The script refuses to replace an existing destination; only use `--force` after backing up and reviewing existing files.
-
-3. Install current compatible dependencies rather than trusting versions remembered by the agent:
-   - Query `npm view oxlint version` and `npm view @oxlint/plugins version`.
-   - Install the same current version of both packages with the repository's package manager.
-   - `oxlint` is a development dependency. The copied source imports `@oxlint/plugins`, so install it as a development dependency for a local-only plugin.
-   - Do not replace the package manager or rewrite unrelated dependency ranges.
-
-4. Register the plugin, configure ignores, and enable all rules. For `oxlint.config.ts` or `.oxlintrc.json`, merge these fields with the existing configuration:
+3. Extend the built-in presets in `oxlint.config.ts`:
 
    ```ts
-   ignorePatterns: [
-     ".agent/**",
-     ".agents/**",
-     ".claude/**",
-     ".codex/**",
-     ".continue/**",
-     ".cursor/**",
-     ".gemini/**",
-     ".opencode/**",
-     ".pi/**",
-     ".roo/**",
-     ".windsurf/**",
-     "tools/oxlint/anti-slop/**",
-   ],
-   jsPlugins: [
-     { name: "anti-slop", specifier: "./tools/oxlint/anti-slop/index.ts" },
-   ],
+   import { defineConfig } from "oxlint"
+   import antiSlop from "ultracite/oxlint/anti-slop"
+   import core from "ultracite/oxlint/core"
+
+   export default defineConfig({
+     extends: [core, antiSlop],
+     ignorePatterns: core.ignorePatterns,
+   })
    ```
 
-   Keep every existing ignore. Adjust the final pattern when the plugin was copied elsewhere. Inspect the repository for other project-local agent tooling directories and add them rather than linting installed skills, hooks, or generated agent configuration as application source. Do not broadly ignore all dot-directories, because some repositories keep owned source or checks in them.
+   Keep `antiSlop` after `core`: it enables all anti-slop rules and disables two core rules that otherwise create conflicting fixes. Merge repository-specific ignores, overrides, and rules without restating the preset's rule list or `jsPlugins` entry.
 
-   For Vite+, add these fields to `lint.ignorePatterns` and `lint.jsPlugins`. Also merge the same patterns into `fmt.ignorePatterns` so `vp check` does not reformat installed agent assets or the vendored plugin. Merge existing entries instead of replacing them.
+4. Keep `oxfmt.config.ts` extending `ultracite/oxfmt`. Remove ignores that existed only for a copied plugin, but preserve source, generated-file, and agent-tooling ignores that still apply.
 
-   Enable these rules at `"error"`:
+5. Delete the copied plugin and its installer assets after the config resolves the Ultracite preset. Remove stale lock metadata that would identify a rewritten repo-owned skill as an unchanged external install.
 
-   ```json
-   {
-     "anti-slop/no-chained-type-assertions": "error",
-     "anti-slop/no-conditional-empty-object-spread": "error",
-     "anti-slop/no-known-value-widening": "error",
-     "anti-slop/no-module-mocking": "error",
-     "anti-slop/no-object-parameters": "error",
-     "anti-slop/no-reflect-apply": "error",
-     "anti-slop/no-reflect-get": "error",
-     "anti-slop/no-runtime-typeof": "error",
-     "anti-slop/no-shape-in-symbol-names": "error",
-     "anti-slop/no-unknown-parameters": "error",
-     "anti-slop/no-unknown-returns": "error",
-     "anti-slop/no-unknown-type-aliases": "error",
-     "anti-slop/no-unsafe-dictionary-type": "error",
-     "anti-slop/no-widen-then-assert": "error",
-     "anti-slop/require-safety-comment-for-type-assertion": "error"
-   }
-   ```
+6. Wire the repository's task runner through Ultracite. For a justfile, use `ultracite fix` for formatting/autofixes and `ultracite check` for non-writing format and lint checks; keep typechecking and tests as separate recipes or steps.
 
-5. Run the repository's lint command and typecheck. For Vite+, run the repository's full `vp check` command after adding both lint and format ignores. If findings appear in owned project source, report them and fix them only when the user asked for migration/cleanup. Do not suppress rules, weaken rule severity, add unsafe casts, or mechanically launder types to make lint pass.
+7. Run the package install, `ultracite doctor`, the repository's full check command, and the skill validator. Fix owned-source findings when the user requested migration or cleanup, but do not weaken rules or add unsafe casts to make the check pass.
 
-6. Review the final diff and clearly report:
-   - copied path,
-   - dependency versions installed,
-   - configuration changed,
-   - checks run and any remaining findings.
-
-## Migration guidance
-
-When replacing an older local copy, compare its rules and diagnostics before overwriting. Keep project-specific rules in their own plugin; anti-slop is intentionally generic. Prefer inference, `as const`, `satisfies`, named owner contracts, and boundary parsing when resolving findings.
+Review the final diff and report the Ultracite version, removed local plugin paths and dependency, configuration changes, and exact verification results.

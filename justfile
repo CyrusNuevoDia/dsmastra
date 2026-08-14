@@ -7,16 +7,15 @@ _default:
 
 # Format everything.
 fmt:
-    bunx oxfmt .
+    bunx ultracite fix
 
-# Lint, including the local anti-slop plugin.
+# Check formatting and lint, including Ultracite's anti-slop preset.
 lint:
-    bunx oxlint
+    bunx ultracite check
 
 # Autofix what the linter and formatter can fix on their own.
 fix:
-    bunx oxlint --fix
-    bunx oxfmt .
+    bunx ultracite fix
 
 # Typecheck and bundle to dist/. Deps stay external; `@/*` paths get inlined.
 build:
@@ -34,7 +33,6 @@ test-int:
 
 # Everything CI should care about: format check, lint, typecheck, unit tests.
 check:
-    bunx oxfmt --check .
     just lint
     bunx tsc --noEmit
     just test

@@ -1,8 +1,9 @@
 import { defineConfig } from "oxlint"
+import antiSlop from "ultracite/oxlint/anti-slop"
 import core from "ultracite/oxlint/core"
 
 export default defineConfig({
-  ...core,
+  extends: [core, antiSlop],
   ignorePatterns: [
     ...(core.ignorePatterns ?? []),
     // dspy and gepa are vendored upstream clones, not our code.
@@ -10,10 +11,6 @@ export default defineConfig({
     "gepa/**",
     ".agents/**",
     ".claude/**",
-    "tools/oxlint/anti-slop/**",
-  ],
-  jsPlugins: [
-    { name: "anti-slop", specifier: "./tools/oxlint/anti-slop/index.ts" },
   ],
   overrides: [
     ...(core.overrides ?? []),
@@ -39,22 +36,6 @@ export default defineConfig({
     },
   ],
   rules: {
-    ...core.rules,
-    "anti-slop/no-chained-type-assertions": "error",
-    "anti-slop/no-conditional-empty-object-spread": "error",
-    "anti-slop/no-known-value-widening": "error",
-    "anti-slop/no-module-mocking": "error",
-    "anti-slop/no-object-parameters": "error",
-    "anti-slop/no-reflect-apply": "error",
-    "anti-slop/no-reflect-get": "error",
-    "anti-slop/no-runtime-typeof": "error",
-    "anti-slop/no-shape-in-symbol-names": "error",
-    "anti-slop/no-unknown-parameters": "error",
-    "anti-slop/no-unknown-returns": "error",
-    "anti-slop/no-unknown-type-aliases": "error",
-    "anti-slop/no-unsafe-dictionary-type": "error",
-    "anti-slop/no-widen-then-assert": "error",
-    "anti-slop/require-safety-comment-for-type-assertion": "error",
     "typescript/consistent-type-definitions": ["error", "type"],
   },
 })

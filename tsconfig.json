@@ -32,5 +32,5 @@
   },
 
   // Vendored upstream code, not ours to typecheck.
-  "exclude": ["node_modules", "dspy", "gepa", "tools/oxlint/anti-slop"]
+  "exclude": ["node_modules", "dspy", "gepa"]
 }

@@ -9,7 +9,6 @@ export default defineConfig({
     "gepa/**",
     ".agents/**",
     ".claude/**",
-    "tools/oxlint/anti-slop/**",
   ],
   semi: false,
 })
