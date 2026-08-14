@@ -1,12 +1,15 @@
 import { generateObject, type LanguageModel } from "ai"
 import { z } from "zod"
-import type { AnyPredictor, RunContext, TraceStep } from "@/predictor"
-import type { Program } from "@/program"
+import {
+  type AnyPredictor,
+  type RunContext,
+  schemaProperties,
+  type TraceStep,
+} from "@/predictor"
+import type { Example, Program } from "@/program"
+import { createRNG, samplePoisson, shuffle, weightedChoice } from "@/random"
 
-export type Example = {
-  expected: Record<string, unknown>
-  input: Record<string, unknown>
-}
+export type { Example } from "@/program"
 
 export type MetricResult = number | { score: number; [key: string]: unknown }
 
@@ -58,46 +61,6 @@ export type SIMBAResult<TInput, TOutput> = {
   trialLogs: TrialLog[]
 }
 
-// --- Seeded RNG ------------------------------------------------------------
-
-/** mulberry32 — small seeded PRNG; only the distributions matter for the port. */
-export function createRNG(seed: number): () => number {
-  // biome-ignore-start lint/suspicious/noBitwiseOperators: mulberry32 is bit-twiddling by design
-  let state = seed >>> 0
-  return () => {
-    state = (state + 0x6d_2b_79_f5) | 0
-    let t = state
-    t = Math.imul(t ^ (t >>> 15), t | 1)
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
-    return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296
-  }
-  // biome-ignore-end lint/suspicious/noBitwiseOperators: mulberry32 is bit-twiddling by design
-}
-
-/** Knuth's Poisson sampler. */
-export function samplePoisson(rng: () => number, lambda: number): number {
-  if (lambda <= 0) {
-    return 0
-  }
-  const limit = Math.exp(-lambda)
-  let k = 0
-  let p = 1
-  do {
-    k += 1
-    p *= rng()
-  } while (p > limit)
-  return k - 1
-}
-
-function shuffle<T>(rng: () => number, items: T[]): void {
-  for (let i = items.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(rng() * (i + 1))
-    const a = items[i] as T
-    items[i] = items[j] as T
-    items[j] = a
-  }
-}
-
 function mean(values: number[]): number {
   return values.reduce((acc, v) => acc + v, 0) / values.length
 }
@@ -147,21 +110,11 @@ export function softmaxSample(
   if (programIdxs.length === 0) {
     throw new Error("No programs available for softmax sampling.")
   }
-  const weights = programIdxs.map((idx) =>
-    Math.exp((avgScores[idx] ?? 0) / temperature)
+  return weightedChoice(
+    rng,
+    programIdxs,
+    programIdxs.map((idx) => Math.exp((avgScores[idx] ?? 0) / temperature))
   )
-  const sum = weights.reduce((acc, w) => acc + w, 0)
-  if (sum <= 0 || !Number.isFinite(sum)) {
-    return programIdxs[Math.floor(rng() * programIdxs.length)] as number
-  }
-  let r = rng() * sum
-  for (const [i, weight] of weights.entries()) {
-    r -= weight
-    if (r <= 0) {
-      return programIdxs[i] as number
-    }
-  }
-  return programIdxs.at(-1) as number
 }
 
 /** NumPy-default linear-interpolation percentile. */
@@ -389,22 +342,8 @@ function serializeField(value: unknown): string {
     : JSON.stringify(recursiveMask(value), null, 2)
 }
 
-type JSONSchemaProperty = {
-  description?: string
-  type?: string
-}
-
 function fieldDescriptionLines(schema: z.ZodType): string {
-  let properties: Record<string, JSONSchemaProperty> = {}
-  try {
-    const jsonSchema = z.toJSONSchema(schema) as {
-      properties?: Record<string, JSONSchemaProperty>
-    }
-    properties = jsonSchema.properties ?? {}
-  } catch {
-    return ""
-  }
-  return Object.entries(properties)
+  return Object.entries(schemaProperties(schema))
     .map(
       ([name, prop]) =>
         `${name} (${prop.type ?? "unknown"})${prop.description ? `: ${prop.description}` : ""}`
@@ -519,9 +458,9 @@ export async function appendARule(
       better_reward_value: goodView.score,
       module_names: candidate.predictors.map((p) => p.name),
       modules_defn: inspectModules(candidate),
-      oracle_metadata: example.expected,
+      oracle_metadata: example.outputs,
       program_code: candidate.code,
-      program_inputs: example.input,
+      program_inputs: example.inputs,
       worse_program_outputs: badView.prediction ?? {},
       worse_program_trajectory: toTrajectory(badView.trace),
       worse_reward_info: badView.outputMetadata,
@@ -550,7 +489,7 @@ async function runRollout(
   const trace: TraceStep[] = []
   let prediction: Record<string, unknown> | undefined
   try {
-    prediction = (await program.run(example.input as never, {
+    prediction = (await program.run(example.inputs as never, {
       ...ctx,
       trace,
     })) as Record<string, unknown>
@@ -638,11 +577,6 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
   shuffle(rng, dataIdxs)
   let instanceIdx = 0
   let nextRolloutId = 0
-  const takeRolloutId = () => {
-    const rolloutId = nextRolloutId
-    nextRolloutId += 1
-    return rolloutId
-  }
 
   const nextBatch = (): Example[] => {
     if (instanceIdx + bsize > trainset.length) {
@@ -663,28 +597,29 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
     if (teacherSettings) {
       models.push({
         model: teacherSettings.model,
-        seed: takeRolloutId(),
+        seed: nextRolloutId,
         temperature: teacherSettings.temperature,
       })
+      nextRolloutId += 1
     }
     while (models.length < numCandidates) {
-      models.push({ seed: takeRolloutId(), temperature: 1 })
+      models.push({ seed: nextRolloutId, temperature: 1 })
+      nextRolloutId += 1
     }
     return models
   }
 
   // Model-major, example-minor: bucket extraction strides by bsize.
   const sampleRollouts = (batch: Example[]): Promise<Rollout[]> => {
+    // The pool is frozen for the whole call, so score the programs once.
+    const avg = avgScores()
+    const topK = topKPlusBaseline(avg, numCandidates)
     const runs: (() => Promise<Rollout>)[] = []
     for (const modelCtx of prepareModelsForResampling()) {
       for (const example of batch) {
-        const srcIdx = softmaxSample(
-          rng,
-          topKPlusBaseline(avgScores(), numCandidates),
-          avgScores(),
-          temperatureForSampling
-        )
-        const rolloutProgram = (programs[srcIdx] as AnyProgram).clone()
+        const srcIdx = softmaxSample(rng, topK, avg, temperatureForSampling)
+        // Rollouts never mutate the program, so no clone is needed.
+        const rolloutProgram = programs[srcIdx] as AnyProgram
         runs.push(() => runRollout(rolloutProgram, example, metric, modelCtx))
       }
     }
@@ -694,14 +629,12 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
   const generateCandidates = async (
     buckets: Bucket[]
   ): Promise<AnyProgram[]> => {
+    // Candidates only join the pool after the step, so score it once.
+    const avg = avgScores()
+    const topK = topKPlusBaseline(avg, numCandidates)
     const candidates: AnyProgram[] = []
     for (const bucket of buckets) {
-      const srcIdx = softmaxSample(
-        rng,
-        topKPlusBaseline(avgScores(), numCandidates),
-        avgScores(),
-        temperatureForCandidates
-      )
+      const srcIdx = softmaxSample(rng, topK, avg, temperatureForCandidates)
       const candidate = (programs[srcIdx] as AnyProgram).clone()
       dropDemos(candidate, maxDemos, rng, poissonRNG)
       const strategy = strategies[
@@ -797,10 +730,9 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
     m < 1
       ? Array.from({ length: n }, () => 0)
       : Array.from({ length: n }, (_, i) => roundHalfEven((i * m) / (n - 1)))
+  // Winners were already cloned at push time, so no extra copy is needed.
   const finalIdxs = [...new Set(spacing)]
-  const finalists = finalIdxs.map((i) =>
-    (winningPrograms[i] as AnyProgram).clone()
-  )
+  const finalists = finalIdxs.map((i) => winningPrograms[i] as AnyProgram)
 
   console.log(
     `VALIDATION: Evaluating ${finalists.length} programs on the full trainset.`

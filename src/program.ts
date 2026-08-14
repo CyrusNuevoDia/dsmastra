@@ -1,5 +1,11 @@
 import type { AnyPredictor, RunContext } from "@/predictor"
 
+/** A training example: inputs plus the expected output fields. */
+export type Example = {
+  inputs: Record<string, unknown>
+  outputs: Record<string, unknown>
+}
+
 export type ProgramForward<TInput, TOutput> = (
   call: (
     predictorName: string,
@@ -27,30 +33,33 @@ export function createProgram<TInput, TOutput>(config: {
   forward: ProgramForward<TInput, TOutput>
   predictors: AnyPredictor[]
 }): Program<TInput, TOutput> {
-  const { forward, predictors } = config
-  return {
-    clone: () =>
-      createProgram({
-        forward,
-        predictors: predictors.map((predictor) => predictor.clone()),
-      }),
-    code: forward.toString(),
-    predictors,
-    run: (input, ctx) => {
-      const call = async (
-        predictorName: string,
-        inputs: Record<string, unknown>
-      ) => {
-        const predictor = predictors.find((p) => p.name === predictorName)
-        if (!predictor) {
-          throw new Error(`Unknown predictor: ${predictorName}`)
+  const { forward } = config
+  const code = forward.toString()
+
+  const make = (predictors: AnyPredictor[]): Program<TInput, TOutput> => {
+    const byName = new Map(predictors.map((p) => [p.name, p]))
+    return {
+      clone: () => make(predictors.map((predictor) => predictor.clone())),
+      code,
+      predictors,
+      run: (input, ctx) => {
+        const call = async (
+          predictorName: string,
+          inputs: Record<string, unknown>
+        ) => {
+          const predictor = byName.get(predictorName)
+          if (!predictor) {
+            throw new Error(`Unknown predictor: ${predictorName}`)
+          }
+          return (await predictor.call(inputs as never, ctx)) as Record<
+            string,
+            unknown
+          >
         }
-        return (await predictor.call(inputs as never, ctx)) as Record<
-          string,
-          unknown
-        >
-      }
-      return forward(call, input)
-    },
+        return forward(call, input)
+      },
+    }
   }
+
+  return make(config.predictors)
 }

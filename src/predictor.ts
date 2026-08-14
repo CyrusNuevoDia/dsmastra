@@ -1,6 +1,6 @@
 import { createStep } from "@mastra/core/workflows"
 import { generateObject, type LanguageModel } from "ai"
-import type { z } from "zod"
+import { z } from "zod"
 
 /** A few-shot example rendered into the prompt between instructions and input. */
 export type Demo = {
@@ -59,6 +59,28 @@ export type Predictor<
 
 export type AnyPredictor = Predictor
 
+export type SchemaProperty = {
+  description?: string
+  type?: string
+}
+
+/** Top-level properties of a zod object schema via JSON-schema conversion; {} when the schema can't convert. */
+export function schemaProperties(
+  schema: z.ZodType | undefined
+): Record<string, SchemaProperty> {
+  if (!schema) {
+    return {}
+  }
+  try {
+    const jsonSchema = z.toJSONSchema(schema) as {
+      properties?: Record<string, SchemaProperty>
+    }
+    return jsonSchema.properties ?? {}
+  } catch {
+    return {}
+  }
+}
+
 function renderPrompt(
   instructions: string,
   demos: Demo[],
@@ -97,8 +119,9 @@ export function declarePredictor<
       return object as z.infer<TOutputSchema>
     },
     clone: () =>
+      // declarePredictor already structuredClones the demos it receives.
       declarePredictor({
-        demos: structuredClone(predictor.demos),
+        demos: predictor.demos,
         inputSchema: predictor.inputSchema,
         instructions: predictor.instructions,
         model: predictor.model,

@@ -12,12 +12,12 @@ const model = openai("gpt-4.1-mini")
 // out as words. The "Spell out:" examples succeed anyway, the plain ones land
 // on partial credit, so minibatches carry the score spread SIMBA climbs.
 const trainset = [
-  { expected: { answer: "four" }, input: { question: "Spell out: 2+2" } },
-  { expected: { answer: "six" }, input: { question: "Spell out: 3+3" } },
-  { expected: { answer: "five" }, input: { question: "2+3" } },
-  { expected: { answer: "seven" }, input: { question: "10-3" } },
-  { expected: { answer: "two" }, input: { question: "1+1" } },
-  { expected: { answer: "nine" }, input: { question: "4+5" } },
+  { inputs: { question: "Spell out: 2+2" }, outputs: { answer: "four" } },
+  { inputs: { question: "Spell out: 3+3" }, outputs: { answer: "six" } },
+  { inputs: { question: "2+3" }, outputs: { answer: "five" } },
+  { inputs: { question: "10-3" }, outputs: { answer: "seven" } },
+  { inputs: { question: "1+1" }, outputs: { answer: "two" } },
+  { inputs: { question: "4+5" }, outputs: { answer: "nine" } },
 ] as const
 
 const numbers: Record<string, number> = {
@@ -35,7 +35,7 @@ const metric: Metric = (example, prediction) => {
   const answer = String(prediction?.answer ?? "")
     .trim()
     .toLowerCase()
-  const expected = example.expected.answer as string
+  const expected = example.outputs.answer as string
   if (answer === expected) {
     return 1
   }
@@ -69,7 +69,7 @@ test(
       const scores = await Promise.all(
         trainset.map(async (ex) => {
           const prediction = await workflow.steps.math.execute({
-            inputData: ex.input,
+            inputData: ex.inputs,
           })
           const result = await metric(ex, prediction)
           return typeof result === "number" ? result : result.score

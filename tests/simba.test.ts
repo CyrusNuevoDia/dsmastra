@@ -4,17 +4,16 @@ import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 import { declarePredictor } from "@/predictor"
 import { createProgram, type Program } from "@/program"
+import { createRNG, samplePoisson } from "@/random"
 import {
   appendADemo,
   appendARule,
   type Bucket,
-  createRNG,
   dropDemos,
   type Example,
   makeBuckets,
   percentile,
   type Rollout,
-  samplePoisson,
   simba,
   softmaxSample,
   topKPlusBaseline,
@@ -59,7 +58,7 @@ const makeRollout = (
   score: number,
   overrides: Partial<Rollout> = {}
 ): Rollout => ({
-  example: { expected: {}, input: {} },
+  example: { inputs: {}, outputs: {} },
   outputMetadata: {},
   prediction: {},
   score,
@@ -175,7 +174,7 @@ describe("makeBuckets", () => {
     // 3 models x 2 examples, model-major: [m0e0, m0e1, m1e0, m1e1, m2e0, m2e1]
     const scores = [0.5, 0.1, 0.7, 0.9, 0.6, 0.2]
     const rollouts = scores.map((score, i) =>
-      makeRollout(score, { example: { expected: {}, input: { i: i % 2 } } })
+      makeRollout(score, { example: { inputs: { i: i % 2 }, outputs: {} } })
     )
     const buckets = makeBuckets(rollouts, 2)
     expect(buckets).toHaveLength(2)
@@ -183,7 +182,7 @@ describe("makeBuckets", () => {
     const first = buckets[0] as Bucket
     expect(first.rollouts.map((r) => r.score)).toEqual([0.9, 0.2, 0.1])
     expect(first.maxToMinGap).toBeCloseTo(0.8)
-    expect(first.rollouts.every((r) => r.example.input.i === 1)).toBe(true)
+    expect(first.rollouts.every((r) => r.example.inputs.i === 1)).toBe(true)
     const second = buckets[1] as Bucket
     expect(second.rollouts.map((r) => r.score)).toEqual([0.7, 0.6, 0.5])
   })
@@ -191,7 +190,7 @@ describe("makeBuckets", () => {
   test("orders by max score then max-to-avg gap when gaps tie", () => {
     // Both examples have max-to-min gap 0.4; example 0 has higher max.
     const rollouts = [0.9, 0.6, 0.5, 0.2].map((score, i) =>
-      makeRollout(score, { example: { expected: {}, input: { i: i % 2 } } })
+      makeRollout(score, { example: { inputs: { i: i % 2 }, outputs: {} } })
     )
     const buckets = makeBuckets(rollouts, 2)
     expect((buckets[0] as Bucket).maxScore).toBeCloseTo(0.9)
@@ -311,8 +310,8 @@ describe("appendADemo", () => {
 
 describe("appendARule", () => {
   const example: Example = {
-    expected: { label: "pos" },
-    input: { text: "hello" },
+    inputs: { text: "hello" },
+    outputs: { label: "pos" },
   }
 
   test("skips when good is at or below p10", async () => {
@@ -388,20 +387,20 @@ describe("simba end-to-end", () => {
 
     const student = makeProgram("Classify the sentiment.", programModel)
     const trainset: Example[] = [
-      { expected: { label: "pos" }, input: { text: "pos easy one" } },
-      { expected: { label: "neg" }, input: { text: "neg easy two" } },
-      { expected: { label: "pos" }, input: { text: "pos hard one" } },
-      { expected: { label: "neg" }, input: { text: "neg hard two" } },
+      { inputs: { text: "pos easy one" }, outputs: { label: "pos" } },
+      { inputs: { text: "neg easy two" }, outputs: { label: "neg" } },
+      { inputs: { text: "pos hard one" }, outputs: { label: "pos" } },
+      { inputs: { text: "neg hard two" }, outputs: { label: "neg" } },
     ]
     const metric = (
       ex: Example,
       prediction?: Record<string, unknown>
-    ): number => (prediction?.label === ex.expected.label ? 1 : 0)
+    ): number => (prediction?.label === ex.outputs.label ? 1 : 0)
 
     const scoreOn = async (program: typeof student) => {
       const scores = await Promise.all(
         trainset.map(async (ex) => {
-          const prediction = (await program.run(ex.input as never)) as Record<
+          const prediction = (await program.run(ex.inputs as never)) as Record<
             string,
             unknown
           >
@@ -445,8 +444,8 @@ describe("simba end-to-end", () => {
       })
     )
     const trainset: Example[] = [
-      { expected: { label: "pos" }, input: { text: "pos" } },
-      { expected: { label: "neg" }, input: { text: "neg" } },
+      { inputs: { text: "pos" }, outputs: { label: "pos" } },
+      { inputs: { text: "neg" }, outputs: { label: "neg" } },
     ]
     const result = await simba(student, trainset, {
       bsize: 2,
