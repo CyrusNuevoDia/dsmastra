@@ -1,4 +1,8 @@
 import type { LanguageModel } from "ai"
+
+import { at, last } from "@/collections"
+import type { Fields } from "@/fields"
+import type { MetricOutput } from "@/metric"
 import type { Demo, RunContext, TraceStep } from "@/predictor"
 import type { Example, Program } from "@/program"
 import { createRNG, sample, shuffle } from "@/random"
@@ -10,25 +14,29 @@ import { createRNG, sample, shuffle } from "@/random"
  * running this first and optimizing the demo-carrying program.
  */
 
-export type BootstrapMetric = (
-  gold: Example,
-  prediction: Record<string, unknown> | null,
+/**
+ * Deviation from DSPy: upstream's metric returns `bool | float`, ours always
+ * returns `{ score }`. A pass/fail metric writes `{ score: 1 }` / `{ score: 0 }`,
+ * and with no `metricThreshold` set any score above zero counts as success —
+ * value-for-value the same decision upstream's `bool(metric_val)` makes.
+ */
+export type BootstrapMetric<TInput = Fields, TOutput = Fields> = (
+  gold: Example<TInput, TOutput>,
+  prediction: TOutput | null,
   trace: TraceStep[]
-) => boolean | number | Promise<boolean | number>
+) => MetricOutput
 
-export type BootstrapConfig = {
+export type BootstrapConfig<TInput = Fields, TOutput = Fields> = {
   maxBootstrappedDemos?: number
   /** Caught per-attempt errors allowed before the run aborts. */
   maxErrors?: number
   maxLabeledDemos?: number
   maxRounds?: number
-  metric?: BootstrapMetric
+  metric?: BootstrapMetric<TInput, TOutput>
   metricThreshold?: number
-  teacher?: Program<never, unknown>
+  teacher?: Program<TInput, TOutput>
   teacherSettings?: { model?: LanguageModel; temperature?: number }
 }
-
-type AnyProgram = Program<never, unknown>
 
 /** dspy.settings.max_errors default. */
 const DEFAULT_MAX_ERRORS = 10
@@ -44,22 +52,23 @@ const demoMatchesExample = (demo: Demo, example: Example): boolean =>
   JSON.stringify(demo.outputs) === JSON.stringify(example.outputs)
 
 /** FNV-1a over the JSON rendering — stands in for dspy's Hasher.hash. */
-function contentHash(value: unknown): number {
+const contentHash = (value: Demo[]): number => {
   const text = JSON.stringify(value)
-  // biome-ignore-start lint/suspicious/noBitwiseOperators: FNV-1a is bit-twiddling by design
+  /* oxlint-disable no-bitwise -- FNV-1a is bit-twiddling by design */
   let hash = 0x81_1c_9d_c5
   for (let i = 0; i < text.length; i += 1) {
+    // oxlint-disable-next-line unicorn/prefer-code-point -- FNV-1a here is defined over UTF-16 code units; code points would change every hash and so every seeded sample
     hash ^= text.charCodeAt(i)
     hash = Math.imul(hash, 0x01_00_01_93)
   }
   return hash >>> 0
-  // biome-ignore-end lint/suspicious/noBitwiseOperators: FNV-1a is bit-twiddling by design
+  /* oxlint-enable no-bitwise */
 }
 
 /** Reset copy: fresh clone with predictor demos cleared (dspy reset_copy). */
-function resetCopy<TInput, TOutput>(
+const resetCopy = <TInput, TOutput>(
   program: Program<TInput, TOutput>
-): Program<TInput, TOutput> {
+): Program<TInput, TOutput> => {
   const copy = program.clone()
   for (const predictor of copy.predictors) {
     predictor.demos = []
@@ -72,11 +81,11 @@ function resetCopy<TInput, TOutput>(
  * on a reset copy of the student. Each predictor draws its own sample from the
  * same seed-0 RNG stream; nothing else is shuffled.
  */
-export function labeledFewShot<TInput, TOutput>(
+export const labeledFewShot = <TInput extends Fields, TOutput extends Fields>(
   student: Program<TInput, TOutput>,
-  trainset: Example[],
+  trainset: Example<TInput, TOutput>[],
   k = 16
-): Program<TInput, TOutput> {
+): Program<TInput, TOutput> => {
   const compiled = resetCopy(student)
   if (trainset.length === 0) {
     return compiled
@@ -95,11 +104,14 @@ export function labeledFewShot<TInput, TOutput>(
  * of every metric-passing run as `augmented` demos per predictor, and fill the
  * remaining demo slots with raw labeled examples.
  */
-export async function bootstrapFewShot<TInput, TOutput>(
+export const bootstrapFewShot = async <
+  TInput extends Fields,
+  TOutput extends Fields,
+>(
   studentProgram: Program<TInput, TOutput>,
-  trainset: Example[],
-  config: BootstrapConfig = {}
-): Promise<Program<TInput, TOutput>> {
+  trainset: Example<TInput, TOutput>[],
+  config: BootstrapConfig<TInput, TOutput> = {}
+): Promise<Program<TInput, TOutput>> => {
   const {
     maxBootstrappedDemos = 4,
     maxErrors = DEFAULT_MAX_ERRORS,
@@ -115,7 +127,7 @@ export async function bootstrapFewShot<TInput, TOutput>(
   // demos are requested (our programs carry no _compiled flag; a provided
   // teacher is treated as uncompiled, see the doc's deviation list).
   const student = resetCopy(studentProgram)
-  let teacher = (config.teacher ?? studentProgram).clone() as AnyProgram
+  let teacher = (config.teacher ?? studentProgram).clone()
   if (maxLabeledDemos > 0) {
     teacher = labeledFewShot(teacher, trainset, maxLabeledDemos)
   }
@@ -146,10 +158,10 @@ export async function bootstrapFewShot<TInput, TOutput>(
   let errorCount = 0
 
   const runTeacherAttempt = async (
-    example: Example,
+    example: Example<TInput, TOutput>,
     roundIdx: number,
     trace: TraceStep[]
-  ): Promise<Record<string, unknown> | null> => {
+  ): Promise<TOutput | null> => {
     // Rounds past the first take a fresh rollout at temperature=1.0 to
     // bypass caches — the rollout id maps onto the seed parameter, exactly
     // like SIMBA's prepareModelsForResampling.
@@ -170,13 +182,10 @@ export async function bootstrapFewShot<TInput, TOutput>(
       )
     }
     try {
-      return (await teacher.run(example.inputs as never, ctx)) as Record<
-        string,
-        unknown
-      >
+      return await teacher.run(example.inputs, ctx)
     } finally {
       for (const [idx, predictor] of teacher.predictors.entries()) {
-        predictor.demos = demoCache[idx] as Demo[]
+        predictor.demos = at(demoCache, idx, "teacher demo cache")
       }
     }
   }
@@ -204,8 +213,8 @@ export async function bootstrapFewShot<TInput, TOutput>(
         const rng = createRNG(contentHash(demos))
         kept = [
           rng() < 0.5
-            ? (demos[Math.floor(rng() * (demos.length - 1))] as Demo)
-            : (demos.at(-1) as Demo),
+            ? at(demos, Math.floor(rng() * (demos.length - 1)), "trace demos")
+            : last(demos, "trace demos"),
         ]
       }
       name2traces.get(name)?.push(...kept)
@@ -213,7 +222,7 @@ export async function bootstrapFewShot<TInput, TOutput>(
   }
 
   const bootstrapOneExample = async (
-    example: Example,
+    example: Example<TInput, TOutput>,
     roundIdx: number
   ): Promise<boolean> => {
     const trace: TraceStep[] = []
@@ -221,11 +230,9 @@ export async function bootstrapFewShot<TInput, TOutput>(
     try {
       const prediction = await runTeacherAttempt(example, roundIdx, trace)
       if (metric) {
-        const metricVal = await metric(example, prediction, trace)
+        const { score } = await metric(example, prediction, trace)
         success =
-          metricThreshold === undefined
-            ? Boolean(metricVal)
-            : Number(metricVal) >= metricThreshold
+          metricThreshold === undefined ? score > 0 : score >= metricThreshold
       } else {
         success = true
       }
@@ -250,7 +257,7 @@ export async function bootstrapFewShot<TInput, TOutput>(
       break
     }
     for (let roundIdx = 0; roundIdx < maxRounds; roundIdx += 1) {
-      // biome-ignore lint/performance/noAwaitInLoops: rounds are inherently sequential
+      // oxlint-disable-next-line no-await-in-loop -- rounds are inherently sequential
       if (await bootstrapOneExample(example, roundIdx)) {
         bootstrapped.add(exampleIdx)
         break

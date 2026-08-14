@@ -1,17 +1,21 @@
+import type { InferPublicSchema } from "@mastra/core/schema"
 import { createStep } from "@mastra/core/workflows"
-import { generateObject, type LanguageModel } from "ai"
-import { z } from "zod"
+import type { LanguageModel } from "ai"
+import { generateObject } from "ai"
+import type { z } from "zod"
+
+import type { FieldSchema, Fields } from "@/fields"
 
 /** A few-shot example rendered into the prompt between instructions and input. */
 export type Demo = {
   augmented?: boolean
-  inputs: Record<string, unknown>
-  outputs: Record<string, unknown>
+  inputs: Fields
+  outputs: Fields
 }
 
 export type TraceStep = {
-  inputs: Record<string, unknown>
-  outputs: Record<string, unknown>
+  inputs: Fields
+  outputs: Fields
   predictorName: string
 }
 
@@ -24,8 +28,8 @@ export type RunContext = {
 }
 
 export type PredictorConfig<
-  TInputSchema extends z.ZodType,
-  TOutputSchema extends z.ZodType,
+  TInputSchema extends FieldSchema,
+  TOutputSchema extends FieldSchema,
 > = {
   demos?: Demo[]
   inputSchema: TInputSchema
@@ -38,10 +42,10 @@ export type PredictorConfig<
 }
 
 export type Predictor<
-  TInputSchema extends z.ZodType = z.ZodType,
-  TOutputSchema extends z.ZodType = z.ZodType,
+  TInputSchema extends FieldSchema = FieldSchema,
+  TOutputSchema extends FieldSchema = FieldSchema,
 > = {
-  // biome-ignore lint/style/useConsistentMethodSignatures: method syntax keeps params bivariant so any Predictor is assignable to AnyPredictor
+  // oxlint-disable-next-line typescript/method-signature-style -- method syntax keeps params bivariant so any Predictor is assignable to AnyPredictor
   call(
     inputs: z.infer<TInputSchema>,
     ctx?: RunContext
@@ -59,33 +63,11 @@ export type Predictor<
 
 export type AnyPredictor = Predictor
 
-export type SchemaProperty = {
-  description?: string
-  type?: string
-}
-
-/** Top-level properties of a zod object schema via JSON-schema conversion; {} when the schema can't convert. */
-export function schemaProperties(
-  schema: z.ZodType | undefined
-): Record<string, SchemaProperty> {
-  if (!schema) {
-    return {}
-  }
-  try {
-    const jsonSchema = z.toJSONSchema(schema) as {
-      properties?: Record<string, SchemaProperty>
-    }
-    return jsonSchema.properties ?? {}
-  } catch {
-    return {}
-  }
-}
-
-function renderPrompt(
+const renderPrompt = (
   instructions: string,
   demos: Demo[],
-  inputs: unknown
-): string {
+  inputs: Fields
+): string => {
   const parts = [instructions]
   for (const demo of demos) {
     parts.push(
@@ -96,27 +78,31 @@ function renderPrompt(
   return parts.join("\n\n")
 }
 
-export function declarePredictor<
-  TInputSchema extends z.ZodType,
-  TOutputSchema extends z.ZodType,
+export const declarePredictor = <
+  TInputSchema extends FieldSchema,
+  TOutputSchema extends FieldSchema,
 >(
   config: PredictorConfig<TInputSchema, TOutputSchema>
-): Predictor<TInputSchema, TOutputSchema> {
+): Predictor<TInputSchema, TOutputSchema> => {
   const predictor: Predictor<TInputSchema, TOutputSchema> = {
     call: async (inputs, ctx) => {
-      const { object } = await generateObject({
+      const generated = await generateObject({
         model: ctx?.model ?? predictor.model,
         prompt: renderPrompt(predictor.instructions, predictor.demos, inputs),
         schema: predictor.outputSchema,
         seed: ctx?.seed ?? predictor.seed,
         temperature: ctx?.temperature ?? predictor.temperature,
       })
+      // The AI SDK types `object` through a conditional it can't collapse while
+      // the schema is still generic, so re-parse instead of asserting: this both
+      // recovers the precise output type and re-checks what the model returned.
+      const outputs = predictor.outputSchema.parse(generated.object)
       ctx?.trace?.push({
-        inputs: inputs as Record<string, unknown>,
-        outputs: object as Record<string, unknown>,
+        inputs,
+        outputs,
         predictorName: predictor.name,
       })
-      return object as z.infer<TOutputSchema>
+      return outputs
     },
     clone: () =>
       // declarePredictor already structuredClones the demos it receives.
@@ -144,8 +130,8 @@ export function declarePredictor<
 
 type DeclareStepConfig<
   TStepId extends string,
-  TInputSchema extends z.ZodType,
-  TOutputSchema extends z.ZodType,
+  TInputSchema extends FieldSchema,
+  TOutputSchema extends FieldSchema,
 > = {
   id: TStepId
   inputSchema: TInputSchema
@@ -156,27 +142,39 @@ type DeclareStepConfig<
   temperature?: number
 }
 
-type DeclaredStep<
+/**
+ * A Mastra step that also carries the predictor driving it, so the optimizers can
+ * find and tune it.
+ *
+ * `execute` is declared with method syntax on purpose. Mastra's own execute takes
+ * a much larger params object (runId, mastra, request context…) that it supplies
+ * when running the step inside a workflow, while callers here only ever pass
+ * `inputData`. Method syntax makes the parameter bivariant, so the real Mastra
+ * step satisfies this narrower view without an assertion — the same reason
+ * `Predictor.call` above is written this way.
+ */
+export type DeclaredStep<
   TStepId extends string,
-  TInputSchema extends z.ZodType,
-  TOutputSchema extends z.ZodType,
+  TInputSchema extends FieldSchema,
+  TOutputSchema extends FieldSchema,
 > = {
-  execute: (params: {
+  // oxlint-disable-next-line typescript/method-signature-style -- bivariance is the point; see the doc comment above
+  execute(params: {
     inputData: z.infer<TInputSchema>
-  }) => Promise<z.infer<TOutputSchema>>
+  }): Promise<z.infer<TOutputSchema>>
   id: TStepId
   inputSchema: TInputSchema
   outputSchema: TOutputSchema
   predictor: Predictor<TInputSchema, TOutputSchema>
 }
 
-export function declareStep<
+export const declareStep = <
   TStepId extends string,
-  TInputSchema extends z.ZodType,
-  TOutputSchema extends z.ZodType,
+  TInputSchema extends FieldSchema,
+  TOutputSchema extends FieldSchema,
 >(
   config: DeclareStepConfig<TStepId, TInputSchema, TOutputSchema>
-): DeclaredStep<TStepId, TInputSchema, TOutputSchema> {
+): DeclaredStep<TStepId, TInputSchema, TOutputSchema> => {
   const { instructions, model, temperature, seed, ...stepConfig } = config
   const predictor = declarePredictor({
     inputSchema: config.inputSchema,
@@ -188,12 +186,35 @@ export function declareStep<
     temperature,
   })
 
+  // The predictor is the real implementation; `execute` just adapts it to the
+  // step-shaped call Mastra makes. It is defined here rather than inline so the
+  // same function object is both what Mastra runs and what `DeclaredStep`
+  // describes — Mastra types `inputData` through its own `InferPublicSchema`,
+  // which TS won't equate with zod's `output` while the schema is generic, so
+  // parsing bridges the two spellings instead of asserting between them.
+  const execute = ({ inputData }: { inputData: z.infer<TInputSchema> }) =>
+    predictor.call(inputData)
+
   const step = createStep({
     ...stepConfig,
-    // `never` satisfies Mastra's inferred execute return type without `any`.
-    execute: async ({ inputData }) =>
-      (await predictor.call(inputData as never)) as never,
-  }) as unknown as DeclaredStep<TStepId, TInputSchema, TOutputSchema>
-  step.predictor = predictor
-  return step
+    execute: async ({ inputData }) => {
+      const outputs = await predictor.call(config.inputSchema.parse(inputData))
+      // SAFETY: `outputs` came back from `predictor.call`, which parses it through
+      // `config.outputSchema` — the very schema Mastra derives its expected step
+      // output from. Both sides agree on the runtime shape; the assertion only
+      // bridges zod's `output<T>` and Mastra's `InferPublicSchema<T>`, two
+      // spellings of that same type that TS cannot equate while `T` is generic.
+      return outputs as InferPublicSchema<TOutputSchema>
+    },
+  })
+
+  // Mastra's step stores the schemas re-wrapped as standard-schema objects and
+  // types `execute` for in-workflow invocation. Overwriting all three restores the
+  // library's own view of the step without disturbing what Mastra runs.
+  return Object.assign(step, {
+    execute,
+    inputSchema: config.inputSchema,
+    outputSchema: config.outputSchema,
+    predictor,
+  })
 }

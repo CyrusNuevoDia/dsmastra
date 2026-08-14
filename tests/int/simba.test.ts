@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test"
+
 import { openai } from "@ai-sdk/openai"
 import { z } from "zod"
+
 import { createWorkflow, declareStep, optimize, SIMBA } from "@/index"
 import type { Metric } from "@/simba"
 
@@ -37,12 +39,12 @@ const metric: Metric = (example, prediction) => {
     .toLowerCase()
   const expected = example.outputs.answer as string
   if (answer === expected) {
-    return 1
+    return { score: 1 }
   }
-  if (Number.parseFloat(answer) === numbers[expected]) {
+  if (Number(answer) === numbers[expected]) {
     return { feedback: "Numerically right, but not spelled out.", score: 0.5 }
   }
-  return 0
+  return { score: 0 }
 }
 
 test(
@@ -51,7 +53,8 @@ test(
     const step = declareStep({
       id: "math",
       inputSchema: z.object({ question: z.string() }),
-      instructions: "Answer the arithmetic question.", // underspecified: format unstated
+      // Deliberately underspecified: the output format is left unstated.
+      instructions: "Answer the arithmetic question.",
       model,
       outputSchema: z.object({ answer: z.string() }),
       temperature: 0,

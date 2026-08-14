@@ -1,11 +1,9 @@
+import { at, get, pop, prop } from "@/collections"
+import type { Fields } from "@/fields"
 import type { TraceStep } from "@/predictor"
 import type { Example } from "@/program"
-import {
-  type RNG,
-  shuffle,
-  weightedChoice,
-  weightedChoiceStrict,
-} from "@/random"
+import { shuffle, weightedChoice, weightedChoiceStrict } from "@/random"
+import type { RNG } from "@/random"
 
 export type { RNG } from "@/random"
 
@@ -16,9 +14,9 @@ export type { RNG } from "@/random"
  */
 export type Candidate = Record<string, string>
 
-export type Trajectory = {
-  example: Example
-  prediction: Record<string, unknown> | null
+export type Trajectory<TInput = Fields, TOutput = Fields> = {
+  example: Example<TInput, TOutput>
+  prediction: TOutput | null
   score: number
   trace: GEPATraceStep[]
 }
@@ -31,10 +29,10 @@ export type GEPATraceStep = TraceStep & {
   parseFailure?: string
 }
 
-export type EvaluationBatch = {
-  outputs: (Record<string, unknown> | null)[]
+export type EvaluationBatch<TInput = Fields, TOutput = Fields> = {
+  outputs: (TOutput | null)[]
   scores: number[]
-  trajectories?: Trajectory[]
+  trajectories?: Trajectory<TInput, TOutput>[]
 }
 
 export type ReflectiveExample = {
@@ -50,15 +48,15 @@ export type ReflectiveDataset = Record<string, ReflectiveExample[]>
  * The engine/adapter seam: the engine owns state, the Pareto frontier, the
  * loop, and merge; the adapter owns everything program- and LM-specific.
  */
-export type GEPAAdapter = {
+export type GEPAAdapter<TInput = Fields, TOutput = Fields> = {
   evaluate: (
-    batch: Example[],
+    batch: Example<TInput, TOutput>[],
     candidate: Candidate,
     captureTraces: boolean
-  ) => Promise<EvaluationBatch>
+  ) => Promise<EvaluationBatch<TInput, TOutput>>
   makeReflectiveDataset: (
     candidate: Candidate,
-    evalBatch: EvaluationBatch,
+    evalBatch: EvaluationBatch<TInput, TOutput>,
     componentsToUpdate: string[]
   ) => Promise<ReflectiveDataset>
   proposeNewTexts: (
@@ -83,41 +81,21 @@ export type GEPAState = {
 
 // --- Small helpers ----------------------------------------------------------
 
-function sum(values: number[]): number {
-  return values.reduce((acc, v) => acc + v, 0)
-}
+export const MERGE_VAL_OVERLAP_FLOOR = 5
 
-/** Mean of a candidate's per-instance scores; -Infinity if unevaluated. */
-export function aggregateScore(subscores: Map<number, number>): number {
-  if (subscores.size === 0) {
-    return Number.NEGATIVE_INFINITY
-  }
-  return sum([...subscores.values()]) / subscores.size
-}
-
-/** argmax with lowest-index-wins ties. */
-export function argmax(values: number[]): number {
-  let best = 0
-  for (let i = 1; i < values.length; i += 1) {
-    if ((values[i] as number) > (values[best] as number)) {
-      best = i
-    }
-  }
-  return best
-}
-
-// --- Pareto frontier --------------------------------------------------------
+const toSubscores = (scores: number[]): Map<number, number> =>
+  new Map(scores.map((score, valId) => [valId, score]))
 
 /**
  * Per-instance frontier update after a candidate's full valset eval. Strict
  * improvement replaces the set; an exact float tie (no epsilon) adds to it.
  */
-export function updateParetoFront(
+export const updateParetoFront = (
   front: Map<number, number>,
   frontPrograms: Map<number, Set<number>>,
   candidateIdx: number,
   subscores: Map<number, number>
-): void {
+): void => {
   for (const [valId, score] of subscores) {
     const prev = front.get(valId)
     if (prev === undefined || score > prev) {
@@ -130,16 +108,81 @@ export function updateParetoFront(
 }
 
 /**
+ * Register an accepted candidate: snapshot the budget as its discovery count
+ * BEFORE billing its full eval, bill it, update the frontier, and inherit
+ * `max(parent cursors)` as its round-robin cursor.
+ */
+const addCandidate = (
+  state: GEPAState,
+  candidate: Candidate,
+  parents: (number | null)[],
+  subscores: Map<number, number>,
+  valsetSize: number
+): number => {
+  const idx = state.programCandidates.length
+  state.programCandidates.push(candidate)
+  state.parentProgramForCandidate.push(parents)
+  state.progCandidateValSubscores.push(subscores)
+  state.numMetricCallsByDiscovery.push(state.totalNumEvals)
+  state.namedPredictorIdToUpdateNextForProgramCandidate.push(
+    Math.max(
+      0,
+      ...parents
+        .filter((p): p is number => p !== null)
+        .map((p) =>
+          at(
+            state.namedPredictorIdToUpdateNextForProgramCandidate,
+            p,
+            "predictor cursors"
+          )
+        )
+    )
+  )
+  state.totalNumEvals += valsetSize
+  state.numFullDSEvals += 1
+  updateParetoFront(
+    state.paretoFrontValset,
+    state.programAtParetoFrontValset,
+    idx,
+    subscores
+  )
+  return idx
+}
+
+const sum = (values: number[]): number => values.reduce((acc, v) => acc + v, 0)
+
+/** Mean of a candidate's per-instance scores; -Infinity if unevaluated. */
+export const aggregateScore = (subscores: Map<number, number>): number => {
+  if (subscores.size === 0) {
+    return Number.NEGATIVE_INFINITY
+  }
+  return sum([...subscores.values()]) / subscores.size
+}
+
+/** argmax with lowest-index-wins ties. */
+export const argmax = (values: number[]): number => {
+  let best = 0
+  for (let i = 1; i < values.length; i += 1) {
+    if (at(values, i, "argmax values") > at(values, best, "argmax values")) {
+      best = i
+    }
+  }
+  return best
+}
+
+// --- Pareto frontier --------------------------------------------------------
+
+/**
  * Dominance filter: a candidate survives iff it is the sole occupant of at
  * least one instance's front. Scan candidates ascending by aggregate score,
  * mark one dominated when every front containing it also holds another
  * non-dominated candidate, and restart after each removal — so ties resolve
  * toward the higher aggregate scorer.
  */
-export function removeDominatedPrograms(
+export const removeDominatedPrograms = (
   frontPrograms: Map<number, Set<number>>,
   aggScores: number[]
-): number[] {
+): number[] => {
   const members = new Set<number>()
   for (const set of frontPrograms.values()) {
     for (const idx of set) {
@@ -148,7 +191,7 @@ export function removeDominatedPrograms(
   }
   // Stable sort by score alone: exact-score ties keep front-iteration
   // encounter order, matching Python's sorted(programs, key=score).
-  const ascending = [...members].sort(
+  const ascending = [...members].toSorted(
     (a, b) =>
       (aggScores[a] ?? Number.NEGATIVE_INFINITY) -
       (aggScores[b] ?? Number.NEGATIVE_INFINITY)
@@ -174,18 +217,20 @@ export function removeDominatedPrograms(
       }
     }
   }
-  return [...members].filter((idx) => !dominated.has(idx)).sort((a, b) => a - b)
+  return [...members]
+    .filter((idx) => !dominated.has(idx))
+    .toSorted((a, b) => a - b)
 }
 
 /**
  * Pareto parent sampling: dominance-filter the frontier, then pick a survivor
  * with probability proportional to how many instance fronts it occupies.
  */
-export function selectParetoParent(
+export const selectParetoParent = (
   frontPrograms: Map<number, Set<number>>,
   aggScores: number[],
   rng: RNG
-): number {
+): number => {
   const survivors = removeDominatedPrograms(frontPrograms, aggScores)
   const frequencies = survivors.map(
     (idx) => [...frontPrograms.values()].filter((set) => set.has(idx)).length
@@ -200,11 +245,11 @@ export function selectParetoParent(
  * the tail to a multiple of bsize with the least-frequently-used id, and serve
  * sequential windows keyed by iteration number.
  */
-export function createEpochShuffledSampler(
+export const createEpochShuffledSampler = (
   rng: RNG,
   trainSize: number,
   bsize: number
-): (iteration: number) => number[] {
+): ((iteration: number) => number[]) => {
   let shuffled: number[] = []
   let epoch = -1
 
@@ -248,22 +293,20 @@ export function createEpochShuffledSampler(
 // --- Merge (crossover) ------------------------------------------------------
 
 /** Transitive closure over parent lineage (excludes the candidate itself). */
-export function findAncestors(
+export const findAncestors = (
   parents: (number | null)[][],
   idx: number
-): Set<number> {
+): Set<number> => {
   const ancestors = new Set<number>()
-  const stack = [
-    ...((parents[idx] ?? []).filter((p) => p !== null) as number[]),
-  ]
+  const stack = (parents[idx] ?? []).filter((p): p is number => p !== null)
   while (stack.length > 0) {
-    const current = stack.pop() as number
+    const current = pop(stack, "ancestor stack")
     if (ancestors.has(current)) {
       continue
     }
     ancestors.add(current)
     stack.push(
-      ...((parents[current] ?? []).filter((p) => p !== null) as number[])
+      ...(parents[current] ?? []).filter((p): p is number => p !== null)
     )
   }
   return ancestors
@@ -274,17 +317,17 @@ export function findAncestors(
  * divergence from the ancestor wins; a double divergence goes to the
  * higher-aggregate descendant, coin-flipped on an exact tie.
  */
-export function buildMergedCandidate(
+export const buildMergedCandidate = (
   ancestor: Candidate,
   descendantI: Candidate,
   descendantJ: Candidate,
   aggI: number,
   aggJ: number,
   rng: RNG
-): Candidate {
-  const merged: Candidate = { ...ancestor }
+) => {
+  const merged = { ...ancestor }
   for (const component of Object.keys(ancestor)) {
-    const anc = ancestor[component] as string
+    const anc = prop(ancestor, component, "ancestor components")
     const di = descendantI[component] ?? anc
     const dj = descendantJ[component] ?? anc
     if (di === dj) {
@@ -321,11 +364,10 @@ export const tripletKey = (ancestor: number, i: number, j: number) =>
 
 const MERGE_MAX_ATTEMPTS = 10
 
-function candidateKey(candidate: Candidate): string {
-  return JSON.stringify(
-    Object.entries(candidate).sort(([a], [b]) => a.localeCompare(b))
+const candidateKey = (candidate: Candidate): string =>
+  JSON.stringify(
+    Object.entries(candidate).toSorted(([a], [b]) => a.localeCompare(b))
   )
-}
 
 /**
  * One pair-sampling attempt loop (Python's find_common_ancestor_pair): sample
@@ -334,20 +376,24 @@ function candidateKey(candidate: Candidate): string {
  * (b) have a component exactly one descendant changed, (c) aren't a tried
  * triplet. No eligible ancestor → resample the pair.
  */
-function findCommonAncestorPair(
+const findCommonAncestorPair = (
   state: GEPAState,
   aggScores: number[],
   survivors: number[],
   rng: RNG,
   memory: MergeMemory
-): [number, number, number] | null {
+): [number, number, number] | null => {
   for (let attempt = 0; attempt < MERGE_MAX_ATTEMPTS; attempt += 1) {
     if (survivors.length < 2) {
       return null
     }
-    const first = survivors[Math.floor(rng() * survivors.length)] as number
+    const first = at(
+      survivors,
+      Math.floor(rng() * survivors.length),
+      "merge survivors"
+    )
     const rest = survivors.filter((idx) => idx !== first)
-    const second = rest[Math.floor(rng() * rest.length)] as number
+    const second = at(rest, Math.floor(rng() * rest.length), "merge survivors")
     const i = Math.min(first, second)
     const j = Math.max(first, second)
     const ancestorsI = findAncestors(state.parentProgramForCandidate, i)
@@ -368,9 +414,9 @@ function findCommonAncestorPair(
         ) {
           return false
         }
-        const ancestor = state.programCandidates[anc] as Candidate
-        const ci = state.programCandidates[i] as Candidate
-        const cj = state.programCandidates[j] as Candidate
+        const ancestor = at(state.programCandidates, anc, "candidates")
+        const ci = at(state.programCandidates, i, "candidates")
+        const cj = at(state.programCandidates, j, "candidates")
         return Object.keys(ancestor).some((component) => {
           const anc_ = ancestor[component]
           const di = ci[component]
@@ -399,13 +445,13 @@ function findCommonAncestorPair(
  * resamples a fresh pair rather than giving up. The tried-triplet memo is
  * recorded by the CALLER for the returned proposal only.
  */
-export function proposeMerge(
+export const proposeMerge = (
   state: GEPAState,
   aggScores: number[],
   rng: RNG,
   memory: MergeMemory,
   valOverlapFloor = MERGE_VAL_OVERLAP_FLOOR
-): MergeProposal | null {
+): MergeProposal | null => {
   const survivors = removeDominatedPrograms(
     state.programAtParetoFrontValset,
     aggScores
@@ -429,9 +475,9 @@ export function proposeMerge(
       continue
     }
     const merged = buildMergedCandidate(
-      state.programCandidates[ancestor] as Candidate,
-      state.programCandidates[i] as Candidate,
-      state.programCandidates[j] as Candidate,
+      at(state.programCandidates, ancestor, "candidates"),
+      at(state.programCandidates, i, "candidates"),
+      at(state.programCandidates, j, "candidates"),
       aggScores[i] ?? Number.NEGATIVE_INFINITY,
       aggScores[j] ?? Number.NEGATIVE_INFINITY,
       rng
@@ -440,8 +486,8 @@ export function proposeMerge(
     if (memory.producedByPair.has(pairKey)) {
       continue
     }
-    const subscoresI = state.progCandidateValSubscores[i] as Map<number, number>
-    const subscoresJ = state.progCandidateValSubscores[j] as Map<number, number>
+    const subscoresI = at(state.progCandidateValSubscores, i, "val subscores")
+    const subscoresJ = at(state.progCandidateValSubscores, j, "val subscores")
     const sharedIds = [...subscoresI.keys()].filter((valId) =>
       subscoresJ.has(valId)
     )
@@ -454,11 +500,10 @@ export function proposeMerge(
   return null
 }
 
-export const MERGE_VAL_OVERLAP_FLOOR = 5
 const MERGE_SUBSAMPLE_SIZE = 5
 const MERGE_PER_BUCKET = Math.max(1, Math.ceil(MERGE_SUBSAMPLE_SIZE / 3))
 
-function sampleUpTo<T>(rng: RNG, items: T[], count: number): T[] {
+const sampleUpTo = <T>(rng: RNG, items: T[], count: number): T[] => {
   const pool = [...items]
   shuffle(rng, pool)
   return pool.slice(0, count)
@@ -469,18 +514,18 @@ function sampleUpTo<T>(rng: RNG, items: T[], count: number): T[] {
  * the i-better / j-better / tied buckets, topped up from unused ids (with
  * replacement only as a last resort), truncated to 5.
  */
-export function buildMergeSubsample(
+export const buildMergeSubsample = (
   sharedIds: number[],
   subscoresI: Map<number, number>,
   subscoresJ: Map<number, number>,
   rng: RNG
-): number[] {
+): number[] => {
   const iBetter: number[] = []
   const jBetter: number[] = []
   const tied: number[] = []
   for (const valId of sharedIds) {
-    const si = subscoresI.get(valId) as number
-    const sj = subscoresJ.get(valId) as number
+    const si = get(subscoresI, valId, "subscores I")
+    const sj = get(subscoresJ, valId, "subscores J")
     if (si > sj) {
       iBetter.push(valId)
     } else if (sj > si) {
@@ -512,7 +557,9 @@ export function buildMergeSubsample(
     } else if (sharedIds.length > 0) {
       // Last resort: sample WITH replacement from all shared ids.
       for (let k = 0; k < remaining; k += 1) {
-        chosen.push(sharedIds[Math.floor(rng() * sharedIds.length)] as number)
+        chosen.push(
+          at(sharedIds, Math.floor(rng() * sharedIds.length), "shared ids")
+        )
       }
     }
   }
@@ -527,12 +574,12 @@ export type MergeOutcome = "accepted" | "none" | "rejected"
  * merged sum is `>=` the better parent's sum on the same ids — non-strict,
  * unlike reflection's strict `>`.
  */
-export async function runMergeIteration(
-  adapter: GEPAAdapter,
+export const runMergeIteration = async <TInput, TOutput>(
+  adapter: GEPAAdapter<TInput, TOutput>,
   state: GEPAState,
-  options: { rng: RNG; valset: Example[] },
+  options: { rng: RNG; valset: Example<TInput, TOutput>[] },
   memory: MergeMemory
-): Promise<MergeOutcome> {
+): Promise<MergeOutcome> => {
   const { rng, valset } = options
   const aggScores = state.progCandidateValSubscores.map(aggregateScore)
   const proposal = proposeMerge(state, aggScores, rng, memory)
@@ -544,24 +591,30 @@ export async function runMergeIteration(
   memory.triedTriplets.add(
     tripletKey(proposal.ancestor, proposal.parentI, proposal.parentJ)
   )
-  const subscoresI = state.progCandidateValSubscores[proposal.parentI] as Map<
-    number,
-    number
-  >
-  const subscoresJ = state.progCandidateValSubscores[proposal.parentJ] as Map<
-    number,
-    number
-  >
+  const subscoresI = at(
+    state.progCandidateValSubscores,
+    proposal.parentI,
+    "val subscores"
+  )
+  const subscoresJ = at(
+    state.progCandidateValSubscores,
+    proposal.parentJ,
+    "val subscores"
+  )
   const sharedIds = [...subscoresI.keys()].filter((valId) =>
     subscoresJ.has(valId)
   )
   const subsample = buildMergeSubsample(sharedIds, subscoresI, subscoresJ, rng)
-  const batch = subsample.map((valId) => valset[valId] as Example)
+  const batch = subsample.map((valId) => at(valset, valId, "valset"))
   const mergedEval = await adapter.evaluate(batch, proposal.candidate, false)
   state.totalNumEvals += batch.length
   const sumMerged = sum(mergedEval.scores)
-  const sumI = sum(subsample.map((valId) => subscoresI.get(valId) as number))
-  const sumJ = sum(subsample.map((valId) => subscoresJ.get(valId) as number))
+  const sumI = sum(
+    subsample.map((valId) => get(subscoresI, valId, "subscores I"))
+  )
+  const sumJ = sum(
+    subsample.map((valId) => get(subscoresJ, valId, "subscores J"))
+  )
   if (sumMerged < Math.max(sumI, sumJ)) {
     return "rejected"
   }
@@ -581,7 +634,7 @@ export async function runMergeIteration(
 
 // --- Engine -----------------------------------------------------------------
 
-export type EngineOptions = {
+export type EngineOptions<TInput = Fields, TOutput = Fields> = {
   candidateSelectionStrategy: "currentBest" | "pareto"
   componentSelector: "all" | "roundRobin"
   maxMergeInvocations: number
@@ -591,55 +644,15 @@ export type EngineOptions = {
   rng: RNG
   seedCandidate: Candidate
   skipPerfectScore: boolean
-  trainset: Example[]
+  trainset: Example<TInput, TOutput>[]
   useMerge: boolean
-  valset: Example[]
+  valset: Example<TInput, TOutput>[]
 }
 
-function toSubscores(scores: number[]): Map<number, number> {
-  return new Map(scores.map((score, valId) => [valId, score]))
-}
-
-/**
- * Register an accepted candidate: snapshot the budget as its discovery count
- * BEFORE billing its full eval, bill it, update the frontier, and inherit
- * `max(parent cursors)` as its round-robin cursor.
- */
-function addCandidate(
+const selectParent = (
   state: GEPAState,
-  candidate: Candidate,
-  parents: (number | null)[],
-  subscores: Map<number, number>,
-  valsetSize: number
-): number {
-  const idx = state.programCandidates.length
-  state.programCandidates.push(candidate)
-  state.parentProgramForCandidate.push(parents)
-  state.progCandidateValSubscores.push(subscores)
-  state.numMetricCallsByDiscovery.push(state.totalNumEvals)
-  state.namedPredictorIdToUpdateNextForProgramCandidate.push(
-    Math.max(
-      0,
-      ...parents
-        .filter((p): p is number => p !== null)
-        .map(
-          (p) =>
-            state.namedPredictorIdToUpdateNextForProgramCandidate[p] as number
-        )
-    )
-  )
-  state.totalNumEvals += valsetSize
-  state.numFullDSEvals += 1
-  updateParetoFront(
-    state.paretoFrontValset,
-    state.programAtParetoFrontValset,
-    idx,
-    subscores
-  )
-  return idx
-}
-
-function selectParent(state: GEPAState, options: EngineOptions): number {
+  options: Pick<EngineOptions, "candidateSelectionStrategy" | "rng">
+): number => {
   const aggScores = state.progCandidateValSubscores.map(aggregateScore)
   if (options.candidateSelectionStrategy === "currentBest") {
     return argmax(aggScores)
@@ -651,10 +664,10 @@ function selectParent(state: GEPAState, options: EngineOptions): number {
   )
 }
 
-export async function runGEPA(
-  adapter: GEPAAdapter,
-  options: EngineOptions
-): Promise<GEPAState> {
+export const runGEPA = async <TInput, TOutput>(
+  adapter: GEPAAdapter<TInput, TOutput>,
+  options: EngineOptions<TInput, TOutput>
+): Promise<GEPAState> => {
   const { rng, trainset, valset } = options
   const componentNames = Object.keys(options.seedCandidate)
 
@@ -675,7 +688,7 @@ export async function runGEPA(
     state.paretoFrontValset,
     state.programAtParetoFrontValset,
     0,
-    state.progCandidateValSubscores[0] as Map<number, number>
+    at(state.progCandidateValSubscores, 0, "val subscores")
   )
 
   const sampler = createEpochShuffledSampler(
@@ -693,10 +706,10 @@ export async function runGEPA(
 
   const runReflection = async (): Promise<void> => {
     const parentIdx = selectParent(state, options)
-    const parent = state.programCandidates[parentIdx] as Candidate
+    const parent = at(state.programCandidates, parentIdx, "candidates")
 
     const minibatchIds = sampler(state.i)
-    const batch = minibatchIds.map((id) => trainset[id] as Example)
+    const batch = minibatchIds.map((id) => at(trainset, id, "trainset"))
     const parentEval = await adapter.evaluate(batch, parent, true)
     state.totalNumEvals += batch.length
 
@@ -715,10 +728,14 @@ export async function runGEPA(
       components = componentNames
     } else {
       // The cursor advances on the parent even if the proposal is rejected.
-      const cursor = state.namedPredictorIdToUpdateNextForProgramCandidate[
-        parentIdx
-      ] as number
-      components = [componentNames[cursor % componentNames.length] as string]
+      const cursor = at(
+        state.namedPredictorIdToUpdateNextForProgramCandidate,
+        parentIdx,
+        "predictor cursors"
+      )
+      components = [
+        at(componentNames, cursor % componentNames.length, "component names"),
+      ]
       state.namedPredictorIdToUpdateNextForProgramCandidate[parentIdx] =
         (cursor + 1) % componentNames.length
     }
@@ -748,7 +765,7 @@ export async function runGEPA(
     if (applicable.length === 0) {
       return
     }
-    const child: Candidate = { ...parent }
+    const child = { ...parent }
     for (const [name, text] of applicable) {
       child[name] = text
     }
@@ -782,7 +799,7 @@ export async function runGEPA(
     state.i += 1
     if (options.useMerge && mergesDue > 0 && lastIterFoundNewProgram) {
       lastIterFoundNewProgram = false
-      // biome-ignore lint/performance/noAwaitInLoops: iterations are inherently sequential
+      // oxlint-disable-next-line no-await-in-loop -- iterations are inherently sequential
       const outcome = await runMergeIteration(
         adapter,
         state,
@@ -799,6 +816,7 @@ export async function runGEPA(
         continue
       }
     }
+    // oxlint-disable-next-line no-await-in-loop -- GEPA iterations are inherently sequential: each reflection reads state the previous one wrote
     await runReflection()
   }
 

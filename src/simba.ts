@@ -1,29 +1,32 @@
-import { generateObject, type LanguageModel } from "ai"
+import { generateObject } from "ai"
+import type { LanguageModel } from "ai"
 import { z } from "zod"
-import {
-  type AnyPredictor,
-  type RunContext,
-  schemaProperties,
-  type TraceStep,
-} from "@/predictor"
+
+import { at, first, last } from "@/collections"
+import type { Fields } from "@/fields"
+import type { JSONData } from "@/json"
+import { classifyJSON } from "@/json"
+import type { MetricOutput } from "@/metric"
+import type { RunContext, TraceStep } from "@/predictor"
 import type { Example, Program } from "@/program"
 import { createRNG, samplePoisson, shuffle, weightedChoice } from "@/random"
+import { schemaProperties } from "@/schema"
 
 export type { Example } from "@/program"
 
-export type MetricResult = number | { score: number; [key: string]: unknown }
+export type { MetricResult } from "@/metric"
 
-export type Metric = (
-  example: Example,
-  prediction: Record<string, unknown> | undefined
-) => MetricResult | Promise<MetricResult>
+export type Metric<TInput = Fields, TOutput = Fields> = (
+  example: Example<TInput, TOutput>,
+  prediction: TOutput | undefined
+) => MetricOutput
 
-export type SIMBAConfig = {
+export type SIMBAConfig<TInput = Fields, TOutput = Fields> = {
   bsize?: number
   demoInputFieldMaxlen?: number
   maxDemos?: number
   maxSteps?: number
-  metric: Metric
+  metric: Metric<TInput, TOutput>
   numCandidates?: number
   /** LM used to write rules; defaults to the first predictor's model. */
   promptModel?: LanguageModel
@@ -33,19 +36,19 @@ export type SIMBAConfig = {
   temperatureForSampling?: number
 }
 
-export type Rollout = {
-  example: Example
-  outputMetadata: Record<string, unknown>
-  prediction: Record<string, unknown> | undefined
+export type Rollout<TInput = Fields, TOutput = Fields> = {
+  example: Example<TInput, TOutput>
+  outputMetadata: Fields
+  prediction: TOutput | undefined
   score: number
   trace: TraceStep[]
 }
 
-export type Bucket = {
+export type Bucket<TInput = Fields, TOutput = Fields> = {
   maxScore: number
   maxToAvgGap: number
   maxToMinGap: number
-  rollouts: Rollout[]
+  rollouts: Rollout<TInput, TOutput>[]
 }
 
 export type TrialLog = {
@@ -61,12 +64,11 @@ export type SIMBAResult<TInput, TOutput> = {
   trialLogs: TrialLog[]
 }
 
-function mean(values: number[]): number {
-  return values.reduce((acc, v) => acc + v, 0) / values.length
-}
+const mean = (values: number[]): number =>
+  values.reduce((acc, v) => acc + v, 0) / values.length
 
 /** Python's round(): banker's rounding, used for final-selection spacing. */
-export function roundHalfEven(x: number): number {
+export const roundHalfEven = (x: number): number => {
   const floor = Math.floor(x)
   const diff = x - floor
   if (diff > 0.5) {
@@ -85,10 +87,10 @@ export function roundHalfEven(x: number): number {
  * the lower index), take the first k, force the baseline (0) into the last
  * slot if absent, then dedupe preserving order. May return fewer than k.
  */
-export function topKPlusBaseline(avgScores: number[], k: number): number[] {
+export const topKPlusBaseline = (avgScores: number[], k: number): number[] => {
   const sorted = avgScores
     .map((avg, idx) => ({ avg, idx }))
-    .sort((a, b) => b.avg - a.avg)
+    .toSorted((a, b) => b.avg - a.avg)
     .slice(0, k)
     .map((entry) => entry.idx)
   if (sorted.length > 0 && !sorted.includes(0)) {
@@ -101,12 +103,12 @@ export function topKPlusBaseline(avgScores: number[], k: number): number[] {
  * Sample an index weighted by exp(avg/temperature); uniform fallback when the
  * weight sum is not positive. With all-zero scores this is uniform.
  */
-export function softmaxSample(
+export const softmaxSample = (
   rng: () => number,
   programIdxs: number[],
   avgScores: number[],
   temperature: number
-): number {
+): number => {
   if (programIdxs.length === 0) {
     throw new Error("No programs available for softmax sampling.")
   }
@@ -118,16 +120,16 @@ export function softmaxSample(
 }
 
 /** NumPy-default linear-interpolation percentile. */
-export function percentile(values: number[], p: number): number {
-  const sorted = [...values].sort((a, b) => a - b)
+export const percentile = (values: number[], p: number): number => {
+  const sorted = values.toSorted((a, b) => a - b)
   if (sorted.length === 0) {
     return 0
   }
   const rank = (p / 100) * (sorted.length - 1)
   const lo = Math.floor(rank)
   const hi = Math.ceil(rank)
-  const low = sorted[lo] as number
-  const high = sorted[hi] as number
+  const low = at(sorted, lo, "sorted scores")
+  const high = at(sorted, hi, "sorted scores")
   return low + (high - low) * (rank - lo)
 }
 
@@ -137,16 +139,19 @@ export function percentile(values: number[], p: number): number {
  * (max−min gap, max score, max−avg gap) lexicographically descending.
  * Rollout records are shallow-copied so strategies never mutate shared state.
  */
-export function makeBuckets(rollouts: Rollout[], bsize: number): Bucket[] {
-  const buckets: Bucket[] = []
+export const makeBuckets = <TInput, TOutput>(
+  rollouts: Rollout<TInput, TOutput>[],
+  bsize: number
+): Bucket<TInput, TOutput>[] => {
+  const buckets: Bucket<TInput, TOutput>[] = []
   for (let exampleIdx = 0; exampleIdx < bsize; exampleIdx += 1) {
-    const bucket: Rollout[] = []
+    const bucket: Rollout<TInput, TOutput>[] = []
     for (let i = exampleIdx; i < rollouts.length; i += bsize) {
-      bucket.push({ ...(rollouts[i] as Rollout) })
+      bucket.push({ ...at(rollouts, i, "rollouts") })
     }
     bucket.sort((a, b) => b.score - a.score)
-    const maxScore = (bucket[0] as Rollout).score
-    const minScore = (bucket.at(-1) as Rollout).score
+    const maxScore = first(bucket, "bucket").score
+    const minScore = last(bucket, "bucket").score
     const avgScore = mean(bucket.map((r) => r.score))
     buckets.push({
       maxScore,
@@ -172,12 +177,12 @@ export function makeBuckets(rollouts: Rollout[], bsize: number): Bucket[] {
  * realized drop count can be lower than the sampled one. The single index set
  * applies to every predictor of the candidate.
  */
-export function dropDemos(
+export const dropDemos = (
   candidate: Program<never, unknown>,
   maxDemos: number,
   rng: () => number,
   poissonRNG: () => number
-): number {
+): number => {
   const cap = maxDemos > 0 ? maxDemos : 3
   const numDemos = Math.max(
     0,
@@ -200,12 +205,12 @@ export function dropDemos(
 
 // --- Strategy A: append_a_demo ---------------------------------------------
 
-export function appendADemo(
-  bucket: Bucket,
-  candidate: Program<never, unknown>,
+export const appendADemo = <TInput, TOutput>(
+  bucket: Bucket<TInput, TOutput>,
+  candidate: Program<TInput, TOutput>,
   opts: { demoInputFieldMaxlen: number; p10: number }
-): boolean {
-  const good = bucket.rollouts[0] as Rollout
+): boolean => {
+  const good = first(bucket.rollouts, "bucket rollouts")
   if (good.score <= opts.p10) {
     console.log(
       `Skipping appending a demo as good score ${good.score} is at or below the 10th percentile.`
@@ -213,12 +218,9 @@ export function appendADemo(
     return false
   }
 
-  const nameToDemo = new Map<
-    string,
-    { inputs: Record<string, unknown>; outputs: Record<string, unknown> }
-  >()
+  const nameToDemo = new Map<string, { inputs: Fields; outputs: Fields }>()
   for (const step of good.trace) {
-    const inputs: Record<string, unknown> = { ...step.inputs }
+    const inputs: Fields = { ...step.inputs }
     for (const [key, value] of Object.entries(inputs)) {
       const text = String(value)
       if (
@@ -295,7 +297,7 @@ const OFFER_FEEDBACK_INPUT_FIELDS: [string, string][] = [
 ]
 
 const MODULE_ADVICE_DESCRIPTION =
-  // biome-ignore lint/suspicious/noTemplateCurlyInString: verbatim upstream field description
+  // oxlint-disable-next-line no-template-curly-in-string -- verbatim upstream field description
   "For each module, describe very concretely: If the module receives ${description of input or patterns therein}, then it should ${description of content, behavior, or strategies to adopt and/or others to avoid}. Basically, your advice be such that if the module has access to your tip, it would be much more likely to act like the successful trajectory rather than the lower-scoring trajectory."
 
 // moduleAdvice is a closed object keyed by the exact module names: a
@@ -313,51 +315,53 @@ const offerFeedbackSchema = (moduleNames: string[]) =>
   })
 
 /** Replace non-serializable values recursively, like dspy's recursive_mask. */
-export function recursiveMask(value: unknown): unknown {
-  if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return value
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a predictor output is an open value until `classifyJSON` sorts it on the next line; that call is the boundary parse, and `JSONData` is the named type it returns
+export const recursiveMask = (value: unknown): JSONData => {
+  const json = classifyJSON(value)
+  switch (json.kind) {
+    case "array": {
+      return json.items.map(recursiveMask)
+    }
+    case "object": {
+      return Object.fromEntries(
+        json.entries.map(([k, v]) => [k, recursiveMask(v)])
+      )
+    }
+    case "null": {
+      return null
+    }
+    case "primitive":
+    case "string": {
+      return json.value
+    }
+    default: {
+      return json.description
+    }
   }
-  if (Array.isArray(value)) {
-    return value.map(recursiveMask)
-  }
-  if (typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
-        k,
-        recursiveMask(v),
-      ])
-    )
-  }
-  return `<non-serializable: ${typeof value}>`
 }
 
-function serializeField(value: unknown): string {
-  return typeof value === "string"
-    ? value
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- same boundary as `recursiveMask`: the field value is open until `classifyJSON` sorts it
+const serializeField = (value: unknown): string => {
+  const json = classifyJSON(value)
+  return json.kind === "string"
+    ? json.value
     : JSON.stringify(recursiveMask(value), null, 2)
 }
 
-function fieldDescriptionLines(schema: z.ZodType): string {
-  return Object.entries(schemaProperties(schema))
+const fieldDescriptionLines = (schema: z.ZodType): string =>
+  Object.entries(schemaProperties(schema))
     .map(
       ([name, prop]) =>
         `${name} (${prop.type ?? "unknown"})${prop.description ? `: ${prop.description}` : ""}`
     )
     .join("\n")
-}
 
 const MODULE_SEPARATOR = "-".repeat(80)
 
-function indentContinuations(text: string): string {
-  return ["", ...text.split("\n")].join("\n\t\t")
-}
+const indentContinuations = (text: string): string =>
+  ["", ...text.split("\n")].join("\n\t\t")
 
-export function inspectModules(program: Program<never, unknown>): string {
+export const inspectModules = (program: Program<never, unknown>): string => {
   const blocks = [MODULE_SEPARATOR]
   for (const predictor of program.predictors) {
     blocks.push(
@@ -368,7 +372,7 @@ export function inspectModules(program: Program<never, unknown>): string {
       MODULE_SEPARATOR
     )
   }
-  return blocks.map((block) => block.replace(/^\n+|\n+$/g, "")).join("\n")
+  return blocks.map((block) => block.replaceAll(/^\n+|\n+$/gu, "")).join("\n")
 }
 
 export type OfferFeedbackResult = {
@@ -376,11 +380,11 @@ export type OfferFeedbackResult = {
   moduleAdvice: Record<string, string>
 }
 
-export async function offerFeedback(
+export const offerFeedback = async (
   promptModel: LanguageModel,
   moduleNames: string[],
-  fields: Record<string, unknown>
-): Promise<OfferFeedbackResult> {
+  fields: Fields
+): Promise<OfferFeedbackResult> => {
   const sections = OFFER_FEEDBACK_INPUT_FIELDS.map(
     ([name, description]) =>
       `[[ ## ${name} ## ]]\n${description}\n\n${serializeField(fields[name])}`
@@ -393,17 +397,43 @@ export async function offerFeedback(
   return object
 }
 
-export async function appendARule(
-  bucket: Bucket,
-  candidate: Program<never, unknown>,
+/**
+ * One side of the good/bad contrast shown to the reflection LM. Either half may
+ * be blanked out when the two rollouts didn't actually differ, which is why the
+ * score can read "N/A" and the prediction can be a placeholder record.
+ */
+type RolloutContrast = {
+  outputMetadata: Fields
+  prediction: Fields | undefined
+  score: number | "N/A"
+  trace: TraceStep[]
+}
+
+const toTrajectory = (trace: TraceStep[]) =>
+  trace.map((step) => ({
+    inputs: step.inputs,
+    module_name: step.predictorName,
+    outputs: step.outputs,
+  }))
+
+/** Stand-in shown when a rollout carries no usable contrast. */
+const BLANKED_CONTRAST = {
+  prediction: { "N/A": "Prediction not available" },
+  score: "N/A",
+  trace: [],
+} as const satisfies Partial<RolloutContrast>
+
+export const appendARule = async <TInput, TOutput extends Fields>(
+  bucket: Bucket<TInput, TOutput>,
+  candidate: Program<TInput, TOutput>,
   opts: {
     p10: number
     p90: number
     promptModel: LanguageModel
   }
-): Promise<boolean> {
-  const good = bucket.rollouts[0] as Rollout
-  const bad = bucket.rollouts.at(-1) as Rollout
+): Promise<boolean> => {
+  const good = first(bucket.rollouts, "bucket rollouts")
+  const bad = last(bucket.rollouts, "bucket rollouts")
 
   if (good.score <= opts.p10 || bad.score >= opts.p90) {
     console.log(
@@ -415,37 +445,25 @@ export async function appendARule(
 
   // Blank the uninformative half when there's no real contrast. Local views
   // only — never mutate the shared rollout records.
-  let goodView = {
+  let goodView: RolloutContrast = {
     outputMetadata: good.outputMetadata,
-    prediction: good.prediction as Record<string, unknown> | undefined,
-    score: good.score as number | "N/A",
+    prediction: good.prediction,
+    score: good.score,
     trace: good.trace,
   }
-  let badView = {
+  let badView: RolloutContrast = {
     outputMetadata: bad.outputMetadata,
-    prediction: bad.prediction as Record<string, unknown> | undefined,
-    score: bad.score as number | "N/A",
+    prediction: bad.prediction,
+    score: bad.score,
     trace: bad.trace,
   }
   if (good.score <= bad.score) {
-    const blank = {
-      prediction: { "N/A": "Prediction not available" },
-      score: "N/A" as const,
-      trace: [] as TraceStep[],
-    }
     if (good.score > opts.p90) {
-      badView = { ...badView, ...blank }
+      badView = { ...badView, ...BLANKED_CONTRAST }
     } else {
-      goodView = { ...goodView, ...blank }
+      goodView = { ...goodView, ...BLANKED_CONTRAST }
     }
   }
-
-  const toTrajectory = (trace: TraceStep[]) =>
-    trace.map((step) => ({
-      inputs: step.inputs,
-      module_name: step.predictorName,
-      outputs: step.outputs,
-    }))
 
   const { example } = good
   const result = await offerFeedback(
@@ -480,34 +498,32 @@ export async function appendARule(
 
 // --- Rollouts ---------------------------------------------------------------
 
-async function runRollout(
-  program: Program<never, unknown>,
-  example: Example,
-  metric: Metric,
+const runRollout = async <TInput, TOutput>(
+  program: Program<TInput, TOutput>,
+  example: Example<TInput, TOutput>,
+  metric: Metric<TInput, TOutput>,
   ctx: RunContext
-): Promise<Rollout> {
+): Promise<Rollout<TInput, TOutput>> => {
   const trace: TraceStep[] = []
-  let prediction: Record<string, unknown> | undefined
+  let prediction: TOutput | undefined
   try {
-    prediction = (await program.run(example.inputs as never, {
+    prediction = await program.run(example.inputs, {
       ...ctx,
       trace,
-    })) as Record<string, unknown>
+    })
   } catch (error) {
     console.warn(error)
   }
 
   let score = 0
-  let outputMetadata: Record<string, unknown> = {}
+  let outputMetadata: Fields = {}
   try {
-    const output = await metric(example, prediction)
-    if (typeof output === "number") {
-      score = output
-    } else {
-      const { score: metricScore, ...rest } = output
-      score = metricScore
-      outputMetadata = rest
-    }
+    const { score: metricScore, ...metadata } = await metric(
+      example,
+      prediction
+    )
+    score = metricScore
+    outputMetadata = metadata
   } catch (error) {
     console.warn(error)
   }
@@ -517,11 +533,11 @@ async function runRollout(
 
 // --- Main loop --------------------------------------------------------------
 
-export async function simba<TInput extends Record<string, unknown>, TOutput>(
+export const simba = async <TInput extends Fields, TOutput extends Fields>(
   student: Program<TInput, TOutput>,
-  trainset: Example[],
-  config: SIMBAConfig
-): Promise<SIMBAResult<TInput, TOutput>> {
+  trainset: Example<TInput, TOutput>[],
+  config: SIMBAConfig<TInput, TOutput>
+): Promise<SIMBAResult<TInput, TOutput>> => {
   const {
     bsize = 32,
     demoInputFieldMaxlen = 100_000,
@@ -539,10 +555,10 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
     throw new Error(`Trainset too small: ${trainset.length} < ${bsize}`)
   }
 
-  type AnyProgram = Program<never, unknown>
-  const baseline = student.clone() as AnyProgram
+  type AnyProgram = Program<TInput, TOutput>
+  const baseline = student.clone()
   const promptModel =
-    config.promptModel ?? (baseline.predictors[0] as AnyPredictor).model
+    config.promptModel ?? first(baseline.predictors, "predictors").model
 
   const rng = createRNG(seed)
   const poissonRNG = createRNG(seed)
@@ -560,11 +576,17 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
   let currentP10 = 0
   let currentP90 = 0
 
-  const demoStrategy = (bucket: Bucket, candidate: AnyProgram) =>
+  const demoStrategy = (
+    bucket: Bucket<TInput, TOutput>,
+    candidate: AnyProgram
+  ) =>
     Promise.resolve(
       appendADemo(bucket, candidate, { demoInputFieldMaxlen, p10: currentP10 })
     )
-  const ruleStrategy = (bucket: Bucket, candidate: AnyProgram) =>
+  const ruleStrategy = (
+    bucket: Bucket<TInput, TOutput>,
+    candidate: AnyProgram
+  ) =>
     appendARule(bucket, candidate, {
       p10: currentP10,
       p90: currentP90,
@@ -578,14 +600,14 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
   let instanceIdx = 0
   let nextRolloutId = 0
 
-  const nextBatch = (): Example[] => {
+  const nextBatch = (): Example<TInput, TOutput>[] => {
     if (instanceIdx + bsize > trainset.length) {
       shuffle(rng, dataIdxs)
       instanceIdx = 0
     }
     const batch = dataIdxs
       .slice(instanceIdx, instanceIdx + bsize)
-      .map((i) => trainset[i] as Example)
+      .map((i) => at(trainset, i, "trainset"))
     instanceIdx += bsize
     return batch
   }
@@ -610,16 +632,18 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
   }
 
   // Model-major, example-minor: bucket extraction strides by bsize.
-  const sampleRollouts = (batch: Example[]): Promise<Rollout[]> => {
+  const sampleRollouts = (
+    batch: Example<TInput, TOutput>[]
+  ): Promise<Rollout<TInput, TOutput>[]> => {
     // The pool is frozen for the whole call, so score the programs once.
     const avg = avgScores()
     const topK = topKPlusBaseline(avg, numCandidates)
-    const runs: (() => Promise<Rollout>)[] = []
+    const runs: (() => Promise<Rollout<TInput, TOutput>>)[] = []
     for (const modelCtx of prepareModelsForResampling()) {
       for (const example of batch) {
         const srcIdx = softmaxSample(rng, topK, avg, temperatureForSampling)
         // Rollouts never mutate the program, so no clone is needed.
-        const rolloutProgram = programs[srcIdx] as AnyProgram
+        const rolloutProgram = at(programs, srcIdx, "programs")
         runs.push(() => runRollout(rolloutProgram, example, metric, modelCtx))
       }
     }
@@ -627,7 +651,7 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
   }
 
   const generateCandidates = async (
-    buckets: Bucket[]
+    buckets: Bucket<TInput, TOutput>[]
   ): Promise<AnyProgram[]> => {
     // Candidates only join the pool after the step, so score it once.
     const avg = avgScores()
@@ -635,15 +659,17 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
     const candidates: AnyProgram[] = []
     for (const bucket of buckets) {
       const srcIdx = softmaxSample(rng, topK, avg, temperatureForCandidates)
-      const candidate = (programs[srcIdx] as AnyProgram).clone()
+      const candidate = at(programs, srcIdx, "programs").clone()
       dropDemos(candidate, maxDemos, rng, poissonRNG)
-      const strategy = strategies[
-        Math.floor(rng() * strategies.length)
-      ] as (typeof strategies)[number]
+      const strategy = at(
+        strategies,
+        Math.floor(rng() * strategies.length),
+        "strategies"
+      )
       try {
         // A strategy no-op still keeps the candidate. Sequential on purpose:
         // the RNG stream must consume picks in bucket order.
-        // biome-ignore lint/performance/noAwaitInLoops: see above
+        // oxlint-disable-next-line no-await-in-loop -- see above
         await strategy(bucket, candidate)
       } catch (error) {
         console.error(`Strategy failed with error: ${error}`)
@@ -659,7 +685,7 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
 
   const evaluateOn = async (
     programsToScore: AnyProgram[],
-    examples: Example[]
+    examples: Example<TInput, TOutput>[]
   ): Promise<number[][]> => {
     const rollouts = await Promise.all(
       programsToScore.flatMap((program) =>
@@ -705,20 +731,20 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
     // Winner = argmax mean score, first max wins ties.
     if (candidateScores.length > 0) {
       const bestIdx = candidateScores.indexOf(Math.max(...candidateScores))
-      winningPrograms.push((candidates[bestIdx] as AnyProgram).clone())
+      winningPrograms.push(at(candidates, bestIdx, "candidates").clone())
     }
 
     // Register ALL candidates into the pool.
     for (const [idx, candidate] of candidates.entries()) {
       programs.push(candidate)
-      programScores.push(candidateScoreLists[idx] as number[])
+      programScores.push(at(candidateScoreLists, idx, "candidate scores"))
     }
 
     trialLogs.push({ baselineScore, candidateScores, step })
   }
 
   for (let step = 0; step < maxSteps; step += 1) {
-    // biome-ignore lint/performance/noAwaitInLoops: optimization steps are inherently sequential
+    // oxlint-disable-next-line no-await-in-loop -- optimization steps are inherently sequential
     await runStep(step)
   }
 
@@ -732,19 +758,20 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
       : Array.from({ length: n }, (_, i) => roundHalfEven((i * m) / (n - 1)))
   // Winners were already cloned at push time, so no extra copy is needed.
   const finalIdxs = [...new Set(spacing)]
-  const finalists = finalIdxs.map((i) => winningPrograms[i] as AnyProgram)
+  const finalists = finalIdxs.map((i) => at(winningPrograms, i, "winners"))
 
   console.log(
     `VALIDATION: Evaluating ${finalists.length} programs on the full trainset.`
   )
-  const finalScores = (await evaluateOn(finalists, trainset)).map(mean)
+  const finalistScores = await evaluateOn(finalists, trainset)
+  const finalScores = finalistScores.map(mean)
 
   const candidateData = finalists
     .map((program, idx) => ({
-      program: program as Program<TInput, TOutput>,
-      score: finalScores[idx] as number,
+      program,
+      score: at(finalScores, idx, "final scores"),
     }))
-    .sort((a, b) => b.score - a.score)
+    .toSorted((a, b) => b.score - a.score)
 
   // First max wins ties — favors the less-evolved program.
   const bestIdx = finalScores.indexOf(Math.max(...finalScores))
@@ -754,10 +781,7 @@ export async function simba<TInput extends Record<string, unknown>, TOutput>(
 
   return {
     candidates: candidateData,
-    program: (finalists[bestIdx] as AnyProgram).clone() as Program<
-      TInput,
-      TOutput
-    >,
+    program: at(finalists, bestIdx, "finalists").clone(),
     trialLogs,
   }
 }

@@ -1,15 +1,9 @@
-import {
-  createProgramAdapter,
-  type GEPAMetric,
-  type ReflectionLM,
-} from "@/gepa/adapter"
-import {
-  aggregateScore,
-  argmax,
-  type Candidate,
-  type GEPAState,
-  runGEPA,
-} from "@/gepa/engine"
+import { at } from "@/collections"
+import type { Fields } from "@/fields"
+import { createProgramAdapter } from "@/gepa/adapter"
+import type { GEPAMetric, ReflectionLM } from "@/gepa/adapter"
+import { aggregateScore, argmax, runGEPA } from "@/gepa/engine"
+import type { Candidate, GEPAState } from "@/gepa/engine"
 import type { Example, Program } from "@/program"
 import { createRNG } from "@/random"
 
@@ -23,13 +17,13 @@ export type GEPAAuto = keyof typeof AUTO_CANDIDATES
  * DSPy's auto-budget estimate. `fullEvalSteps` (m) exists only here — the
  * engine has no periodic full-eval scheduling.
  */
-export function autoBudget(
+export const autoBudget = (
   numPreds: number,
   numCandidates: number,
   valsetSize: number,
   minibatchSize = 35,
   fullEvalSteps = 5
-): number {
+): number => {
   const numTrials = Math.floor(
     Math.max(2 * (numPreds * 2) * Math.log2(numCandidates), 1.5 * numCandidates)
   )
@@ -53,7 +47,7 @@ export function autoBudget(
 
 // --- Configuration ----------------------------------------------------------
 
-export type GEPAConfig = {
+export type GEPAConfig<TInput = Fields, TOutput = Fields> = {
   addFormatFailureAsFeedback?: boolean
   /** Exactly one of `auto`, `maxFullEvals`, `maxMetricCalls` must be set. */
   auto?: GEPAAuto
@@ -63,25 +57,27 @@ export type GEPAConfig = {
   maxFullEvals?: number
   maxMergeInvocations?: number
   maxMetricCalls?: number
-  metric: GEPAMetric
+  metric: GEPAMetric<TInput, TOutput>
   perfectScore?: number
   reflectionLM: ReflectionLM
   reflectionMinibatchSize?: number
   seed?: number
   skipPerfectScore?: boolean
   useMerge?: boolean
-  valset?: Example[]
+  valset?: Example<TInput, TOutput>[]
   warnOnScoreMismatch?: boolean
 }
 
 const VALSET_SIZE_NOTE = 35
 
-function resolveBudget(
-  config: GEPAConfig,
+const resolveBudget = (
+  config: Pick<GEPAConfig, "auto" | "maxFullEvals" | "maxMetricCalls"> & {
+    valset?: readonly unknown[]
+  },
   numPreds: number,
-  trainset: Example[],
+  trainset: readonly unknown[],
   valsetSize: number
-): number {
+): number => {
   const provided = [
     config.auto,
     config.maxFullEvals,
@@ -102,9 +98,14 @@ function resolveBudget(
       config.maxFullEvals * (trainset.length + (config.valset?.length ?? 0))
     )
   }
+  if (config.auto === undefined) {
+    throw new Error(
+      "Exactly one of auto, maxFullEvals, maxMetricCalls must be set"
+    )
+  }
   return autoBudget(
     Math.max(numPreds, 1),
-    AUTO_CANDIDATES[config.auto as GEPAAuto],
+    AUTO_CANDIDATES[config.auto],
     valsetSize
   )
 }
@@ -126,13 +127,48 @@ export type GEPAResult<TInput, TOutput> = {
   valSubscores: number[][]
 }
 
+export const buildResult = <TInput, TOutput>(
+  state: GEPAState,
+  valsetSize: number,
+  seed: number,
+  buildProgram: (candidate: Candidate) => Program<TInput, TOutput>
+): GEPAResult<TInput, TOutput> => {
+  const valAggregateScores = state.progCandidateValSubscores.map(aggregateScore)
+  const bestIdx = argmax(valAggregateScores)
+  return {
+    bestIdx,
+    candidates: state.programCandidates,
+    discoveryEvalCounts: state.numMetricCallsByDiscovery,
+    numFullValEvals: state.numFullDSEvals,
+    parents: state.parentProgramForCandidate,
+    perValInstanceBestCandidates: state.programAtParetoFrontValset,
+    program: buildProgram(at(state.programCandidates, bestIdx, "candidates")),
+    seed,
+    totalMetricCalls: state.totalNumEvals,
+    valAggregateScores,
+    valSubscores: Array.from(
+      { length: state.programCandidates.length },
+      (_, idx) =>
+        Array.from(
+          { length: valsetSize },
+          (_2, valId) =>
+            at(
+              state.progCandidateValSubscores,
+              idx,
+              "candidate val subscores"
+            ).get(valId) ?? Number.NaN
+        )
+    ),
+  }
+}
+
 // --- Entry point ------------------------------------------------------------
 
-export async function gepa<TInput, TOutput>(
+export const gepa = async <TInput, TOutput>(
   student: Program<TInput, TOutput>,
-  trainset: Example[],
-  config: GEPAConfig
-): Promise<GEPAResult<TInput, TOutput>> {
+  trainset: Example<TInput, TOutput>[],
+  config: GEPAConfig<TInput, TOutput>
+): Promise<GEPAResult<TInput, TOutput>> => {
   if (trainset.length === 0) {
     throw new Error("GEPA requires a non-empty trainset")
   }
@@ -146,7 +182,7 @@ export async function gepa<TInput, TOutput>(
     )
   }
 
-  const program = student as Program<never, unknown>
+  const program = student
   // Instruction text only, like upstream; the student's demos stay on its
   // predictors and reach every candidate through buildProgram's clone.
   const seedCandidate: Candidate = Object.fromEntries(
@@ -189,43 +225,5 @@ export async function gepa<TInput, TOutput>(
     valset,
   })
 
-  return buildResult(
-    state,
-    valset.length,
-    seed,
-    adapter.buildProgram
-  ) as GEPAResult<TInput, TOutput>
-}
-
-export function buildResult(
-  state: GEPAState,
-  valsetSize: number,
-  seed: number,
-  buildProgram: (candidate: Candidate) => Program<never, unknown>
-): GEPAResult<never, unknown> {
-  const valAggregateScores = state.progCandidateValSubscores.map(aggregateScore)
-  const bestIdx = argmax(valAggregateScores)
-  return {
-    bestIdx,
-    candidates: state.programCandidates,
-    discoveryEvalCounts: state.numMetricCallsByDiscovery,
-    numFullValEvals: state.numFullDSEvals,
-    parents: state.parentProgramForCandidate,
-    perValInstanceBestCandidates: state.programAtParetoFrontValset,
-    program: buildProgram(state.programCandidates[bestIdx] as Candidate),
-    seed,
-    totalMetricCalls: state.totalNumEvals,
-    valAggregateScores,
-    valSubscores: Array.from(
-      { length: state.programCandidates.length },
-      (_, idx) =>
-        Array.from(
-          { length: valsetSize },
-          (_2, valId) =>
-            (state.progCandidateValSubscores[idx] as Map<number, number>).get(
-              valId
-            ) ?? Number.NaN
-        )
-    ),
-  }
+  return buildResult(state, valset.length, seed, adapter.buildProgram)
 }

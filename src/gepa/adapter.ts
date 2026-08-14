@@ -1,5 +1,9 @@
-import { generateText, type LanguageModel } from "ai"
+import { generateText } from "ai"
+import type { LanguageModel } from "ai"
 import type { z } from "zod"
+
+import { at } from "@/collections"
+import type { Fields } from "@/fields"
 import type {
   Candidate,
   EvaluationBatch,
@@ -10,44 +14,53 @@ import type {
   RNG,
   Trajectory,
 } from "@/gepa/engine"
-import { schemaProperties } from "@/predictor"
+import { classifyJSON } from "@/json"
+import type { MetricOutput, MetricResult } from "@/metric"
 import type { Example, Program } from "@/program"
+import { schemaProperties } from "@/schema"
 
-export type ScoreWithFeedback = { feedback?: string; score: number }
+/** A metric result that names the feedback field GEPA's reflection LM reads. */
+export type ScoreWithFeedback = MetricResult & { feedback?: string }
 
 /**
  * GEPA metric contract: called with (gold, prediction, trace) at module level
  * and with (gold, prediction, fullTrace, predName, predTrace) for
- * per-predictor feedback. Bare numbers get the default feedback string.
+ * per-predictor feedback. A result without a `feedback` field gets the default
+ * feedback string.
  */
-export type GEPAMetric = (
-  gold: Example,
-  prediction: Record<string, unknown> | null,
+export type GEPAMetric<TInput = Fields, TOutput = Fields> = (
+  gold: Example<TInput, TOutput>,
+  prediction: TOutput | null,
   trace: GEPATraceStep[] | null,
   predName?: string,
   predTrace?: GEPATraceStep[]
-) => number | Promise<number | ScoreWithFeedback> | ScoreWithFeedback
+) => MetricOutput
 
 export type ReflectionLM = LanguageModel | ((prompt: string) => Promise<string>)
 
 const defaultFeedback = (score: number) =>
   `This trajectory got a score of ${score}.`
 
-export async function runFeedbackMetric(
-  metric: GEPAMetric,
-  gold: Example,
-  prediction: Record<string, unknown> | null,
+export const runFeedbackMetric = async <TInput, TOutput>(
+  metric: GEPAMetric<TInput, TOutput>,
+  gold: Example<TInput, TOutput>,
+  prediction: TOutput | null,
   trace: GEPATraceStep[] | null,
   predName?: string,
   predTrace?: GEPATraceStep[]
-): Promise<Required<ScoreWithFeedback>> {
-  const output = await metric(gold, prediction, trace, predName, predTrace)
-  if (typeof output === "number") {
-    return { feedback: defaultFeedback(output), score: output }
-  }
+): Promise<Required<Pick<ScoreWithFeedback, "feedback" | "score">>> => {
+  const { score, ...metadata } = await metric(
+    gold,
+    prediction,
+    trace,
+    predName,
+    predTrace
+  )
+  const feedback = classifyJSON(metadata.feedback)
   return {
-    feedback: output.feedback ?? defaultFeedback(output.score),
-    score: output.score,
+    feedback:
+      feedback.kind === "string" ? feedback.value : defaultFeedback(score),
+    score,
   }
 }
 
@@ -59,11 +72,10 @@ const PARSE_FAILURE_OUTPUT = (raw: string) =>
 const PARSE_FAILURE_FEEDBACK_PREFIX =
   "Your output failed to parse. Follow this structure:\n"
 
-function expectedStructure(outputSchema: z.ZodType | undefined): string {
-  return Object.entries(schemaProperties(outputSchema))
+const expectedStructure = (outputSchema: z.ZodType | undefined): string =>
+  Object.entries(schemaProperties(outputSchema))
     .map(([name, prop]) => `${name}: ${prop.type ?? "unknown"}`)
     .join("\n")
-}
 
 const MAX_HEADER_DEPTH = 6
 
@@ -72,7 +84,8 @@ const MAX_HEADER_DEPTH = 6
  * (`value\n\n`), headers with a single newline, empty dicts/lists add a bare
  * newline, and the depth cap applies on recursion.
  */
-function renderValue(value: unknown, level: number): string {
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a predictor output is open until `classifyJSON` sorts it below; that call is the boundary parse
+const renderValue = (value: unknown, level: number): string => {
   const header = "#".repeat(level)
   const nextLevel = Math.min(level + 1, MAX_HEADER_DEPTH)
   if (Array.isArray(value)) {
@@ -85,8 +98,9 @@ function renderValue(value: unknown, level: number): string {
     }
     return s
   }
-  if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
+  const json = classifyJSON(value)
+  if (json.kind === "object") {
+    const { entries } = json
     let s = ""
     for (const [key, sub] of entries) {
       s += `${header} ${key}\n${renderValue(sub, nextLevel)}`
@@ -100,8 +114,8 @@ function renderValue(value: unknown, level: number): string {
 }
 
 /** Markdown rendering of the reflective dataset for `<side_info>`. */
-export function renderSideInfo(examples: ReflectiveExample[]): string {
-  return examples
+export const renderSideInfo = (examples: ReflectiveExample[]): string =>
+  examples
     .map((example, n) => {
       let s = `# Example ${n + 1}\n`
       for (const [key, value] of Object.entries(example)) {
@@ -110,15 +124,14 @@ export function renderSideInfo(examples: ReflectiveExample[]): string {
       return s
     })
     .join("\n\n")
-}
 
 // --- Instruction-proposal prompt (verbatim template) ------------------------
 
-export function buildProposalPrompt(
+export const buildProposalPrompt = (
   currentInstructions: string,
   sideInfo: string
-): string {
-  return `I provided an assistant with the following instructions to perform a task for me:
+): string =>
+  `I provided an assistant with the following instructions to perform a task for me:
 \`\`\`
 ${currentInstructions}
 \`\`\`
@@ -135,10 +148,9 @@ Read the inputs carefully and identify the input format and infer detailed task 
 Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well.
 
 Provide the new instructions within \`\`\` blocks.`
-}
 
-const LANGUAGE_TAG = /^\S*\n/
-const LEADING_FENCE = /^```\S*\n?/
+const LANGUAGE_TAG = /^\S*\n/u
+const LEADING_FENCE = /^```\S*\n?/u
 
 /**
  * Byte-for-byte port of Python's output_extractor (which receives the
@@ -147,7 +159,7 @@ const LEADING_FENCE = /^```\S*\n?/
  * leading fence (+ optional language tag and newline) or a trailing fence,
  * else the whole trimmed response.
  */
-export function extractInstructionText(response: string): string {
+export const extractInstructionText = (response: string): string => {
   const lmOut = response.trim()
   const start = lmOut.indexOf("```") + 3
   const end = lmOut.lastIndexOf("```")
@@ -172,29 +184,38 @@ export function extractInstructionText(response: string): string {
   return content.trim()
 }
 
+const stringifyFields = (fields: Fields): Record<string, string> =>
+  Object.fromEntries(
+    Object.entries(fields).map(([key, value]) => [key, String(value)])
+  )
+
 // --- Program adapter ---------------------------------------------------------
 
-export type ProgramAdapterConfig = {
+export type ProgramAdapterConfig<TInput = Fields, TOutput = Fields> = {
   addFormatFailureAsFeedback: boolean
   adapterRNG: RNG
   failureScore: number
-  metric: GEPAMetric
-  program: Program<never, unknown>
+  metric: GEPAMetric<TInput, TOutput>
+  program: Program<TInput, TOutput>
   reflectionLM: ReflectionLM
   warnOnScoreMismatch: boolean
 }
 
-export type ProgramGEPAAdapter = GEPAAdapter & {
-  buildProgram: (candidate: Candidate) => Program<never, unknown>
+export type ProgramGEPAAdapter<TInput = Fields, TOutput = Fields> = GEPAAdapter<
+  TInput,
+  TOutput
+> & {
+  buildProgram: (candidate: Candidate) => Program<TInput, TOutput>
 }
 
-export function createProgramAdapter(
-  config: ProgramAdapterConfig
-): ProgramGEPAAdapter {
+export const createProgramAdapter = <TInput, TOutput>(
+  config: ProgramAdapterConfig<TInput, TOutput>
+): ProgramGEPAAdapter<TInput, TOutput> => {
   const { adapterRNG, failureScore, metric, program, reflectionLM } = config
   let warnedScoreMismatch = false
 
   const proposeText =
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- `ReflectionLM` is a published `LanguageModel | (prompt) => Promise<string>` union; a callable is only distinguishable from a model object at runtime
     typeof reflectionLM === "function"
       ? reflectionLM
       : async (prompt: string) => {
@@ -205,7 +226,7 @@ export function createProgramAdapter(
   // Instructions only, exactly like upstream build_program — the clone keeps
   // whatever demos the student's predictors already carry (e.g. from a
   // bootstrapFewShot pre-pass).
-  const buildProgram = (candidate: Candidate): Program<never, unknown> => {
+  const buildProgram = (candidate: Candidate): Program<TInput, TOutput> => {
     const built = program.clone()
     for (const predictor of built.predictors) {
       const instructions = candidate[predictor.name]
@@ -219,48 +240,43 @@ export function createProgramAdapter(
   // Never throws per example: a failed rollout scores failureScore with a
   // null output. Only a build-time program error may abort.
   const evaluate = async (
-    batch: Example[],
+    batch: Example<TInput, TOutput>[],
     candidate: Candidate,
     captureTraces: boolean
-  ): Promise<EvaluationBatch> => {
+  ): Promise<EvaluationBatch<TInput, TOutput>> => {
     const built = buildProgram(candidate)
     const trajectories = await Promise.all(
-      batch.map(async (example): Promise<Trajectory> => {
+      batch.map(async (example): Promise<Trajectory<TInput, TOutput>> => {
         const trace: GEPATraceStep[] = []
-        let prediction: Record<string, unknown> | null = null
+        let prediction: TOutput | null = null
         try {
-          prediction = (await built.run(example.inputs as never, {
+          prediction = await built.run(example.inputs, {
             trace,
-          })) as Record<string, unknown>
+          })
         } catch (error) {
           console.warn(error)
         }
         let score = failureScore
         try {
-          const output = await metric(example, prediction, trace)
-          score = typeof output === "number" ? output : output.score
+          ;({ score } = await metric(example, prediction, trace))
         } catch (error) {
           console.warn(error)
         }
         return { example, prediction, score, trace }
       })
     )
-    return {
+    const batchResult: EvaluationBatch<TInput, TOutput> = {
       outputs: trajectories.map((t) => t.prediction),
       scores: trajectories.map((t) => t.score),
-      ...(captureTraces ? { trajectories } : {}),
     }
+    if (captureTraces) {
+      batchResult.trajectories = trajectories
+    }
+    return batchResult
   }
 
-  const stringifyFields = (
-    fields: Record<string, unknown>
-  ): Record<string, string> =>
-    Object.fromEntries(
-      Object.entries(fields).map(([key, value]) => [key, String(value)])
-    )
-
   const recordForStep = async (
-    trajectory: Trajectory,
+    trajectory: Trajectory<TInput, TOutput>,
     step: GEPATraceStep,
     componentName: string
   ): Promise<ReflectiveExample> => {
@@ -307,7 +323,7 @@ export function createProgramAdapter(
    * failed, which skips the example.
    */
   const chooseStep = (
-    trajectory: Trajectory,
+    trajectory: Trajectory<TInput, TOutput>,
     componentName: string
   ): GEPATraceStep | null => {
     let steps = trajectory.trace.filter(
@@ -326,12 +342,12 @@ export function createProgramAdapter(
     if (trajectory.prediction === null) {
       return null
     }
-    return steps[Math.floor(adapterRNG() * steps.length)] as GEPATraceStep
+    return at(steps, Math.floor(adapterRNG() * steps.length), "trace steps")
   }
 
   const makeReflectiveDataset = async (
     _candidate: Candidate,
-    evalBatch: EvaluationBatch,
+    evalBatch: EvaluationBatch<TInput, TOutput>,
     componentsToUpdate: string[]
   ): Promise<ReflectiveDataset> => {
     const dataset: ReflectiveDataset = {}
@@ -342,7 +358,7 @@ export function createProgramAdapter(
         if (!chosen) {
           continue
         }
-        // biome-ignore lint/performance/noAwaitInLoops: adapter-RNG step choice must stay in trajectory order
+        // oxlint-disable-next-line no-await-in-loop -- adapter-RNG step choice must stay in trajectory order
         records.push(await recordForStep(trajectory, chosen, componentName))
       }
       if (records.length > 0) {
@@ -368,7 +384,7 @@ export function createProgramAdapter(
         candidate[componentName] ?? "",
         renderSideInfo(examples)
       )
-      // biome-ignore lint/performance/noAwaitInLoops: sequential LM calls per component
+      // oxlint-disable-next-line no-await-in-loop -- sequential LM calls per component
       const response = await proposeText(prompt)
       // Python stores even an empty extraction — an empty-string instruction
       // becomes a real child; only an empty proposal dict skips the round.

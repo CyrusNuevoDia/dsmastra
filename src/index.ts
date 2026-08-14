@@ -1,9 +1,15 @@
 import type { z } from "zod"
+
 import { bootstrapFewShot } from "@/bootstrap"
+import { first } from "@/collections"
+import type { Fields } from "@/fields"
 import { gepa } from "@/gepa"
+import type { MetricResult } from "@/metric"
 import type { AnyPredictor } from "@/predictor"
-import { createProgram, type Example, type Program } from "@/program"
-import { type Metric, simba } from "@/simba"
+import { createProgram } from "@/program"
+import type { Example, Program } from "@/program"
+import { simba } from "@/simba"
+import type { Metric } from "@/simba"
 
 export {
   type BootstrapConfig,
@@ -31,9 +37,8 @@ export type AnyStep = StepLike<never, unknown>
 /** Steps keyed by their own literal `id`, so lookups stay precisely typed. */
 export type StepMap = Record<string, AnyStep>
 
-type WithStep<TSteps extends StepMap, TStep extends AnyStep> = TSteps & {
-  [K in TStep["id"]]: TStep
-}
+type WithStep<TSteps extends StepMap, TStep extends AnyStep> = TSteps &
+  Record<TStep["id"], TStep>
 
 export type WorkflowConfig = {
   id: string
@@ -52,25 +57,33 @@ export type CommittedWorkflow<TSteps extends StepMap = StepMap> = {
   steps: TSteps
 }
 
-export function createWorkflow(_config: WorkflowConfig): Workflow {
+export const createWorkflow = (_config: WorkflowConfig): Workflow => {
   const steps: AnyStep[] = []
 
-  const builder = {
-    commit() {
+  // One mutable builder serves every `then` call. Each call returns `this` while
+  // the *type* grows by the step just added, which is why `then` is declared
+  // generic on `Workflow` and simply hands the same object back here: the runtime
+  // value never changes, only the compile-time view of which steps it holds.
+  const builder: Workflow = {
+    commit: () => {
       const stepMap: StepMap = {}
       for (const step of steps) {
         stepMap[step.id] = step
       }
       return { steps: stepMap }
     },
-    // biome-ignore lint/suspicious/noThenProperty: mirrors Mastra's workflow builder API
-    then(step: AnyStep) {
+    // oxlint-disable-next-line unicorn/no-thenable -- mirrors Mastra's workflow builder API
+    then: <TStep extends AnyStep>(step: TStep) => {
       steps.push(step)
-      return builder
+      // SAFETY: the builder is the same object before and after; only the
+      // compile-time record of which steps it holds grows. `step` was just pushed
+      // onto `steps`, so by the time `commit` reads them the map really does
+      // contain an entry keyed by `step.id` — exactly what `WithStep` adds.
+      return builder as Workflow<WithStep<Record<never, AnyStep>, TStep>>
     },
   }
 
-  return builder as unknown as Workflow
+  return builder
 }
 
 export type OptimizerConfig = {
@@ -100,18 +113,19 @@ export const SIMBA = (config: OptimizerConfig): Optimizer => ({
 /** Every expected field must match the prediction exactly for a score of 1. */
 const exactMatchMetric = (
   example: Example,
-  prediction: Record<string, unknown> | null | undefined
-) =>
-  Object.entries(example.outputs).every(
+  prediction: Fields | null | undefined
+): MetricResult => ({
+  score: Object.entries(example.outputs).every(
     ([key, value]) => prediction?.[key] === value
   )
     ? 1
-    : 0
+    : 0,
+})
 
 /** Steps run in insertion order, each feeding its output to the next. */
-function workflowToProgram(
+const workflowToProgram = (
   workflow: CommittedWorkflow
-): Program<Record<string, unknown>, Record<string, unknown>> {
+): Program<Fields, Fields> => {
   const predictors = Object.values(workflow.steps).map((step) => {
     if (!step.predictor) {
       throw new Error(`Step ${step.id} has no predictor to optimize`)
@@ -119,10 +133,10 @@ function workflowToProgram(
     return step.predictor
   })
   return createProgram({
-    forward: async (call, input: Record<string, unknown>) => {
+    forward: async (call, input: Fields) => {
       let data = input
       for (const predictor of predictors) {
-        // biome-ignore lint/performance/noAwaitInLoops: sequential pipeline
+        // oxlint-disable-next-line no-await-in-loop -- sequential pipeline
         data = await call(predictor.name, data)
       }
       return data
@@ -131,10 +145,10 @@ function workflowToProgram(
   })
 }
 
-function programToSteps(
-  program: Program<Record<string, unknown>, Record<string, unknown>>,
+const programToSteps = (
+  program: Program<Fields, Fields>,
   stepIds: string[]
-): StepMap {
+) => {
   const tunedSteps: StepMap = {}
   for (const stepId of stepIds) {
     const tuned = program.predictors.find((p) => p.name === stepId)
@@ -143,8 +157,7 @@ function programToSteps(
     }
     // Carrying the tuned predictor keeps the step re-optimizable.
     tunedSteps[stepId] = {
-      execute: ({ inputData }: { inputData: Record<string, unknown> }) =>
-        tuned.call(inputData as never) as Promise<Record<string, unknown>>,
+      execute: ({ inputData }: { inputData: Fields }) => tuned.call(inputData),
       id: stepId,
       predictor: tuned,
     }
@@ -153,11 +166,11 @@ function programToSteps(
 }
 
 /** Optimizing preserves the step map, so a tuned workflow stays as typed as its source. */
-export async function optimize<TSteps extends StepMap>(
+export const optimize = async <TSteps extends StepMap>(
   optimizer: Optimizer,
   workflow: CommittedWorkflow<TSteps>,
   options: { trainset: readonly Example[] }
-): Promise<CommittedWorkflow<TSteps>> {
+): Promise<CommittedWorkflow<TSteps>> => {
   const program = workflowToProgram(workflow)
   const stepIds = Object.keys(workflow.steps)
   const metric = optimizer.metric ?? exactMatchMetric
@@ -171,6 +184,10 @@ export async function optimize<TSteps extends StepMap>(
       numCandidates: optimizer.numCandidates,
       seed: optimizer.seed,
     })
+    // SAFETY: `stepIds` is `Object.keys(workflow.steps)`, and `programToSteps`
+    // writes exactly one entry per id, so the rebuilt map has precisely the keys
+    // `TSteps` declares — the optimizer replaces each step's predictor, never the
+    // set of steps.
     return { steps: programToSteps(result.program, stepIds) as TSteps }
   }
 
@@ -185,30 +202,21 @@ export async function optimize<TSteps extends StepMap>(
       // The wrapper's maxDemos is a TOTAL cap per predictor, so the labeled
       // backfill shares it instead of DSPy's default 16.
       maxLabeledDemos: optimizer.maxDemos,
-      metric: async (gold, prediction, _trace) => {
-        const output = await metric(gold, prediction ?? undefined)
-        return typeof output === "number" ? output : output.score
-      },
+      // Same contract on both sides, so the user's metric passes straight through.
+      metric: (gold, prediction) => metric(gold, prediction ?? undefined),
     })
   }
 
   // maxSteps maps to full evals.
   const result = await gepa(student, [...options.trainset], {
     maxFullEvals: optimizer.maxSteps,
-    // Feedback strings pass through — GEPA's reflection consumes them.
-    metric: async (gold, prediction) => {
-      const output = await metric(gold, prediction ?? undefined)
-      if (typeof output === "number") {
-        return output
-      }
-      const { feedback, score } = output
-      return {
-        score,
-        ...(typeof feedback === "string" ? { feedback } : {}),
-      }
-    },
-    reflectionLM: (program.predictors[0] as AnyPredictor).model,
+    // Any `feedback` the metric reported rides along — GEPA's reflection reads it.
+    metric: (gold, prediction) => metric(gold, prediction ?? undefined),
+    reflectionLM: first(program.predictors, "program predictors").model,
     seed: optimizer.seed,
   })
+  // SAFETY: same invariant as the SIMBA branch above — `stepIds` came from
+  // `Object.keys(workflow.steps)` and `programToSteps` writes exactly one entry
+  // per id, so the rebuilt map carries precisely the keys `TSteps` declares.
   return { steps: programToSteps(result.program, stepIds) as TSteps }
 }

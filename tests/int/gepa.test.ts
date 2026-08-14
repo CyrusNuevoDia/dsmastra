@@ -1,11 +1,14 @@
 import { expect, test } from "bun:test"
+
 import { z } from "zod"
+
 import { bootstrapFewShot } from "@/bootstrap"
 import { gepa } from "@/gepa"
 import { declarePredictor } from "@/predictor"
 import { createProgram } from "@/program"
 import type { Example } from "@/simba"
-import { model } from "./_helpers"
+
+import { model } from "../_helpers"
 
 const trainset: Example[] = [1, 2, 3, 5, 8, 13].map((x) => ({
   inputs: { x },
@@ -19,7 +22,8 @@ test(
   async () => {
     const predictor = declarePredictor({
       inputSchema: z.object({ x: z.number() }),
-      instructions: BAD_INSTRUCTIONS, // should be x*2
+      // BAD_INSTRUCTIONS asks for the wrong operation; the target is x*2.
+      instructions: BAD_INSTRUCTIONS,
       model,
       name: "math",
       outputSchema: z.object({ y: z.number() }),
@@ -34,7 +38,9 @@ test(
     const student = await bootstrapFewShot(program, trainset, {
       maxBootstrappedDemos: 2,
       maxLabeledDemos: 2,
-      metric: (gold, prediction) => prediction?.y === gold.outputs.y,
+      metric: (gold, prediction) => ({
+        score: prediction?.y === gold.outputs.y ? 1 : 0,
+      }),
     })
 
     const result = await gepa(student, trainset, {

@@ -28,7 +28,7 @@ A local clone for reference lives at `/private/tmp/claude-501/-Users-knrz-Git-Cy
 ## Configuration (DSPy wrapper)
 
 | param | default | meaning |
-|---|---|---|
+| --- | --- | --- |
 | `metric` | required | `(gold, pred, trace, pred_name, pred_trace) -> number \| {score, feedback}` — must accept exactly 5 positional args |
 | `auto` / `max_full_evals` / `max_metric_calls` | exactly one | budget; `auto ∈ light(n=6) / medium(n=12) / heavy(n=18)` |
 | `reflection_minibatch_size` | 3 | train examples per reflection round |
@@ -39,10 +39,10 @@ A local clone for reference lives at `/private/tmp/claude-501/-Users-knrz-Git-Cy
 | `component_selector` | `"round_robin"` | which component(s) to rewrite per round (`"all"` available) |
 | `use_merge` / `max_merge_invocations` | true / 5 | crossover of frontier survivors (the core engine's own default is merge OFF; DSPy turns it on) |
 | `num_threads` | none | eval parallelism |
-| `failure_score` / `perfect_score` | 0.0 / 1.0 | |
+| `failure_score` / `perfect_score` | 0.0 / 1.0 |  |
 | `track_stats` / `track_best_outputs` | false / false | `track_best_outputs` requires `track_stats`; attaches `detailed_results` |
 | `warn_on_score_mismatch` | true | one-time warning when predictor-level metric score ≠ module score |
-| `seed` | 0 | |
+| `seed` | 0 |  |
 
 ### Metric / feedback contract
 
@@ -129,7 +129,7 @@ Per validation instance, the state tracks the best score seen (`pareto_front_val
 Parent sampling (`"pareto"` strategy):
 
 1. Take the frontier mapping `{valId: Set<candidates>}`.
-2. **Dominance filter**: a candidate survives iff it is the *sole* occupant of at least one instance's front. Implementation: sort candidates ascending by aggregate score (mean of their per-instance scores, `-inf` if unevaluated); repeatedly scan in that order and mark a candidate dominated if every frontier key containing it also contains some other non-dominated candidate; restart the scan after each removal until a fixed point. Low scorers are eliminated first, so ties resolve toward higher aggregate score. Every non-empty front must retain ≥ 1 survivor.
+2. **Dominance filter**: a candidate survives iff it is the _sole_ occupant of at least one instance's front. Implementation: sort candidates ascending by aggregate score (mean of their per-instance scores, `-inf` if unevaluated); repeatedly scan in that order and mark a candidate dominated if every frontier key containing it also contains some other non-dominated candidate; restart the scan after each removal until a fixed point. Low scorers are eliminated first, so ties resolve toward higher aggregate score. Every non-empty front must retain ≥ 1 survivor.
 3. Sample a survivor with probability proportional to **how many instances it sits on the front of** (`rng.choice` over a list with each candidate repeated `freq` times).
 
 `"current_best"` instead picks argmax mean valset score (lowest index on ties). The engine also ships `EpsilonGreedy(ε=0.1)` (random with prob ε, else argmax) and `TopKPareto(k=5)` (frontier sets restricted to the top-k by aggregate score) selectors — optional for a port.
@@ -147,7 +147,7 @@ For the chosen component, for each minibatch trajectory:
 2. Pick one step: the **first parse-failure** step if any remain; else if the whole prediction is a parse failure, skip the example; else a **random** one (adapter RNG).
 3. Emit a record:
    - `Inputs`: `{field: str(value)}`. A conversation-history input is rendered instead into a single `Context` key as a ` ```json ` fenced block of `  {i}: {message}` lines. (With a custom multimodal proposer, rich types like images stay as objects.)
-   - `Generated Outputs`: `{field: str(value)}`; for a parse failure, the single **string** `` "Couldn't parse the output as per the expected output format. The model's raw response was:\n```\n{raw}\n```\n\n" ``.
+   - `Generated Outputs`: `{field: str(value)}`; for a parse failure, the single **string** `"Couldn't parse the output as per the expected output format. The model's raw response was:\n```\n{raw}\n```\n\n"`.
    - `Feedback`: the feedback function's text for this predictor; for a parse failure, `"Your output failed to parse. Follow this structure:\n"` + the expected chat-format rendering of the signature (one `role: content` line per message).
 
 A component with zero records is omitted; if every requested component is empty the round is skipped (in Python this is a thrown-and-caught `"No valid predictions found for any module."`).

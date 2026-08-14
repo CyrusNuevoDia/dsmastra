@@ -45,14 +45,16 @@ const tuned = await optimize(
 await tuned.steps.math.execute({ inputData: { question: "4+5" } })
 ```
 
-The metric defaults to exact match on every expected output field. Pass your own for partial credit, and return `{ score, feedback }` instead of a bare number when you want to tell the optimizer *why* a prediction fell short — SIMBA's rule-writing and GEPA's reflection both read the feedback string:
+The metric defaults to exact match on every expected output field. Pass your own for partial credit. A metric always returns an object with a `score`, and adding a `feedback` string tells the optimizer _why_ a prediction fell short — SIMBA's rule-writing and GEPA's reflection both read it:
 
 ```ts
 const metric = (example, prediction) =>
   prediction?.answer === example.outputs.answer
-    ? 1
+    ? { score: 1 }
     : { score: 0.5, feedback: "Numerically right, but not spelled out." }
 ```
+
+Any other fields you return ride along as metadata. The same `{ score }` contract covers all three metrics — SIMBA's, GEPA's, and BootstrapFewShot's — so one metric works everywhere. This is a deliberate divergence from DSPy, whose bootstrap metric returns `bool | float`; here a pass/fail metric writes `{ score: 1 }` / `{ score: 0 }`, and with no `metricThreshold` set any score above zero counts as a pass.
 
 ## The optimizers
 

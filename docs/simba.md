@@ -10,18 +10,18 @@ Authoritative flow of DSPy's SIMBA optimizer, traced from `dspy/dspy/teleprompt/
 
 ## Configuration
 
-| param                        | default    | meaning                                                                                           |
-| ---------------------------- | ---------- | ------------------------------------------------------------------------------------------------- |
-| `metric`                     | required   | `(example, prediction) -> number`, or an object with a `score` field plus extra feedback metadata |
-| `bsize`                      | 32         | minibatch size                                                                                    |
-| `num_candidates`             | 6          | rollouts per example per step, and candidates produced per step                                   |
-| `max_steps`                  | 8          | optimization steps                                                                                |
-| `max_demos`                  | 4          | soft cap on few-shot demos per predictor (see demo dropping)                                      |
-| `demo_input_field_maxlen`    | 100 000    | truncation length for demo input fields                                                           |
-| `prompt_model`               | session LM | LM used to write rules (`append_a_rule`)                                                          |
-| `temperature_for_sampling`   | 0.2        | softmax temp when picking source programs for rollouts                                            |
-| `temperature_for_candidates` | 0.2        | softmax temp when picking the source program to mutate                                            |
-| `teacher_settings`           | none       | optional teacher LM used as the first rollout model                                               |
+| param | default | meaning |
+| --- | --- | --- |
+| `metric` | required | `(example, prediction) -> { score: number }`, plus any extra fields carried through as feedback metadata. Upstream also accepts a bare number; ours always returns the object |
+| `bsize` | 32 | minibatch size |
+| `num_candidates` | 6 | rollouts per example per step, and candidates produced per step |
+| `max_steps` | 8 | optimization steps |
+| `max_demos` | 4 | soft cap on few-shot demos per predictor (see demo dropping) |
+| `demo_input_field_maxlen` | 100 000 | truncation length for demo input fields |
+| `prompt_model` | session LM | LM used to write rules (`append_a_rule`) |
+| `temperature_for_sampling` | 0.2 | softmax temp when picking source programs for rollouts |
+| `temperature_for_candidates` | 0.2 | softmax temp when picking the source program to mutate |
+| `teacher_settings` | none | optional teacher LM used as the first rollout model |
 
 Strategies: `[append_a_demo, append_a_rule]` when `max_demos > 0`, else `[append_a_rule]` only. Chosen **uniformly at random** per candidate (50/50 — there are no weights).
 
@@ -103,7 +103,7 @@ Then call the prompt model once with the `OfferFeedback` signature and merge the
 Inputs to `OfferFeedback`, in declaration order (order matters for prompt layout). Every non-string value is serialized to pretty (2-space-indented) JSON; non-serializable values are recursively replaced with `<non-serializable: TypeName>`:
 
 | field | description text |
-|---|---|
+| --- | --- |
 | `program_code` | "The code of the program that we are analyzing" — source code of the program class |
 | `modules_defn` | "The definition of each module in the program, including its I/O" — see rendering below |
 | `program_inputs` | "The inputs to the program that we are analyzing" — the example's input fields |

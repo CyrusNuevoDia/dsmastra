@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test"
+
 import { z } from "zod"
+
 import { bootstrapFewShot, labeledFewShot } from "@/bootstrap"
+import type { Fields } from "@/fields"
 import { gepa } from "@/gepa"
 import type { Demo, Predictor, RunContext } from "@/predictor"
-import { createProgram, type Example, type Program } from "@/program"
+import { createProgram } from "@/program"
+import type { Example, Program } from "@/program"
 
 type Call = { ctx?: RunContext; inputs: Record<string, unknown> }
 
@@ -11,14 +15,14 @@ type Call = { ctx?: RunContext; inputs: Record<string, unknown> }
  * Deterministic fake predictor: `fn` maps inputs (+ctx) to outputs, calls are
  * logged, clones share the log and behavior but copy demos/instructions.
  */
-function fakePredictor(
+const fakePredictor = (
   name: string,
   fn: (
     inputs: Record<string, unknown>,
     ctx?: RunContext
   ) => Record<string, unknown>,
   log: Call[] = []
-): Predictor {
+): Predictor => {
   const predictor: Predictor = {
     call: (inputs: Record<string, unknown>, ctx?: RunContext) => {
       log.push({ ctx, inputs })
@@ -42,26 +46,24 @@ function fakePredictor(
   return predictor
 }
 
-function singleProgram(
+const singleProgram = (
   fn: (
     inputs: Record<string, unknown>,
     ctx?: RunContext
   ) => Record<string, unknown>,
   log: Call[] = []
-): Program<Record<string, unknown>, Record<string, unknown>> {
-  return createProgram({
+): Program<Record<string, unknown>, Record<string, unknown>> =>
+  createProgram({
     forward: (call, input: Record<string, unknown>) => call("solve", input),
     predictors: [fakePredictor("solve", fn, log)],
   })
-}
 
 const dataset = (xs: number[]): Example[] =>
   xs.map((x) => ({ inputs: { x }, outputs: { y: x * 2 } }))
 
-const exactMetric = (
-  gold: Example,
-  prediction: Record<string, unknown> | null
-) => prediction?.y === gold.outputs.y
+const exactMetric = (gold: Example, prediction: Fields | null) => ({
+  score: prediction?.y === gold.outputs.y ? 1 : 0,
+})
 
 // --- LabeledFewShot ----------------------------------------------------------
 
@@ -102,13 +104,28 @@ test("bootstrapped demos only come from metric-passing traces", async () => {
     metric: exactMetric,
   })
   const demos = compiled.predictors[0]?.demos as Demo[]
-  expect(demos.map((d) => d.inputs.x as number).sort((a, b) => a - b)).toEqual([
-    2, 4,
-  ])
+  expect(
+    demos.map((d) => d.inputs.x as number).toSorted((a, b) => a - b)
+  ).toEqual([2, 4])
   expect(demos.every((d) => d.augmented === true)).toBe(true)
-  expect(demos.map((d) => d.outputs.y as number).sort((a, b) => a - b)).toEqual(
-    [4, 8]
-  )
+  expect(
+    demos.map((d) => d.outputs.y as number).toSorted((a, b) => a - b)
+  ).toEqual([4, 8])
+})
+
+test("without a threshold, only a score above zero is accepted", async () => {
+  const program = singleProgram((inputs) => ({ y: inputs.x }))
+  // Upstream DSPy tests `bool(metric_val)`, which counts a negative score as a
+  // pass. We test `score > 0` instead, so a penalty score is a failure.
+  const signedScore = (gold: Example) => ({
+    score: (gold.inputs.x as number) - 2,
+  })
+  const compiled = await bootstrapFewShot(program, dataset([1, 2, 3]), {
+    maxLabeledDemos: 0,
+    metric: signedScore,
+  })
+  // x=1 scores -1 and x=2 scores 0; only x=3, scoring 1, is bootstrapped.
+  expect(compiled.predictors[0]?.demos.map((d) => d.inputs.x)).toEqual([3])
 })
 
 test("no metric accepts every trace", async () => {
@@ -122,9 +139,10 @@ test("no metric accepts every trace", async () => {
 
 test("metricThreshold switches acceptance from truthiness to >= threshold", async () => {
   const program = singleProgram((inputs) => ({ y: inputs.x }))
-  const partialCredit = (gold: Example) =>
-    (gold.inputs.x as number) === 1 ? 0.4 : 0.6
-  // Without a threshold both scores are truthy → both accepted.
+  const partialCredit = (gold: Example) => ({
+    score: (gold.inputs.x as number) === 1 ? 0.4 : 0.6,
+  })
+  // Without a threshold every score above zero is accepted.
   const loose = await bootstrapFewShot(program, dataset([1, 2]), {
     maxLabeledDemos: 0,
     metric: partialCredit,
@@ -288,8 +306,11 @@ test("bootstrap → gepa: demos ride the program, candidates stay instruction-on
   })
   const installed = structuredClone(student.predictors[0]?.demos)
   const result = await gepa(student, trainset, {
-    maxMetricCalls: 1, // seed eval exhausts the budget → loop never runs
-    metric: (gold, prediction) => (prediction?.y === gold.outputs.y ? 1 : 0),
+    // The seed eval exhausts the budget, so the loop never runs.
+    maxMetricCalls: 1,
+    metric: (gold, prediction) => ({
+      score: prediction?.y === gold.outputs.y ? 1 : 0,
+    }),
     reflectionLM: () => Promise.resolve(""),
   })
   // Candidates are pure instruction maps.

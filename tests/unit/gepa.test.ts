@@ -1,14 +1,13 @@
 import { expect, test } from "bun:test"
+
 import { z } from "zod"
+
+import type { Fields } from "@/fields"
 import { autoBudget, gepa } from "@/gepa"
 import { createProgramAdapter, extractInstructionText } from "@/gepa/adapter"
 import {
   buildMergeSubsample,
-  type Candidate,
   createEpochShuffledSampler,
-  type EngineOptions,
-  type GEPAAdapter,
-  type GEPAState,
   proposeMerge,
   removeDominatedPrograms,
   runGEPA,
@@ -16,18 +15,24 @@ import {
   selectParetoParent,
   updateParetoFront,
 } from "@/gepa/engine"
+import type {
+  Candidate,
+  EngineOptions,
+  GEPAAdapter,
+  GEPAState,
+} from "@/gepa/engine"
 import type { Demo, Predictor } from "@/predictor"
-import { createProgram, type Program } from "@/program"
+import { createProgram } from "@/program"
+import type { Program } from "@/program"
 import type { Example } from "@/simba"
 
 const zero = () => 0
 
-function examples(n: number): Example[] {
-  return Array.from({ length: n }, (_, id) => ({
+const examples = (n: number): Example[] =>
+  Array.from({ length: n }, (_, id) => ({
     inputs: { id },
     outputs: {},
   }))
-}
 
 // --- Auto-budget -------------------------------------------------------------
 
@@ -75,7 +80,7 @@ test("frontier update: exact tie adds to the set, improvement replaces it", () =
     ])
   )
   expect(front.get(0)).toBe(0.5)
-  expect([...(frontPrograms.get(0) as Set<number>)].sort()).toEqual([0, 1])
+  expect([...(frontPrograms.get(0) as Set<number>)].toSorted()).toEqual([0, 1])
   expect(front.get(1)).toBe(0.7)
   expect([...(frontPrograms.get(1) as Set<number>)]).toEqual([1])
 })
@@ -149,64 +154,60 @@ test("instruction extraction edge cases", () => {
 
 // --- Engine: acceptance, cursor, budget --------------------------------------
 
-function scriptedAdapter(
+const scriptedAdapter = (
   scoreOf: (candidate: Candidate, example: Example) => number,
   propose: (component: string) => string,
   proposalLog?: string[][]
-): GEPAAdapter {
-  return {
-    evaluate: (batch, candidate, captureTraces) => {
-      const scores = batch.map((example) => scoreOf(candidate, example))
-      return Promise.resolve({
-        outputs: batch.map(() => ({})),
-        scores,
-        ...(captureTraces
-          ? {
-              trajectories: batch.map((example, k) => ({
-                example,
-                prediction: {},
-                score: scores[k] as number,
-                trace: [{ inputs: {}, outputs: {}, predictorName: "c1" }],
-              })),
-            }
-          : {}),
-      })
-    },
-    makeReflectiveDataset: (_candidate, _evalBatch, components) =>
-      Promise.resolve(
-        Object.fromEntries(
-          components.map((name) => [
-            name,
-            [{ Feedback: "f", "Generated Outputs": {}, Inputs: {} }],
-          ])
-        )
-      ),
-    proposeNewTexts: (_candidate, _dataset, components) => {
-      proposalLog?.push([...components])
-      return Promise.resolve(
-        Object.fromEntries(components.map((name) => [name, propose(name)]))
+): GEPAAdapter => ({
+  evaluate: (batch, candidate, captureTraces) => {
+    const scores = batch.map((example) => scoreOf(candidate, example))
+    return Promise.resolve({
+      outputs: batch.map(() => ({})),
+      scores,
+      ...(captureTraces
+        ? {
+            trajectories: batch.map((example, k) => ({
+              example,
+              prediction: {},
+              score: scores[k] as number,
+              trace: [{ inputs: {}, outputs: {}, predictorName: "c1" }],
+            })),
+          }
+        : {}),
+    })
+  },
+  makeReflectiveDataset: (_candidate, _evalBatch, components) =>
+    Promise.resolve(
+      Object.fromEntries(
+        components.map((name) => [
+          name,
+          [{ Feedback: "f", "Generated Outputs": {}, Inputs: {} }],
+        ])
       )
-    },
-  }
-}
+    ),
+  proposeNewTexts: (_candidate, _dataset, components) => {
+    proposalLog?.push([...components])
+    return Promise.resolve(
+      Object.fromEntries(components.map((name) => [name, propose(name)]))
+    )
+  },
+})
 
-function engineOptions(overrides: Partial<EngineOptions>): EngineOptions {
-  return {
-    candidateSelectionStrategy: "pareto",
-    componentSelector: "roundRobin",
-    maxMergeInvocations: 5,
-    maxMetricCalls: 0,
-    perfectScore: 1,
-    reflectionMinibatchSize: 3,
-    rng: zero,
-    seedCandidate: { c1: "s1", c2: "s2" },
-    skipPerfectScore: true,
-    trainset: examples(3),
-    useMerge: true,
-    valset: examples(4),
-    ...overrides,
-  }
-}
+const engineOptions = (overrides: Partial<EngineOptions>): EngineOptions => ({
+  candidateSelectionStrategy: "pareto",
+  componentSelector: "roundRobin",
+  maxMergeInvocations: 5,
+  maxMetricCalls: 0,
+  perfectScore: 1,
+  reflectionMinibatchSize: 3,
+  rng: zero,
+  seedCandidate: { c1: "s1", c2: "s2" },
+  skipPerfectScore: true,
+  trainset: examples(3),
+  useMerge: true,
+  valset: examples(4),
+  ...overrides,
+})
 
 test("reflection acceptance is strict > on sums; cursor advances on rejection", async () => {
   const proposalLog: string[][] = []
@@ -259,7 +260,8 @@ test("empty proposed text still produces a real child that gets evaluated", asyn
     () => ""
   )
   const state = await runGEPA(adapter, engineOptions({ maxMetricCalls: 16 }))
-  expect(state.programCandidates.length).toBe(1) // equal sums → rejected
+  // Equal sums mean the merge is rejected, so no candidate is added.
+  expect(state.programCandidates.length).toBe(1)
   // 4 seed + 2 iterations × (3 parent + 3 child) = 16, child evals included.
   expect(state.totalNumEvals).toBe(16)
 })
@@ -292,7 +294,7 @@ test("budget is checked at the top of the loop only (bounded overshoot)", async 
 
 // --- Merge -------------------------------------------------------------------
 
-function mergeLineageState(): GEPAState {
+const mergeLineageState = (): GEPAState => {
   const candidates: Candidate[] = [
     { c1: "s", c2: "s" },
     { c1: "A", c2: "s" },
@@ -380,10 +382,10 @@ test("merge subsample is balanced across better/worse/tied buckets", () => {
   expect(sub.filter((valId) => valId >= 3).length).toBeGreaterThanOrEqual(2)
 })
 
-function mergeScoreAdapter(
+const mergeScoreAdapter = (
   mergedScore: (valId: number) => number
-): GEPAAdapter {
-  return scriptedAdapter(
+): GEPAAdapter =>
+  scriptedAdapter(
     (candidate, example) => {
       const valId = example.inputs.id as number
       const { c1, c2 } = candidate
@@ -400,7 +402,6 @@ function mergeScoreAdapter(
     },
     () => ""
   )
-}
 
 test("merge acceptance is non-strict >= on subsample sums", async () => {
   const state = mergeLineageState()
@@ -451,7 +452,7 @@ type MathPredictor = Predictor<
   z.ZodType<{ y: number }>
 >
 
-function makeMathPredictor(name: string): MathPredictor {
+const makeMathPredictor = (name: string): MathPredictor => {
   const predictor: MathPredictor = {
     call: (inputs, ctx) => {
       const { x } = inputs
@@ -478,12 +479,12 @@ function makeMathPredictor(name: string): MathPredictor {
   return predictor
 }
 
-function makeMathProgram(): Program<never, unknown> {
+const makeMathProgram = (): Program => {
   const predictor = makeMathPredictor("math")
   return createProgram({
-    forward: (call, input: Record<string, unknown>) => call("math", input),
+    forward: (call, input: Fields) => call("math", input),
     predictors: [predictor],
-  }) as Program<never, unknown>
+  })
 }
 
 test("evaluate never throws per example: failures score failureScore with null output", async () => {
@@ -495,7 +496,7 @@ test("evaluate never throws per example: failures score failureScore with null o
       if (!prediction) {
         throw new Error("no prediction")
       }
-      return 1
+      return { score: 1 }
     },
     program: makeMathProgram(),
     reflectionLM: () => Promise.resolve(""),
@@ -517,8 +518,9 @@ test("student demos survive gepa untouched; candidates stay instruction-only", a
   const program = makeMathProgram()
   ;(program.predictors[0] as Predictor).demos = [demo]
   const result = await gepa(program, examples(3), {
-    maxMetricCalls: 1, // seed eval alone exceeds this → loop never runs
-    metric: () => 0,
+    // The seed eval alone exceeds this, so the loop never runs.
+    maxMetricCalls: 1,
+    metric: () => ({ score: 0 }),
     reflectionLM: () => Promise.resolve(""),
   })
   // The candidate is a bare instruction map, exactly upstream's dict[str, str].
@@ -536,7 +538,9 @@ test("gepa e2e: budget enforced, best candidate beats or matches the seed", asyn
   }))
   const result = await gepa(makeMathProgram(), trainset, {
     maxMetricCalls: 60,
-    metric: (gold, prediction) => (prediction?.y === gold.outputs.y ? 1 : 0),
+    metric: (gold, prediction) => ({
+      score: prediction?.y === gold.outputs.y ? 1 : 0,
+    }),
     reflectionLM: () =>
       Promise.resolve("```\nAlways double the input: return y = x * 2.\n```"),
     seed: 1,

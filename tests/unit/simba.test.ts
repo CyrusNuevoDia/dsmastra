@@ -1,23 +1,25 @@
 import { describe, expect, test } from "bun:test"
+
 import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
+
+import type { Fields } from "@/fields"
 import { declarePredictor } from "@/predictor"
-import { createProgram, type Program } from "@/program"
+import { createProgram } from "@/program"
+import type { Program } from "@/program"
 import { createRNG, samplePoisson } from "@/random"
 import {
   appendADemo,
   appendARule,
-  type Bucket,
   dropDemos,
-  type Example,
   makeBuckets,
   percentile,
-  type Rollout,
   simba,
   softmaxSample,
   topKPlusBaseline,
 } from "@/simba"
+import type { Bucket, Example, Rollout } from "@/simba"
 
 const usage = {
   inputTokens: {
@@ -66,10 +68,10 @@ const makeRollout = (
   ...overrides,
 })
 
-function bucketOf(scores: number[]): Bucket {
+const bucketOf = (scores: number[]): Bucket => {
   const rollouts = scores
     .map((score) => makeRollout(score))
-    .sort((a, b) => b.score - a.score)
+    .toSorted((a, b) => b.score - a.score)
   const max = (rollouts[0] as Rollout).score
   const min = (rollouts.at(-1) as Rollout).score
   const avg = scores.reduce((acc, s) => acc + s, 0) / scores.length
@@ -81,10 +83,10 @@ function bucketOf(scores: number[]): Bucket {
   }
 }
 
-function makeProgram(
+const makeProgram = (
   instructions: string,
   model: LanguageModel = deadModel
-): Program<never, unknown> {
+): Program => {
   const predictor = declarePredictor({
     inputSchema: z.object({ text: z.string() }),
     instructions,
@@ -93,9 +95,9 @@ function makeProgram(
     outputSchema: z.object({ label: z.enum(["pos", "neg"]) }),
   })
   return createProgram({
-    forward: (call, input: Record<string, unknown>) => call("classify", input),
+    forward: (call, input: Fields) => call("classify", input),
     predictors: [predictor],
-  }) as Program<never, unknown>
+  })
 }
 
 describe("topKPlusBaseline", () => {
@@ -200,12 +202,14 @@ describe("makeBuckets", () => {
     const rollouts = [makeRollout(1), makeRollout(0)]
     const buckets = makeBuckets(rollouts, 1)
     ;((buckets[0] as Bucket).rollouts[0] as Rollout).score = 42
-    expect(rollouts.map((r) => r.score).sort((a, b) => a - b)).toEqual([0, 1])
+    expect(rollouts.map((r) => r.score).toSorted((a, b) => a - b)).toEqual([
+      0, 1,
+    ])
   })
 })
 
 describe("dropDemos", () => {
-  function programWithDemos(count: number): Program<never, unknown> {
+  const programWithDemos = (count: number): Program => {
     const program = makeProgram("classify")
     for (const predictor of program.predictors) {
       predictor.demos = Array.from({ length: count }, (_, i) => ({
@@ -252,9 +256,9 @@ describe("dropDemos", () => {
       }))
     }
     const program = createProgram({
-      forward: (call, input: Record<string, unknown>) => call("a", input),
+      forward: (call, input: Fields) => call("a", input),
       predictors: [a, b],
-    }) as Program<never, unknown>
+    })
     dropDemos(program, 4, createRNG(3), createRNG(3))
     expect(a.demos.map((d) => d.inputs.i)).toEqual(
       b.demos.map((d) => d.inputs.i)
@@ -392,10 +396,9 @@ describe("simba end-to-end", () => {
       { inputs: { text: "pos hard one" }, outputs: { label: "pos" } },
       { inputs: { text: "neg hard two" }, outputs: { label: "neg" } },
     ]
-    const metric = (
-      ex: Example,
-      prediction?: Record<string, unknown>
-    ): number => (prediction?.label === ex.outputs.label ? 1 : 0)
+    const metric = (ex: Example, prediction?: Fields) => ({
+      score: prediction?.label === ex.outputs.label ? 1 : 0,
+    })
 
     const scoreOn = async (program: typeof student) => {
       const scores = await Promise.all(
@@ -407,7 +410,7 @@ describe("simba end-to-end", () => {
           return metric(ex, prediction)
         })
       )
-      return scores.reduce((acc, s) => acc + s, 0) / trainset.length
+      return scores.reduce((acc, s) => acc + s.score, 0) / trainset.length
     }
 
     const baselineScore = await scoreOn(student)
@@ -429,7 +432,7 @@ describe("simba end-to-end", () => {
 
     expect(result.candidates.length).toBeGreaterThanOrEqual(1)
     const scores = result.candidates.map((c) => c.score)
-    expect([...scores].sort((a, b) => b - a)).toEqual(scores)
+    expect([...scores].toSorted((a, b) => b - a)).toEqual(scores)
     expect(scores[0]).toBe(1)
     expect(result.trialLogs).toHaveLength(2)
     // the untouched student stays in the finalist pool
