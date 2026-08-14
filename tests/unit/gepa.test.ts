@@ -4,10 +4,7 @@ import { z } from "zod"
 
 import type { Fields } from "@/fields"
 import { autoBudget, gepa, gepaProgram } from "@/optimizers/gepa"
-import {
-  createProgramAdapter,
-  extractInstructionText,
-} from "@/optimizers/gepa/adapter"
+import { createProgramAdapter } from "@/optimizers/gepa/adapter"
 import {
   buildMergeSubsample,
   createEpochShuffledSampler,
@@ -27,6 +24,7 @@ import type {
 import type { Prompts } from "@/optimizers/utils"
 import { createProgram } from "@/program"
 import type { Example, Program } from "@/program"
+import { extractInstructionText } from "@/prompting"
 import type { AnyTunableStep } from "@/step"
 import { createWorkflow } from "@/workflow"
 

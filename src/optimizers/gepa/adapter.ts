@@ -1,6 +1,5 @@
 import { generateText } from "ai"
 import type { LanguageModel } from "ai"
-import type { z } from "zod"
 
 import { at } from "@/collections"
 import type { Fields } from "@/fields"
@@ -16,7 +15,12 @@ import type {
   Trajectory,
 } from "@/optimizers/gepa/engine"
 import type { Example, Program } from "@/program"
-import { schemaProperties } from "@/schema"
+import {
+  expectedStructure,
+  extractInstructionText,
+  renderSideInfo,
+  stringifyFields,
+} from "@/prompting"
 
 /** A metric result that names the feedback field GEPA's reflection LM reads. */
 export type ScoreWithFeedback = MetricResult & { feedback?: string }
@@ -73,59 +77,6 @@ const PARSE_FAILURE_OUTPUT = (raw: string) =>
 const PARSE_FAILURE_FEEDBACK_PREFIX =
   "Your output failed to parse. Follow this structure:\n"
 
-const expectedStructure = (outputSchema: z.ZodType | undefined): string =>
-  Object.entries(schemaProperties(outputSchema))
-    .map(([name, prop]) => `${name}: ${prop.type ?? "unknown"}`)
-    .join("\n")
-
-const MAX_HEADER_DEPTH = 6
-
-/**
- * Byte-for-byte port of the Python renderer: scalars end with a blank line
- * (`value\n\n`), headers with a single newline, empty dicts/lists add a bare
- * newline, and the depth cap applies on recursion.
- */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is whatever the model produced and the schema accepted, so the renderer genuinely meets an open value
-const renderValue = (value: unknown, level: number): string => {
-  const header = "#".repeat(level)
-  const nextLevel = Math.min(level + 1, MAX_HEADER_DEPTH)
-  if (Array.isArray(value)) {
-    let s = ""
-    for (const [k, item] of value.entries()) {
-      s += `${header} Item ${k + 1}\n${renderValue(item, nextLevel)}`
-    }
-    if (value.length === 0) {
-      s += "\n"
-    }
-    return s
-  }
-  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- objects nest into headers; every other JSON case renders as a scalar below
-  if (typeof value === "object" && value !== null) {
-    const entries = Object.entries(value)
-    let s = ""
-    for (const [key, sub] of entries) {
-      s += `${header} ${key}\n${renderValue(sub, nextLevel)}`
-    }
-    if (entries.length === 0) {
-      s += "\n"
-    }
-    return s
-  }
-  return `${String(value).trim()}\n\n`
-}
-
-/** Markdown rendering of the reflective dataset for `<side_info>`. */
-export const renderSideInfo = (examples: ReflectiveExample[]): string =>
-  examples
-    .map((example, n) => {
-      let s = `# Example ${n + 1}\n`
-      for (const [key, value] of Object.entries(example)) {
-        s += `## ${key}\n${renderValue(value, 3)}`
-      }
-      return s
-    })
-    .join("\n\n")
-
 // --- Instruction-proposal prompt (verbatim template) ------------------------
 
 export const buildProposalPrompt = (
@@ -149,46 +100,6 @@ Read the inputs carefully and identify the input format and infer detailed task 
 Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well.
 
 Provide the new instructions within \`\`\` blocks.`
-
-const LANGUAGE_TAG = /^\S*\n/u
-const LEADING_FENCE = /^```\S*\n?/u
-
-/**
- * Byte-for-byte port of Python's output_extractor (which receives the
- * response pre-stripped): text between the first and last fences with a
- * leading language tag stripped; incomplete blocks fall back to stripping a
- * leading fence (+ optional language tag and newline) or a trailing fence,
- * else the whole trimmed response.
- */
-export const extractInstructionText = (response: string): string => {
-  const lmOut = response.trim()
-  const start = lmOut.indexOf("```") + 3
-  const end = lmOut.lastIndexOf("```")
-  if (start >= end) {
-    if (lmOut.startsWith("```")) {
-      const match = LEADING_FENCE.exec(lmOut)
-      if (match) {
-        return lmOut.slice(match[0].length).trim()
-      }
-      return lmOut
-    }
-    if (lmOut.endsWith("```")) {
-      return lmOut.slice(0, -3).trim()
-    }
-    return lmOut
-  }
-  let content = lmOut.slice(start, end)
-  const tag = LANGUAGE_TAG.exec(content)
-  if (tag) {
-    content = content.slice(tag[0].length)
-  }
-  return content.trim()
-}
-
-const stringifyFields = (fields: Fields): Record<string, string> =>
-  Object.fromEntries(
-    Object.entries(fields).map(([key, value]) => [key, String(value)])
-  )
 
 // --- Program adapter ---------------------------------------------------------
 

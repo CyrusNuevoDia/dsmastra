@@ -17,7 +17,7 @@ const usage = {
   outputTokens: { reasoning: undefined, text: 20, total: 20 },
 }
 
-test("declareStep forwards AI SDK call settings to generateObject", async () => {
+test("declareStep forwards AI SDK call settings to generateText", async () => {
   const seen: LanguageModelV4CallOptions[] = []
   const model = new MockLanguageModelV4({
     doGenerate: (options) => {

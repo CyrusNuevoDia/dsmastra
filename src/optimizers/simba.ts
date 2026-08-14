@@ -13,8 +13,8 @@ import {
 } from "@/optimizers/utils"
 import type { SavePrompts } from "@/optimizers/utils"
 import type { Example, Program } from "@/program"
+import { inspectModules, serializeField } from "@/prompting"
 import { createRNG, samplePoisson, shuffle, weightedChoice } from "@/random"
-import { schemaProperties } from "@/schema"
 import type { RunContext, TraceStep } from "@/step"
 import type { CommittedWorkflow, StepMap } from "@/workflow"
 
@@ -333,77 +333,6 @@ const offerFeedbackSchema = (moduleNames: string[]) =>
       .object(Object.fromEntries(moduleNames.map((name) => [name, z.string()])))
       .describe(MODULE_ADVICE_DESCRIPTION),
   })
-
-/** A value that survives `JSON.stringify` unchanged. */
-type JSONData =
-  | JSONData[]
-  | boolean
-  | number
-  | string
-  | { [key: string]: JSONData }
-  | null
-
-/** Replace non-serializable values recursively, like dspy's recursive_mask. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a step output is whatever the model produced and the schema accepted, so this genuinely meets an open value; `JSONData` is the named type it returns
-export const recursiveMask = (value: unknown): JSONData => {
-  if (value === null) {
-    return null
-  }
-  if (Array.isArray(value)) {
-    return value.map(recursiveMask)
-  }
-  /* oxlint-disable anti-slop/no-runtime-typeof -- this IS the parse step the rule asks for: an open value becomes `JSONData`, with anything unserializable replaced by a printable placeholder */
-  switch (typeof value) {
-    case "boolean":
-    case "number":
-    case "string": {
-      return value
-    }
-    case "object": {
-      return Object.fromEntries(
-        Object.entries(value).map(([k, v]) => [k, recursiveMask(v)])
-      )
-    }
-    default: {
-      return `<non-serializable: ${typeof value}>`
-    }
-  }
-  /* oxlint-enable anti-slop/no-runtime-typeof */
-}
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- same open boundary as `recursiveMask`: a field value is whatever the step produced
-const serializeField = (value: unknown): string =>
-  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- strings go into the prompt raw; everything else routes through `recursiveMask`, which is the parse
-  typeof value === "string"
-    ? value
-    : JSON.stringify(recursiveMask(value), null, 2)
-
-const fieldDescriptionLines = (schema: z.ZodType): string =>
-  Object.entries(schemaProperties(schema))
-    .map(
-      ([name, prop]) =>
-        `${name} (${prop.type ?? "unknown"})${prop.description ? `: ${prop.description}` : ""}`
-    )
-    .join("\n")
-
-const MODULE_SEPARATOR = "-".repeat(80)
-
-const indentContinuations = (text: string): string =>
-  ["", ...text.split("\n")].join("\n\t\t")
-
-export const inspectModules = (program: Program<never, unknown>): string => {
-  const blocks = [MODULE_SEPARATOR]
-  for (const step of program.steps) {
-    blocks.push(
-      `Module ${step.id}`,
-      `\n\tInput Fields:${indentContinuations(fieldDescriptionLines(step.inputSchema))}`,
-      `\tOutput Fields:${indentContinuations(fieldDescriptionLines(step.outputSchema))}`,
-      `\tOriginal Instructions: ${indentContinuations(step.description)}`,
-      MODULE_SEPARATOR
-    )
-  }
-  return blocks.map((block) => block.replaceAll(/^\n+|\n+$/gu, "")).join("\n")
-}
 
 export type OfferFeedbackResult = {
   discussion: string

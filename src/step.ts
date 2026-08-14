@@ -5,6 +5,7 @@ import { generateText, Output } from "ai"
 import type { z } from "zod"
 
 import type { FieldSchema, Fields } from "@/fields"
+import { renderPrompt } from "@/prompting"
 
 /**
  * A training example: inputData plus the expected output fields. Doubles as a
@@ -30,7 +31,7 @@ export type RunContext = {
   trace?: TraceStep[]
 }
 
-/** AI SDK call settings supported first-class on a step, forwarded verbatim to generateObject. */
+/** AI SDK call settings supported first-class on a step, forwarded verbatim to generateText. */
 export type StepSettings = {
   abortSignal?: AbortSignal
   frequencyPenalty?: number
@@ -92,21 +93,6 @@ export type TunableStep<
 }
 
 export type AnyTunableStep = TunableStep
-
-const renderPrompt = (
-  description: string,
-  examples: Example[],
-  inputData: Fields
-): string => {
-  const parts = [description]
-  for (const example of examples) {
-    parts.push(
-      `Example:\nInput:\n${JSON.stringify(example.inputData)}\nOutput:\n${JSON.stringify(example.outputData)}`
-    )
-  }
-  parts.push(`Input:\n${JSON.stringify(inputData)}`)
-  return parts.join("\n\n")
-}
 
 export const declareStep = <
   TStepId extends string,
