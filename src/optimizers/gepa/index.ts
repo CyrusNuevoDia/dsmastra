@@ -156,7 +156,7 @@ export type GEPAProgramResult<TInput, TOutput> = {
   bestIdx: number
   candidates: Candidate[]
   discoveryEvalCounts: number[]
-  fullValidationSetEvalsCount: number
+  validationSetEvalsCount: number
   parents: (number | null)[][]
   perValidationInstanceBestCandidates: Map<number, Set<number>>
   program: Program<TInput, TOutput>
@@ -179,7 +179,6 @@ export const buildResult = <TInput, TOutput>(
     bestIdx,
     candidates: state.programCandidates,
     discoveryEvalCounts: state.metricCallCountsByDiscovery,
-    fullValidationSetEvalsCount: state.fullValidationSetEvalsCount,
     parents: state.parentProgramForCandidate,
     perValidationInstanceBestCandidates:
       state.programAtParetoFrontValidationSet,
@@ -187,6 +186,7 @@ export const buildResult = <TInput, TOutput>(
     seed,
     totalMetricCalls: state.totalEvalsCount,
     validationAggregateScores,
+    validationSetEvalsCount: state.validationSetEvalsCount,
     validationSubscores: Array.from(
       { length: state.programCandidates.length },
       (_, idx) =>

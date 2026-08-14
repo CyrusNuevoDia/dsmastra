@@ -69,7 +69,7 @@ export type GEPAAdapter<TInput = Fields, TOutput = Fields> = {
 export type GEPAState = {
   i: number
   stepIdToUpdateNextForCandidate: number[]
-  fullValidationSetEvalsCount: number
+  validationSetEvalsCount: number
   metricCallCountsByDiscovery: number[]
   paretoFrontValidationSet: Map<number, number>
   parentProgramForCandidate: (number | null)[][]
@@ -133,7 +133,7 @@ const addCandidate = (
     )
   )
   state.totalEvalsCount += validationSetSize
-  state.fullValidationSetEvalsCount += 1
+  state.validationSetEvalsCount += 1
   updateParetoFront(
     state.paretoFrontValidationSet,
     state.programAtParetoFrontValidationSet,
@@ -705,7 +705,6 @@ export const runGEPA = async <TInput, TOutput>(
   )
   const state: GEPAState = {
     candidateValidationSubscores: [toSubscores(seedEval.scores)],
-    fullValidationSetEvalsCount: 1,
     i: -1,
     metricCallCountsByDiscovery: [0],
     parentProgramForCandidate: [[null]],
@@ -714,6 +713,7 @@ export const runGEPA = async <TInput, TOutput>(
     programCandidates: [options.seedCandidate],
     stepIdToUpdateNextForCandidate: [0],
     totalEvalsCount: validationSet.length,
+    validationSetEvalsCount: 1,
   }
   updateParetoFront(
     state.paretoFrontValidationSet,

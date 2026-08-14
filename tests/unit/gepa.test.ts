@@ -233,7 +233,7 @@ test("accepted child: full eval billed, discovery snapshot, cursor inheritance, 
   // Snapshot taken BEFORE billing the full eval: 4 seed + 3 + 3 = 10.
   expect(state.metricCallCountsByDiscovery[1]).toBe(10)
   expect(state.totalEvalsCount).toBe(14)
-  expect(state.fullValidationSetEvalsCount).toBe(2)
+  expect(state.validationSetEvalsCount).toBe(2)
   // Child inherits max(parent cursors) = 1 (parent advanced c1 → c2).
   expect(state.stepIdToUpdateNextForCandidate[1]).toBe(1)
   // Frontier replaced by the strictly better child on every instance.
@@ -322,7 +322,6 @@ const mergeLineageState = (): GEPAState => {
   }
   return {
     candidateValidationSubscores: subscores,
-    fullValidationSetEvalsCount: 3,
     i: 0,
     metricCallCountsByDiscovery: [0, 6, 12],
     parentProgramForCandidate: [[null], [0], [0]],
@@ -331,6 +330,7 @@ const mergeLineageState = (): GEPAState => {
     programCandidates: candidates,
     stepIdToUpdateNextForCandidate: [0, 0, 0],
     totalEvalsCount: 18,
+    validationSetEvalsCount: 3,
   }
 }
 
