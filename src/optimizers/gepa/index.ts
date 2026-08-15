@@ -2,11 +2,11 @@ import type { AnyWorkflow } from "@mastra/core/workflows"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { at, first } from "../../collections"
-import type { Fields } from "../../fields"
-import { bootstrapFewShotPrompts } from "../../optimizers/bootstrap"
-import { createWorkflowAdapter } from "../../optimizers/gepa/adapter"
-import type { GEPAMetric, ReflectionModel } from "../../optimizers/gepa/adapter"
+import { at, first } from "#src/collections"
+import type { Fields } from "#src/fields"
+import { bootstrapFewShotPrompts } from "#src/optimizers/bootstrap"
+import { createWorkflowAdapter } from "#src/optimizers/gepa/adapter"
+import type { GEPAMetric, ReflectionModel } from "#src/optimizers/gepa/adapter"
 import {
   acceptReflection,
   aggregateScore,
@@ -21,30 +21,30 @@ import {
   runMergeBranch,
   serializeGEPALoopState,
   serializeGEPAState,
-} from "../../optimizers/gepa/engine"
+} from "#src/optimizers/gepa/engine"
 import type {
   Candidate,
   EngineOptions,
   GEPAState,
   ReflectionPlan,
-} from "../../optimizers/gepa/engine"
+} from "#src/optimizers/gepa/engine"
 import {
   declarativeSteps,
   loadPrompts,
   optimizerResultSchema,
   promptsOf,
   promptsSchema,
-} from "../../optimizers/utils"
+} from "#src/optimizers/utils"
 import type {
   OptimizerCheckpoint,
   Prompts,
   SavePrompts,
-} from "../../optimizers/utils"
-import { createRNG, restoreRNG } from "../../random"
-import type { RNG } from "../../random"
-import { resolveScorer, scorerMetric } from "../../scorers"
-import type { MetricOutput, ScorerRef } from "../../scorers"
-import type { Example, ScoreTarget } from "../../step"
+} from "#src/optimizers/utils"
+import { createRNG, restoreRNG } from "#src/random"
+import type { RNG } from "#src/random"
+import { resolveScorer, scorerMetric } from "#src/scorers"
+import type { MetricOutput, ScorerRef } from "#src/scorers"
+import type { Example, ScoreTarget } from "#src/step"
 
 // --- Budget -----------------------------------------------------------------
 

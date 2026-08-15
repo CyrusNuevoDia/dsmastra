@@ -1,16 +1,16 @@
 import { expect, test } from "bun:test"
 
-import type { Fields } from "../../src/fields"
+import type { Fields } from "#src/fields"
 import {
   bootstrapFewShotPrompts,
   labeledFewShotPrompts,
-} from "../../src/optimizers/bootstrap"
-import { gepaPrompts } from "../../src/optimizers/gepa"
-import { promptsOf } from "../../src/optimizers/utils"
-import type { Prompts } from "../../src/optimizers/utils"
-import type { Example, RunContext } from "../../src/step"
-import { fakeStep, fakeWorkflow, promptStep } from "./helpers"
-import type { Call } from "./helpers"
+} from "#src/optimizers/bootstrap"
+import { gepaPrompts } from "#src/optimizers/gepa/index"
+import { promptsOf } from "#src/optimizers/utils"
+import type { Prompts } from "#src/optimizers/utils"
+import type { Example, RunContext } from "#src/step"
+import { fakeStep, fakeWorkflow, promptStep } from "#tests/unit/helpers"
+import type { Call } from "#tests/unit/helpers"
 
 const singleWorkflow = (
   fn: (

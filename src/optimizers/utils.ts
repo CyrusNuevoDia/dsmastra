@@ -4,10 +4,10 @@ import { createStep } from "@mastra/core/workflows"
 import type { AnyWorkflow, SingleStepEntry, Step } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import type { Fields } from "../fields"
-import type { Metric } from "../scorers"
-import type { AnyDeclarativeStep, Example, RunContext } from "../step"
-import { RUN_CONTEXT_KEY } from "../step"
+import type { Fields } from "#src/fields"
+import type { Metric } from "#src/scorers"
+import type { AnyDeclarativeStep, Example, RunContext } from "#src/step"
+import { RUN_CONTEXT_KEY } from "#src/step"
 
 /**
  * The tuned prompt state of a workflow: everything an optimizer changes and

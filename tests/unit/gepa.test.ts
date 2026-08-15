@@ -4,12 +4,7 @@ import type { RequestContext } from "@mastra/core/request-context"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import {
-  autoBudget,
-  createGEPAWorkflow,
-  gepaPrompts,
-} from "../../src/optimizers/gepa"
-import { createWorkflowAdapter } from "../../src/optimizers/gepa/adapter"
+import { createWorkflowAdapter } from "#src/optimizers/gepa/adapter"
 import {
   buildMergeSubsample,
   createEpochShuffledSampler,
@@ -19,19 +14,24 @@ import {
   runMergeIteration,
   selectParetoParent,
   updateParetoFront,
-} from "../../src/optimizers/gepa/engine"
+} from "#src/optimizers/gepa/engine"
 import type {
   Candidate,
   EngineOptions,
   GEPAAdapter,
   GEPAState,
-} from "../../src/optimizers/gepa/engine"
-import { promptsOf } from "../../src/optimizers/utils"
-import type { Prompts } from "../../src/optimizers/utils"
-import { extractInstructionText } from "../../src/prompting"
-import type { Example, RunContext } from "../../src/step"
-import { RUN_CONTEXT_KEY } from "../../src/step"
-import { fakeScorer, promptStep, runOptimizer } from "./helpers"
+} from "#src/optimizers/gepa/engine"
+import {
+  autoBudget,
+  createGEPAWorkflow,
+  gepaPrompts,
+} from "#src/optimizers/gepa/index"
+import { promptsOf } from "#src/optimizers/utils"
+import type { Prompts } from "#src/optimizers/utils"
+import { extractInstructionText } from "#src/prompting"
+import type { Example, RunContext } from "#src/step"
+import { RUN_CONTEXT_KEY } from "#src/step"
+import { fakeScorer, promptStep, runOptimizer } from "#tests/unit/helpers"
 
 const zero = () => 0
 

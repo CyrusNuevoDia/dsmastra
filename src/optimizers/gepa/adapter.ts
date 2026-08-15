@@ -2,8 +2,8 @@ import type { AnyWorkflow } from "@mastra/core/workflows"
 import { generateText } from "ai"
 import type { LanguageModel } from "ai"
 
-import { at } from "../../collections"
-import type { Fields } from "../../fields"
+import { at } from "#src/collections"
+import type { Fields } from "#src/fields"
 import type {
   Candidate,
   EvaluationBatch,
@@ -13,17 +13,17 @@ import type {
   ReflectiveExample,
   RNG,
   Trajectory,
-} from "../../optimizers/gepa/engine"
-import { declarativeSteps, runWith } from "../../optimizers/utils"
-import type { Prompts } from "../../optimizers/utils"
+} from "#src/optimizers/gepa/engine"
+import { declarativeSteps, runWith } from "#src/optimizers/utils"
+import type { Prompts } from "#src/optimizers/utils"
 import {
   expectedStructure,
   extractInstructionText,
   renderSideInfo,
   stringifyFields,
-} from "../../prompting"
-import type { MetricOutput, MetricResult } from "../../scorers"
-import type { Example, ScoreTarget } from "../../step"
+} from "#src/prompting"
+import type { MetricOutput, MetricResult } from "#src/scorers"
+import type { Example, ScoreTarget } from "#src/step"
 
 /** A metric result that names the feedback field GEPA's reflection LM reads. */
 export type ScoreWithFeedback = MetricResult & { feedback?: string }

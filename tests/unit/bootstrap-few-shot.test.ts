@@ -5,8 +5,8 @@ import type { Trajectory } from "@mastra/core/evals"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { createBootstrapFewShotWorkflow } from "../../src/optimizers/bootstrap-few-shot"
-import { fakeScorer, fakeStep, runOptimizer } from "./helpers"
+import { createBootstrapFewShotWorkflow } from "#src/optimizers/bootstrap-few-shot"
+import { fakeScorer, fakeStep, runOptimizer } from "#tests/unit/helpers"
 
 const fieldsSchema = z.record(z.string(), z.unknown())
 

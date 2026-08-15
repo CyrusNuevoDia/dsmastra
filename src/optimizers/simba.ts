@@ -4,8 +4,8 @@ import { generateText, Output } from "ai"
 import type { LanguageModel } from "ai"
 import { z } from "zod"
 
-import { at, first, last } from "../collections"
-import type { Fields } from "../fields"
+import { at, first, last } from "#src/collections"
+import type { Fields } from "#src/fields"
 import {
   codeOf,
   declarativeSteps,
@@ -16,24 +16,24 @@ import {
   promptsOf,
   promptsSchema,
   runWith,
-} from "../optimizers/utils"
+} from "#src/optimizers/utils"
 import type {
   OptimizerCheckpoint,
   Prompts,
   SavePrompts,
-} from "../optimizers/utils"
-import { inspectModules, serializeField } from "../prompting"
+} from "#src/optimizers/utils"
+import { inspectModules, serializeField } from "#src/prompting"
 import {
   createRNG,
   restoreRNG,
   samplePoisson,
   shuffle,
   weightedChoice,
-} from "../random"
-import type { RNG } from "../random"
-import { resolveScorer, scorerMetric } from "../scorers"
-import type { Metric, ScorerRef } from "../scorers"
-import type { Example, RunContext, TraceStep } from "../step"
+} from "#src/random"
+import type { RNG } from "#src/random"
+import { resolveScorer, scorerMetric } from "#src/scorers"
+import type { Metric, ScorerRef } from "#src/scorers"
+import type { Example, RunContext, TraceStep } from "#src/step"
 
 export type SIMBAConfig = {
   batchSize?: number

@@ -2,17 +2,17 @@ import type { AnyWorkflow } from "@mastra/core/workflows"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { labeledFewShotPrompts } from "../optimizers/bootstrap"
+import { labeledFewShotPrompts } from "#src/optimizers/bootstrap"
 import {
   compiledSchema,
   finishingSteps,
   optimizerResultSchema,
   promptsOf,
-} from "../optimizers/utils"
-import type { SavePrompts } from "../optimizers/utils"
-import { resolveScorer, scorerMetric } from "../scorers"
-import type { ScorerRef } from "../scorers"
-import type { Example } from "../step"
+} from "#src/optimizers/utils"
+import type { SavePrompts } from "#src/optimizers/utils"
+import { resolveScorer, scorerMetric } from "#src/scorers"
+import type { ScorerRef } from "#src/scorers"
+import type { Example } from "#src/step"
 
 export type LabeledFewShotConfig = {
   maxFewShotExamples?: number

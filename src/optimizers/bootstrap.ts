@@ -1,14 +1,14 @@
 import type { AnyWorkflow } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
 
-import { at, last } from "../collections"
-import type { Fields } from "../fields"
-import { runWith } from "../optimizers/utils"
-import type { Prompts } from "../optimizers/utils"
-import { createRNG, sample, shuffle } from "../random"
-import type { MetricOutput } from "../scorers"
-import type { Example, RunContext, TraceStep } from "../step"
-import { isEqualJSON } from "../utils"
+import { at, last } from "#src/collections"
+import type { Fields } from "#src/fields"
+import { runWith } from "#src/optimizers/utils"
+import type { Prompts } from "#src/optimizers/utils"
+import { createRNG, sample, shuffle } from "#src/random"
+import type { MetricOutput } from "#src/scorers"
+import type { Example, RunContext, TraceStep } from "#src/step"
+import { isEqualJSON } from "#src/utils"
 
 /**
  * Shared bootstrap machinery, ported faithfully from

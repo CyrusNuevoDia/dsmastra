@@ -14,14 +14,14 @@ import {
   percentile,
   softmaxSample,
   topKPlusBaseline,
-} from "../../src/optimizers/simba"
-import type { Bucket, Rollout } from "../../src/optimizers/simba"
-import { promptsOf } from "../../src/optimizers/utils"
-import type { Prompts } from "../../src/optimizers/utils"
-import { createRNG, samplePoisson } from "../../src/random"
-import { declareStep } from "../../src/step"
-import type { Example } from "../../src/step"
-import { fakeScorer, promptStep, runOptimizer } from "./helpers"
+} from "#src/optimizers/simba"
+import type { Bucket, Rollout } from "#src/optimizers/simba"
+import { promptsOf } from "#src/optimizers/utils"
+import type { Prompts } from "#src/optimizers/utils"
+import { createRNG, samplePoisson } from "#src/random"
+import { declareStep } from "#src/step"
+import type { Example } from "#src/step"
+import { fakeScorer, promptStep, runOptimizer } from "#tests/unit/helpers"
 
 const usage = {
   inputTokens: {

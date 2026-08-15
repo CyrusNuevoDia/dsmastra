@@ -1,6 +1,6 @@
 /** Seeded RNG + sampling utilities shared by the optimizers. */
 
-import { at, last } from "./collections"
+import { at, last } from "#src/collections"
 
 export type RNG = () => number
 

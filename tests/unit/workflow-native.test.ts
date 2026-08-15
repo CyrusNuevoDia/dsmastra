@@ -5,11 +5,16 @@ import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
-import { createLabeledFewShotWorkflow } from "../../src/optimizers/labeled-few-shot"
-import { loadPrompts, promptsOf, runWith } from "../../src/optimizers/utils"
-import type { TraceStep } from "../../src/step"
-import { declareStep } from "../../src/step"
-import { fakeScorer, fakeStep, promptStep, runOptimizer } from "./helpers"
+import { createLabeledFewShotWorkflow } from "#src/optimizers/labeled-few-shot"
+import { loadPrompts, promptsOf, runWith } from "#src/optimizers/utils"
+import type { TraceStep } from "#src/step"
+import { declareStep } from "#src/step"
+import {
+  fakeScorer,
+  fakeStep,
+  promptStep,
+  runOptimizer,
+} from "#tests/unit/helpers"
 
 const usage = {
   inputTokens: {

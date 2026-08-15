@@ -6,11 +6,11 @@ import { createWorkflow } from "@mastra/core/workflows"
 import type { AnyWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { createBootstrapFewShotWorkflow } from "../../src/optimizers/bootstrap-few-shot"
-import { createGEPAWorkflow } from "../../src/optimizers/gepa"
-import { createLabeledFewShotWorkflow } from "../../src/optimizers/labeled-few-shot"
-import { createSIMBAWorkflow } from "../../src/optimizers/simba"
-import { fakeScorer, fakeStep } from "./helpers"
+import { createBootstrapFewShotWorkflow } from "#src/optimizers/bootstrap-few-shot"
+import { createGEPAWorkflow } from "#src/optimizers/gepa/index"
+import { createLabeledFewShotWorkflow } from "#src/optimizers/labeled-few-shot"
+import { createSIMBAWorkflow } from "#src/optimizers/simba"
+import { fakeScorer, fakeStep } from "#tests/unit/helpers"
 
 const fieldsSchema = z.record(z.string(), z.unknown())
 

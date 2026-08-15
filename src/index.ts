@@ -1,19 +1,19 @@
 export {
   type BootstrapFewShotConfig,
   createBootstrapFewShotWorkflow,
-} from "./optimizers/bootstrap-few-shot"
-export { type GEPAConfig, createGEPAWorkflow } from "./optimizers/gepa"
+} from "#src/optimizers/bootstrap-few-shot"
+export { type GEPAConfig, createGEPAWorkflow } from "#src/optimizers/gepa/index"
 export {
   type LabeledFewShotConfig,
   createLabeledFewShotWorkflow,
-} from "./optimizers/labeled-few-shot"
-export { type SIMBAConfig, createSIMBAWorkflow } from "./optimizers/simba"
+} from "#src/optimizers/labeled-few-shot"
+export { type SIMBAConfig, createSIMBAWorkflow } from "#src/optimizers/simba"
 export {
   type OptimizerCheckpoint,
   type OptimizerResult,
   type Prompts,
   type SavePrompts,
   loadPrompts,
-} from "./optimizers/utils"
-export { type ScorerRef, createExactMatchScorer } from "./scorers"
-export { type Example, type StepSettings, declareStep } from "./step"
+} from "#src/optimizers/utils"
+export { type ScorerRef, createExactMatchScorer } from "#src/scorers"
+export { type Example, type StepSettings, declareStep } from "#src/step"

@@ -1,10 +1,10 @@
-import { at, get, pop, prop } from "../../collections"
-import type { Fields } from "../../fields"
-import { shuffle, weightedChoice, weightedChoiceStrict } from "../../random"
-import type { RNG } from "../../random"
-import type { Example, TraceStep } from "../../step"
+import { at, get, pop, prop } from "#src/collections"
+import type { Fields } from "#src/fields"
+import { shuffle, weightedChoice, weightedChoiceStrict } from "#src/random"
+import type { RNG } from "#src/random"
+import type { Example, TraceStep } from "#src/step"
 
-export type { RNG } from "../../random"
+export type { RNG } from "#src/random"
 
 /**
  * A candidate is a map of component (step) name → instruction text,

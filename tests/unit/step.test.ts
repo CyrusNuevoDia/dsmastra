@@ -6,9 +6,9 @@ import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
-import { loadPrompts, promptsOf } from "../../src/optimizers/utils"
-import { declareStep } from "../../src/step"
-import { promptStep } from "./helpers"
+import { loadPrompts, promptsOf } from "#src/optimizers/utils"
+import { declareStep } from "#src/step"
+import { promptStep } from "#tests/unit/helpers"
 
 const usage = {
   inputTokens: {

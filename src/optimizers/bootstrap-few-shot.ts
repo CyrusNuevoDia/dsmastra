@@ -3,8 +3,8 @@ import { createStep, createWorkflow } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
 import { z } from "zod"
 
-import { at } from "../collections"
-import type { BootstrapMetric } from "../optimizers/bootstrap"
+import { at } from "#src/collections"
+import type { BootstrapMetric } from "#src/optimizers/bootstrap"
 import {
   BOOTSTRAP_DEFAULT_MAX_ERRORS,
   harvestTraceExamples,
@@ -12,7 +12,7 @@ import {
   prepareStudentAndTeacher,
   resetCopy,
   runBootstrapAttempt,
-} from "../optimizers/bootstrap"
+} from "#src/optimizers/bootstrap"
 import {
   compiledSchema,
   exampleSchema,
@@ -20,11 +20,15 @@ import {
   optimizerResultSchema,
   promptsOf,
   promptsSchema,
-} from "../optimizers/utils"
-import type { OptimizerCheckpoint, SavePrompts } from "../optimizers/utils"
-import { resolveScorer, scorerMetric, trajectoryScorerMetric } from "../scorers"
-import type { ScorerRef } from "../scorers"
-import type { Example } from "../step"
+} from "#src/optimizers/utils"
+import type { OptimizerCheckpoint, SavePrompts } from "#src/optimizers/utils"
+import {
+  resolveScorer,
+  scorerMetric,
+  trajectoryScorerMetric,
+} from "#src/scorers"
+import type { ScorerRef } from "#src/scorers"
+import type { Example } from "#src/step"
 
 export type BootstrapFewShotConfig = {
   /** Pause hook: called before every teacher attempt; returning true suspends

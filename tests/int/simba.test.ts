@@ -5,7 +5,7 @@ import { createScorer } from "@mastra/core/evals"
 import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { createSIMBAWorkflow, declareStep } from "../../src/index"
+import { createSIMBAWorkflow, declareStep } from "#src/index"
 
 // A temperature-capable (non-reasoning) model: SIMBA's rollout sampling and
 // the rule strategy both need it.

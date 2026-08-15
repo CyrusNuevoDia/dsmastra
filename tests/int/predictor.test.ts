@@ -2,8 +2,8 @@ import { expect, test } from "bun:test"
 
 import { z } from "zod"
 
-import { declareStep } from "../../src/step"
-import { model } from "../_helpers"
+import { declareStep } from "#src/step"
+import { model } from "#tests/_helpers"
 
 test("declareStep → doubles number (live)", async () => {
   const step = declareStep({

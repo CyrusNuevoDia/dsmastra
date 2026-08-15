@@ -3,9 +3,9 @@ import { expect, test } from "bun:test"
 import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { loadPrompts } from "../../src/optimizers/utils"
-import type { Prompts } from "../../src/optimizers/utils"
-import { fakeStep } from "./helpers"
+import { loadPrompts } from "#src/optimizers/utils"
+import type { Prompts } from "#src/optimizers/utils"
+import { fakeStep } from "#tests/unit/helpers"
 
 const makeWorkflow = () => {
   const step = fakeStep("solve", (inputData) => inputData)

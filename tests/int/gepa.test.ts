@@ -4,9 +4,9 @@ import { createScorer } from "@mastra/core/evals"
 import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { createGEPAWorkflow, declareStep } from "../../src/index"
-import type { Example } from "../../src/index"
-import { model } from "../_helpers"
+import { createGEPAWorkflow, declareStep } from "#src/index"
+import type { Example } from "#src/index"
+import { model } from "#tests/_helpers"
 
 const trainingSet: Example[] = [1, 2, 3, 5, 8, 13].map((x) => ({
   inputData: { x },

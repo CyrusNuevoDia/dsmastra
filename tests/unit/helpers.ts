@@ -4,9 +4,9 @@ import { createStep, createWorkflow } from "@mastra/core/workflows"
 import type { AnyWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import type { Prompts } from "../../src/optimizers/utils"
-import type { Example, RunContext } from "../../src/step"
-import { RUN_CONTEXT_KEY } from "../../src/step"
+import type { Prompts } from "#src/optimizers/utils"
+import type { Example, RunContext } from "#src/step"
+import { RUN_CONTEXT_KEY } from "#src/step"
 
 export type Call = { ctx?: RunContext; inputData: Record<string, unknown> }
 

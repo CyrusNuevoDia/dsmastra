@@ -1,8 +1,8 @@
 import type { z } from "zod"
 
-import type { FieldSchema, Fields } from "./fields"
-import { schemaProperties } from "./schema"
-import type { Example } from "./step"
+import type { FieldSchema, Fields } from "#src/fields"
+import { schemaProperties } from "#src/schema"
+import type { Example } from "#src/step"
 
 /**
  * Prompt-template formatting shared across the steps and optimizers: rendering

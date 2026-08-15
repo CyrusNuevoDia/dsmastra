@@ -7,8 +7,8 @@ import type { LanguageModel } from "ai"
 import { generateText, Output } from "ai"
 import type { z } from "zod"
 
-import type { FieldSchema, Fields } from "./fields"
-import { renderPrompt } from "./prompting"
+import type { FieldSchema, Fields } from "#src/fields"
+import { renderPrompt } from "#src/prompting"
 
 /**
  * A training example: inputData plus the expected output fields. Doubles as a
