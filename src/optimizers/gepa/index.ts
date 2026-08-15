@@ -1,19 +1,52 @@
 import type { AnyWorkflow } from "@mastra/core/workflows"
+import { createStep, createWorkflow } from "@mastra/core/workflows"
+import { z } from "zod"
 
-import { at, first } from "@/collections"
-import type { Fields } from "@/fields"
-import { bootstrapFewShotProgram } from "@/optimizers/bootstrap"
-import { createProgramAdapter } from "@/optimizers/gepa/adapter"
-import type { GEPAMetric, ReflectionModel } from "@/optimizers/gepa/adapter"
-import { aggregateScore, argmax, runGEPA } from "@/optimizers/gepa/engine"
-import type { Candidate, GEPAState } from "@/optimizers/gepa/engine"
-import { applyProgram, promptsOf, workflowToProgram } from "@/optimizers/utils"
-import type { Prompts, SavePrompts } from "@/optimizers/utils"
-import type { Example, Program } from "@/program"
-import { createRNG } from "@/random"
-import { resolveScorer, scorerMetric } from "@/scorers"
-import type { MetricOutput, ScorerRef } from "@/scorers"
-import type { ScoreTarget } from "@/step"
+import { at, first } from "../../collections"
+import type { Fields } from "../../fields"
+import { bootstrapFewShotProgram } from "../../optimizers/bootstrap"
+import { createProgramAdapter } from "../../optimizers/gepa/adapter"
+import type { GEPAMetric, ReflectionModel } from "../../optimizers/gepa/adapter"
+import {
+  acceptReflection,
+  aggregateScore,
+  argmax,
+  deserializeGEPALoopState,
+  deserializeGEPAState,
+  initGEPALoopState,
+  initGEPAState,
+  mergeDue,
+  prepareReflection,
+  runGEPA,
+  runMergeBranch,
+  serializeGEPALoopState,
+  serializeGEPAState,
+} from "../../optimizers/gepa/engine"
+import type {
+  Candidate,
+  EngineOptions,
+  GEPAState,
+  ReflectionPlan,
+} from "../../optimizers/gepa/engine"
+import {
+  applyProgram,
+  optimizerResultSchema,
+  programFromPrompts,
+  promptsOf,
+  promptsSchema,
+  workflowToProgram,
+} from "../../optimizers/utils"
+import type {
+  OptimizerCheckpoint,
+  Prompts,
+  SavePrompts,
+} from "../../optimizers/utils"
+import type { Example, Program } from "../../program"
+import { createRNG, restoreRNG } from "../../random"
+import type { RNG } from "../../random"
+import { resolveScorer, scorerMetric } from "../../scorers"
+import type { MetricOutput, ScorerRef } from "../../scorers"
+import type { ScoreTarget } from "../../step"
 
 // --- Budget -----------------------------------------------------------------
 
@@ -87,6 +120,9 @@ export type GEPAProgramConfig<TInput = Fields, TOutput = Fields> = EngineTuning<
 export type GEPAConfig = EngineTuning<Fields, Fields> & {
   /** Exactly one of `auto`, `maxFullEvals`, `maxScorerCalls` must be set. */
   auto?: GEPAAuto
+  /** Pause hook: called before every iteration; returning true suspends the
+   * run durably, to be continued with `run.resume()`. */
+  checkpoint?: OptimizerCheckpoint
   /** When > 0, a bootstrapFewShot pre-pass installs few-shot examples first. */
   maxFewShotExamples?: number
   /** Labeled backfill cap for the pre-pass; defaults to maxFewShotExamples. */
@@ -277,17 +313,99 @@ export const gepaProgram = async <TInput, TOutput>(
 
 // --- Workflow-level entry point ----------------------------------------------
 
+/** The serialized engine state, as it crosses workflow step boundaries. */
+const serializedStateSchema = z.object({
+  candidateValidationSubscores: z.array(
+    z.array(z.tuple([z.number(), z.number()]))
+  ),
+  i: z.number(),
+  metricCallCountsByDiscovery: z.array(z.number()),
+  parentProgramForCandidate: z.array(z.array(z.number().nullable())),
+  paretoFrontValidationSet: z.array(z.tuple([z.number(), z.number()])),
+  programAtParetoFrontValidationSet: z.array(
+    z.tuple([z.number(), z.array(z.number())])
+  ),
+  programCandidates: z.array(z.record(z.string(), z.string())),
+  stepIdToUpdateNextForCandidate: z.array(z.number()),
+  totalEvalsCount: z.number(),
+  validationSetEvalsCount: z.number(),
+})
+
+const serializedLoopSchema = z.object({
+  bestAgg: z.number(),
+  lastIterFoundNewProgram: z.boolean(),
+  mergeMemory: z.object({
+    producedByPair: z.array(z.string()),
+    triedTriplets: z.array(z.string()),
+  }),
+  mergesDue: z.number(),
+  samplerState: z.object({
+    epoch: z.number(),
+    shuffled: z.array(z.number()),
+  }),
+  totalMergesTested: z.number(),
+})
+
+const reflectiveExampleSchema = z.object({
+  Feedback: z.string(),
+  "Generated Outputs": z.union([z.record(z.string(), z.string()), z.string()]),
+  Inputs: z.record(z.string(), z.string()),
+})
+
+const reflectionPlanSchema = z.object({
+  components: z.array(z.string()),
+  minibatchIds: z.array(z.number()),
+  parentIdx: z.number(),
+  parentScores: z.array(z.number()),
+  reflectiveDataset: z.record(z.string(), z.array(reflectiveExampleSchema)),
+})
+
+const iterationSchema = z.object({
+  loop: serializedLoopSchema,
+  rng: z.object({ adapter: z.number(), engine: z.number() }),
+  state: serializedStateSchema,
+  studentPrompts: promptsSchema,
+})
+
+const reflectedSchema = iterationSchema.extend({
+  plan: reflectionPlanSchema.nullable(),
+})
+
+const proposedSchema = reflectedSchema.extend({
+  newTexts: z.record(z.string(), z.string()).nullable(),
+})
+
+type IterationPayload = z.infer<typeof iterationSchema>
+
+/** The description-only Candidate view of a student snapshot. */
+const seedCandidateOf = (studentPrompts: Prompts): Candidate =>
+  Object.fromEntries(
+    Object.entries(studentPrompts.steps).map(([id, step]) => [
+      id,
+      step.description,
+    ])
+  )
+
 /**
- * Genetic-Pareto reflective prompt evolution. When `maxFewShotExamples` > 0 a
- * BootstrapFewShot pre-pass installs few-shot examples on the steps first
- * (DSPy-style teleprompter composition); its metric calls are not billed to
- * GEPA's budget, matching DSPy.
+ * Genetic-Pareto reflective prompt evolution as a Mastra workflow over the
+ * target `workflow`: a pre-pass step optionally bootstraps few-shot examples
+ * (its metric calls are not billed to GEPA's budget, matching DSPy), a
+ * seed-eval step scores the seed candidate over the validationSet, and a
+ * durable dountil loop runs one GEPA iteration per pass — split into a
+ * `reflect` step (parent selection, minibatch rollouts, reflective dataset,
+ * or the merge branch), a `propose` step that makes the reflection-LM calls,
+ * and an `accept` step (child evaluation and Pareto bookkeeping). Every
+ * candidate crosses step boundaries as a JSON snapshot and randomness as
+ * checkpointed RNG state, so a storage-backed run resumes mid-optimization
+ * without redoing completed iterations, and savePrompts checkpoints the best
+ * candidate whenever the aggregate score improves.
  */
-export const gepa = async (
+export const createGEPAWorkflow = (
   workflow: AnyWorkflow,
   config: GEPAConfig
-): Promise<{ candidates: [Prompts, { score: number }][]; score: number }> => {
+) => {
   const {
+    checkpoint,
     maxFewShotExamples = 0,
     maxLabeledExamples,
     maxScorerCalls,
@@ -298,6 +416,9 @@ export const gepa = async (
     ...tuning
   } = config
   const examples = [...trainingSet]
+  if (examples.length === 0) {
+    throw new Error("GEPA requires a non-empty trainingSet")
+  }
   const budgetKnobs = [tuning.auto, tuning.maxFullEvals, maxScorerCalls].filter(
     (value) => value !== undefined
   )
@@ -306,6 +427,25 @@ export const gepa = async (
       "Exactly one of auto, maxFullEvals, maxScorerCalls must be set"
     )
   }
+  const validationSet = tuning.validationSet ?? examples
+  if (!tuning.validationSet) {
+    console.warn(
+      "GEPA: no validationSet provided; using the trainingSet for validation."
+    )
+  }
+  if (validationSet.length > VALIDATION_SET_SIZE_NOTE) {
+    console.warn(
+      `GEPA: validationSet has ${validationSet.length} examples; every accepted candidate costs a full validationSet eval.`
+    )
+  }
+  const stepsCount = workflowToProgram(workflow).steps.length
+  const maxMetricCalls = resolveBudget(
+    { ...tuning, maxMetricCalls: maxScorerCalls },
+    stepsCount,
+    examples,
+    validationSet.length
+  )
+  const seed = tuning.seed ?? 0
   const metric = scorerMetric(resolveScorer(workflow, scorer))
 
   // One scorer run per rollout: GEPA scores each rollout, then asks again for
@@ -336,56 +476,297 @@ export const gepa = async (
     cache.set(prediction, pending)
     return pending
   }
+  // The scorer's `reason` rides along as `feedback` — GEPA's reflection reads it.
+  const gepaMetric: GEPAMetric = (
+    gold,
+    prediction,
+    _trace,
+    _stepId,
+    _stepTrace,
+    target
+  ) => cachedMetric(gold, prediction, target)
 
-  let student = workflowToProgram(workflow)
-  if (maxFewShotExamples > 0) {
-    student = await bootstrapFewShotProgram(student, examples, {
-      maxFewShotExamples,
-      // A TOTAL cap per step, so the labeled backfill shares it instead of
-      // DSPy's default 16 — unless the caller raises it explicitly.
-      maxLabeledExamples: maxLabeledExamples ?? maxFewShotExamples,
-      metric: (gold, prediction) => cachedMetric(gold, prediction),
+  // Derived, non-serializable machinery is rebuilt per step invocation from
+  // the serializable payload — never carried across steps in closures — so a
+  // resumed run in a fresh process reconstructs the exact same world.
+  const buildAdapter = (studentPrompts: Prompts, adapterRNGState: number) => {
+    const student = programFromPrompts(
+      workflowToProgram(workflow),
+      studentPrompts
+    )
+    const adapterRNG = restoreRNG(adapterRNGState)
+    const adapter = createProgramAdapter({
+      adapterRNG,
+      addFormatFailureAsFeedback: tuning.addFormatFailureAsFeedback ?? false,
+      failureScore: tuning.failureScore ?? 0,
+      metric: gepaMetric,
+      program: student,
+      reflectionModel:
+        reflectionModel ?? first(student.steps, "workflow steps").model,
+      warnOnScoreMismatch: tuning.warnOnScoreMismatch ?? true,
     })
+    return { adapter, adapterRNG, student }
   }
 
-  const result = await gepaProgram(student, examples, {
-    ...tuning,
-    ...(maxScorerCalls !== undefined && { maxMetricCalls: maxScorerCalls }),
-    // The scorer's `reason` rides along as `feedback` — GEPA's reflection reads it.
-    metric: (gold, prediction, _trace, _stepId, _stepTrace, target) =>
-      cachedMetric(gold, prediction, target),
-    onImprovement: async (program) => {
-      await savePrompts(promptsOf(program))
+  const engineOptionsFor = (
+    rng: RNG,
+    adapter: ReturnType<typeof buildAdapter>["adapter"],
+    seedCandidate: Candidate
+  ): EngineOptions<Fields, Fields> => ({
+    candidateSelectionStrategy: tuning.candidateSelectionStrategy ?? "pareto",
+    componentSelector: tuning.componentSelector ?? "roundRobin",
+    maxMergeInvocations: tuning.maxMergeInvocations ?? 5,
+    maxMetricCalls,
+    onImprovement: async (candidate) => {
+      await savePrompts(promptsOf(adapter.buildProgram(candidate)))
     },
-    reflectionModel:
-      reflectionModel ?? first(student.steps, "workflow steps").model,
+    perfectScore: tuning.perfectScore ?? 1,
+    reflectionMinibatchSize: tuning.reflectionMinibatchSize ?? 3,
+    rng,
+    seedCandidate,
+    skipPerfectScore: tuning.skipPerfectScore ?? true,
+    trainingSet: examples,
+    useMerge: tuning.useMerge ?? true,
+    validationSet,
   })
-  await savePrompts(promptsOf(result.program))
-  // The winner's prompt state lands in place on the caller's workflow.
-  applyProgram(workflow, result.program)
-  return {
-    // Every candidate GEPA tried, as a JSON-safe snapshot paired with its
-    // validation aggregate score. Candidates are description-only; the
-    // snapshot carries the student's (possibly pre-pass-installed) examples.
-    candidates: result.candidates.map((candidate, idx) => {
-      const snapshot = student.clone()
-      for (const step of snapshot.steps) {
-        const description = candidate[step.id]
-        if (description !== undefined) {
-          step.description = description
-        }
+
+  const prepass = createStep({
+    description:
+      "Optional BootstrapFewShot pre-pass installing few-shot examples",
+    execute: async () => {
+      let student = workflowToProgram(workflow)
+      if (maxFewShotExamples > 0) {
+        student = await bootstrapFewShotProgram(student, examples, {
+          maxFewShotExamples,
+          // A TOTAL cap per step, so the labeled backfill shares it instead of
+          // DSPy's default 16 — unless the caller raises it explicitly.
+          maxLabeledExamples: maxLabeledExamples ?? maxFewShotExamples,
+          metric: (gold, prediction) => cachedMetric(gold, prediction),
+        })
       }
-      return [
-        promptsOf(snapshot),
-        {
-          score: at(result.validationAggregateScores, idx, "aggregate scores"),
-        },
-      ]
-    }),
-    score: at(
-      result.validationAggregateScores,
-      result.bestIdx,
-      "aggregate scores"
-    ),
-  }
+      return { studentPrompts: promptsOf(student) }
+    },
+    id: "prepass",
+    inputSchema: z.object({}),
+    outputSchema: z.object({ studentPrompts: promptsSchema }),
+  })
+
+  const seedEval = createStep({
+    description: "Score the seed candidate over the validationSet",
+    execute: async ({ inputData }) => {
+      const { studentPrompts } = inputData
+      const { adapter } = buildAdapter(studentPrompts, seed)
+      const seedCandidate = seedCandidateOf(studentPrompts)
+      const evaluated = await adapter.evaluate(
+        validationSet,
+        seedCandidate,
+        false
+      )
+      const state = initGEPAState(seedCandidate, evaluated.scores)
+      const loop = initGEPALoopState(state)
+      return {
+        loop: serializeGEPALoopState(loop),
+        rng: { adapter: createRNG(seed).state, engine: createRNG(seed).state },
+        state: serializeGEPAState(state),
+        studentPrompts,
+      }
+    },
+    id: "seed-eval",
+    inputSchema: z.object({ studentPrompts: promptsSchema }),
+    outputSchema: iterationSchema,
+  })
+
+  const reflect = createStep({
+    description:
+      "One iteration's prologue: merge branch, or minibatch rollouts and the reflective dataset",
+    execute: async ({ inputData, resumeData, suspend }) => {
+      const payload: IterationPayload = inputData
+      const state = deserializeGEPAState(payload.state)
+      if (state.totalEvalsCount >= maxMetricCalls) {
+        // Budget already spent — the dountil body still runs once.
+        return { ...payload, plan: null }
+      }
+      if (!resumeData && (await checkpoint?.({ iteration: state.i + 1 }))) {
+        return await suspend({ iteration: state.i + 1 })
+      }
+      const loop = deserializeGEPALoopState(payload.loop)
+      const engineRNG = restoreRNG(payload.rng.engine)
+      const { adapter, adapterRNG } = buildAdapter(
+        payload.studentPrompts,
+        payload.rng.adapter
+      )
+      const options = engineOptionsFor(
+        engineRNG,
+        adapter,
+        seedCandidateOf(payload.studentPrompts)
+      )
+      state.i += 1
+      let plan: ReflectionPlan | null = null
+      if (mergeDue(loop, options)) {
+        const outcome = await runMergeBranch(adapter, state, loop, options)
+        // A PRODUCED merge proposal ends the iteration whether accepted or
+        // rejected; a fruitless search falls through to reflection.
+        if (outcome === "none") {
+          plan = await prepareReflection(adapter, state, loop, options)
+        }
+      } else {
+        plan = await prepareReflection(adapter, state, loop, options)
+      }
+      return {
+        loop: serializeGEPALoopState(loop),
+        plan,
+        rng: { adapter: adapterRNG.state, engine: engineRNG.state },
+        state: serializeGEPAState(state),
+        studentPrompts: payload.studentPrompts,
+      }
+    },
+    id: "reflect",
+    inputSchema: iterationSchema,
+    outputSchema: reflectedSchema,
+    resumeSchema: z.object({}),
+    suspendSchema: z.object({ iteration: z.number() }),
+  })
+
+  const propose = createStep({
+    description: "Reflection-LM calls proposing new instruction texts",
+    execute: async ({ inputData }) => {
+      const { plan } = inputData
+      if (!plan) {
+        return { ...inputData, newTexts: null }
+      }
+      const { adapter } = buildAdapter(
+        inputData.studentPrompts,
+        inputData.rng.adapter
+      )
+      const parent = at(
+        inputData.state.programCandidates,
+        plan.parentIdx,
+        "candidates"
+      )
+      const newTexts = await adapter.proposeNewTexts(
+        parent,
+        plan.reflectiveDataset,
+        plan.components
+      )
+      return { ...inputData, newTexts }
+    },
+    id: "propose",
+    inputSchema: reflectedSchema,
+    outputSchema: proposedSchema,
+  })
+
+  const accept = createStep({
+    description:
+      "Child evaluation, acceptance, Pareto bookkeeping, checkpointing",
+    execute: async ({ inputData }) => {
+      const { newTexts, plan, ...payload } = inputData
+      if (!(plan && newTexts)) {
+        return payload
+      }
+      const state = deserializeGEPAState(payload.state)
+      const loop = deserializeGEPALoopState(payload.loop)
+      const engineRNG = restoreRNG(payload.rng.engine)
+      const { adapter, adapterRNG } = buildAdapter(
+        payload.studentPrompts,
+        payload.rng.adapter
+      )
+      const options = engineOptionsFor(
+        engineRNG,
+        adapter,
+        seedCandidateOf(payload.studentPrompts)
+      )
+      await acceptReflection(adapter, state, loop, options, plan, newTexts)
+      return {
+        loop: serializeGEPALoopState(loop),
+        rng: { adapter: adapterRNG.state, engine: engineRNG.state },
+        state: serializeGEPAState(state),
+        studentPrompts: payload.studentPrompts,
+      }
+    },
+    id: "accept",
+    inputSchema: proposedSchema,
+    outputSchema: iterationSchema,
+  })
+
+  /* oxlint-disable promise/prefer-await-to-then -- Mastra's workflow builder chains `.then(step)`: these are graph edges, not promise continuations */
+  const iteration = createWorkflow({
+    id: "iteration",
+    inputSchema: iterationSchema,
+    outputSchema: iterationSchema,
+  })
+    .then(reflect)
+    .then(propose)
+    .then(accept)
+    .commit()
+  /* oxlint-enable promise/prefer-await-to-then */
+
+  const finalize = createStep({
+    description: "Select the winner, persist it, and land it on the workflow",
+    execute: async ({ inputData }) => {
+      const payload: IterationPayload = inputData
+      const state = deserializeGEPAState(payload.state)
+      const { adapter, student } = buildAdapter(
+        payload.studentPrompts,
+        payload.rng.adapter
+      )
+      const result = buildResult(
+        state,
+        validationSet.length,
+        seed,
+        adapter.buildProgram
+      )
+      await savePrompts(promptsOf(result.program))
+      // The winner's prompt state lands in place on the caller's workflow.
+      applyProgram(workflow, result.program)
+      return {
+        // Every candidate GEPA tried, as a JSON-safe snapshot paired with its
+        // validation aggregate score. Candidates are description-only; the
+        // snapshot carries the student's (possibly pre-pass-installed)
+        // examples.
+        candidates: result.candidates.map((candidate, idx) => {
+          const snapshot = student.clone()
+          for (const step of snapshot.steps) {
+            const description = candidate[step.id]
+            if (description !== undefined) {
+              step.description = description
+            }
+          }
+          const pair: [Prompts, { score: number }] = [
+            promptsOf(snapshot),
+            {
+              score: at(
+                result.validationAggregateScores,
+                idx,
+                "aggregate scores"
+              ),
+            },
+          ]
+          return pair
+        }),
+        score: at(
+          result.validationAggregateScores,
+          result.bestIdx,
+          "aggregate scores"
+        ),
+      }
+    },
+    id: "finalize",
+    inputSchema: iterationSchema,
+    outputSchema: optimizerResultSchema,
+  })
+
+  /* oxlint-disable promise/prefer-await-to-then, promise/no-return-wrap -- Mastra's workflow builder chains `.then(step)`: these are graph edges, not promise continuations */
+  return createWorkflow({
+    id: `${workflow.id}.gepa`,
+    inputSchema: z.object({}),
+    outputSchema: optimizerResultSchema,
+  })
+    .then(prepass)
+    .then(seedEval)
+    .dountil(iteration, ({ inputData }) =>
+      Promise.resolve(inputData.state.totalEvalsCount >= maxMetricCalls)
+    )
+    .then(finalize)
+    .commit()
+  /* oxlint-enable promise/prefer-await-to-then, promise/no-return-wrap */
 }

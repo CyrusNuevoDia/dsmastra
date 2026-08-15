@@ -5,9 +5,8 @@ import type { Trajectory } from "@mastra/core/evals"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { bootstrapFewShot } from "@/optimizers/bootstrap-few-shot"
-
-import { fakeScorer, fakeStep } from "./helpers"
+import { createBootstrapFewShotWorkflow } from "../../src/optimizers/bootstrap-few-shot"
+import { fakeScorer, fakeStep, runOptimizer } from "./helpers"
 
 const fieldsSchema = z.record(z.string(), z.unknown())
 
@@ -60,11 +59,13 @@ test("without a gate, the objective scorer gates teacher-trace acceptance", asyn
     return prediction?.y === gold.outputData.y ? 1 : 0
   })
 
-  const { score } = await bootstrapFewShot(workflow, {
-    savePrompts: () => Promise.resolve(),
-    scorer: objective,
-    trainingSet,
-  })
+  const { score } = await runOptimizer(
+    createBootstrapFewShotWorkflow(workflow, {
+      savePrompts: () => Promise.resolve(),
+      scorer: objective,
+      trainingSet,
+    })
+  )
 
   // Both teacher rollouts match gold on y, so both traces become demos.
   expect(augmentedCount(step.examples)).toBe(2)
@@ -87,12 +88,14 @@ test("a gate scores the trajectory and decides acceptance instead of the objecti
     return firstStepOutput(trajectory)?.y === 2 ? 1 : 0
   })
 
-  const { score } = await bootstrapFewShot(workflow, {
-    gate: { scorer: gate },
-    savePrompts: () => Promise.resolve(),
-    scorer: objective,
-    trainingSet,
-  })
+  const { score } = await runOptimizer(
+    createBootstrapFewShotWorkflow(workflow, {
+      gate: { scorer: gate },
+      savePrompts: () => Promise.resolve(),
+      scorer: objective,
+      trainingSet,
+    })
+  )
 
   // Only x=1's trace (y === 2) passes the gate, even though the objective
   // scorer would have accepted everything; x=2 backfills as a labeled example.
@@ -147,12 +150,14 @@ test("non-declarative steps appear in the gate's trajectory but never as demos",
     return 1
   })
 
-  await bootstrapFewShot(workflow, {
-    gate: { scorer: gate },
-    savePrompts: () => Promise.resolve(),
-    scorer: fakeScorer(() => 1),
-    trainingSet,
-  })
+  await runOptimizer(
+    createBootstrapFewShotWorkflow(workflow, {
+      gate: { scorer: gate },
+      savePrompts: () => Promise.resolve(),
+      scorer: fakeScorer(() => 1),
+      trainingSet,
+    })
+  )
 
   // Every engine-executed step shows up, in execution order — the plain
   // createStep included, even though only declareStep steps are declarative.
@@ -179,22 +184,26 @@ test("gate.threshold switches acceptance from truthiness to >= threshold", async
   const zeroGate = () => gateScorer(() => 0)
 
   const strict = makeWorkflow()
-  await bootstrapFewShot(strict.workflow, {
-    gate: { scorer: zeroGate() },
-    savePrompts: () => Promise.resolve(),
-    scorer: fakeScorer(() => 1),
-    trainingSet,
-  })
+  await runOptimizer(
+    createBootstrapFewShotWorkflow(strict.workflow, {
+      gate: { scorer: zeroGate() },
+      savePrompts: () => Promise.resolve(),
+      scorer: fakeScorer(() => 1),
+      trainingSet,
+    })
+  )
   // Score 0 with no threshold: nothing above zero, nothing accepted.
   expect(augmentedCount(strict.step.examples)).toBe(0)
 
   const lenient = makeWorkflow()
-  await bootstrapFewShot(lenient.workflow, {
-    gate: { scorer: zeroGate(), threshold: 0 },
-    savePrompts: () => Promise.resolve(),
-    scorer: fakeScorer(() => 1),
-    trainingSet,
-  })
+  await runOptimizer(
+    createBootstrapFewShotWorkflow(lenient.workflow, {
+      gate: { scorer: zeroGate(), threshold: 0 },
+      savePrompts: () => Promise.resolve(),
+      scorer: fakeScorer(() => 1),
+      trainingSet,
+    })
+  )
   // An explicit threshold of 0 accepts a 0 score (>=), unlike DSPy's
   // truthiness quirk where a falsy threshold is ignored.
   expect(augmentedCount(lenient.step.examples)).toBe(2)
@@ -209,27 +218,29 @@ test("a throwing gate counts toward maxErrors and rethrows at the cap", async ()
   })
 
   await expect(
-    bootstrapFewShot(workflow, {
-      gate: { scorer: gate },
-      maxErrors: 2,
-      savePrompts: () => Promise.resolve(),
-      scorer: fakeScorer(() => 1),
-      trainingSet,
-    })
+    runOptimizer(
+      createBootstrapFewShotWorkflow(workflow, {
+        gate: { scorer: gate },
+        maxErrors: 2,
+        savePrompts: () => Promise.resolve(),
+        scorer: fakeScorer(() => 1),
+        trainingSet,
+      })
+    )
   ).rejects.toThrow("gate boom")
   // First failure is swallowed and counted, the second hits the cap.
   expect(gateRuns).toBe(2)
 })
 
-test("combining gate with scoreThreshold is rejected", async () => {
+test("combining gate with scoreThreshold is rejected", () => {
   const { workflow } = makeWorkflow()
-  await expect(
-    bootstrapFewShot(workflow, {
+  expect(() =>
+    createBootstrapFewShotWorkflow(workflow, {
       gate: { scorer: gateScorer(() => 1) },
       savePrompts: () => Promise.resolve(),
       scoreThreshold: 0.5,
       scorer: fakeScorer(() => 1),
       trainingSet,
     })
-  ).rejects.toThrow("gate.threshold")
+  ).toThrow("gate.threshold")
 })

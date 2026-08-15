@@ -5,12 +5,11 @@ import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
-import { labeledFewShot } from "@/optimizers/labeled-few-shot"
-import { loadPrompts, workflowToProgram } from "@/optimizers/utils"
-import type { AnyDeclarativeStep, TraceStep } from "@/step"
-import { declareStep } from "@/step"
-
-import { fakeScorer, fakeStep } from "./helpers"
+import { createLabeledFewShotWorkflow } from "../../src/optimizers/labeled-few-shot"
+import { loadPrompts, workflowToProgram } from "../../src/optimizers/utils"
+import type { AnyDeclarativeStep, TraceStep } from "../../src/step"
+import { declareStep } from "../../src/step"
+import { fakeScorer, fakeStep, runOptimizer } from "./helpers"
 
 const usage = {
   inputTokens: {
@@ -166,14 +165,16 @@ test("engine rollouts run parallel graphs; tuning lands on declarative steps onl
   expect(trace.map((t) => t.stepId).toSorted()).toEqual(["double", "inc"])
 
   // Optimizing tunes the declarative steps in place; the merge step is untouched.
-  const { candidates, score } = await labeledFewShot(workflow, {
-    maxFewShotExamples: 1,
-    savePrompts: () => Promise.resolve(),
-    scorer: fakeScorer((gold, prediction) =>
-      prediction?.sum === gold.outputData.sum ? 1 : 0
-    ),
-    trainingSet: [{ inputData: { x: 1 }, outputData: { sum: 4 } }],
-  })
+  const { candidates, score } = await runOptimizer(
+    createLabeledFewShotWorkflow(workflow, {
+      maxFewShotExamples: 1,
+      savePrompts: () => Promise.resolve(),
+      scorer: fakeScorer((gold, prediction) =>
+        prediction?.sum === gold.outputData.sum ? 1 : 0
+      ),
+      trainingSet: [{ inputData: { x: 1 }, outputData: { sum: 4 } }],
+    })
+  )
   expect(double.examples).toHaveLength(1)
   expect(inc.examples).toHaveLength(1)
   // The compiled workflow was evaluated: x=1 → 2 + 2 = 4, exact match.

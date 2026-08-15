@@ -1,12 +1,14 @@
 import { extractWorkflowTrajectory } from "@mastra/core/evals"
 import { RequestContext } from "@mastra/core/request-context"
+import { createStep } from "@mastra/core/workflows"
 import type { AnyWorkflow, SingleStepEntry, Step } from "@mastra/core/workflows"
+import { z } from "zod"
 
-import type { Fields } from "@/fields"
-import type { Program } from "@/program"
-import type { Metric } from "@/scorers"
-import type { AnyDeclarativeStep, Example, RunContext } from "@/step"
-import { RUN_CONTEXT_KEY } from "@/step"
+import type { Fields } from "../fields"
+import type { Program } from "../program"
+import type { Metric } from "../scorers"
+import type { AnyDeclarativeStep, Example, RunContext } from "../step"
+import { RUN_CONTEXT_KEY } from "../step"
 
 /**
  * The tuned prompt state of a workflow: everything an optimizer changes and
@@ -241,6 +243,70 @@ export const evaluateProgram = async (
   )
 }
 
+// --- Durable-workflow currency ----------------------------------------------
+//
+// The optimizer workflows move ALL inter-step state as JSON: candidates cross
+// step boundaries as Prompts snapshots, randomness as checkpointed RNG state.
+// These schemas type that currency on the workflow steps, and
+// programFromPrompts turns a snapshot back into a runnable Program.
+
+export const fieldsSchema = z.record(z.string(), z.unknown())
+
+export const exampleSchema = z.object({
+  inputData: fieldsSchema,
+  outputData: fieldsSchema,
+})
+
+export const promptsSchema = z.object({
+  steps: z.record(
+    z.string(),
+    z.object({ description: z.string(), examples: z.array(exampleSchema) })
+  ),
+  version: z.literal(1),
+})
+
+/** Every optimizer workflow ends in this shape: candidate snapshots with their
+ * scores (best first for the search optimizers), plus the winner's score. */
+export const optimizerResultSchema = z.object({
+  candidates: z.array(
+    z.tuple([promptsSchema, z.object({ score: z.number() })])
+  ),
+  score: z.number(),
+})
+
+export type OptimizerResult = z.infer<typeof optimizerResultSchema>
+
+/**
+ * Rebuild a runnable candidate from its JSON snapshot: clone the base program
+ * and install the snapshot's descriptions and examples. Inverse of promptsOf,
+ * up to the base program's fixed config (models, schemas, settings).
+ */
+export const programFromPrompts = (
+  base: Program<Fields, Fields>,
+  prompts: Prompts
+): Program<Fields, Fields> => {
+  const built = base.clone()
+  for (const step of built.steps) {
+    const saved = prompts.steps[step.id]
+    if (!saved) {
+      throw new Error(`Prompts lost step ${step.id}`)
+    }
+    step.description = saved.description
+    step.examples = structuredClone(saved.examples)
+  }
+  return built
+}
+
+/**
+ * Pause hook shared by the optimizer workflows: called at the top of every
+ * loop iteration with the optimizer's progress; returning true suspends the
+ * run (durably, via Mastra's suspend), to be continued later with
+ * `run.resume()`. Human-in-the-loop checkpointing for long optimizations.
+ */
+export type OptimizerCheckpoint = (progress: {
+  iteration: number
+}) => boolean | Promise<boolean>
+
 /** Snapshot a program's tuned prompt state as a JSON-safe payload. */
 export const promptsOf = (program: Program<Fields, Fields>): Prompts => ({
   steps: Object.fromEntries(
@@ -286,4 +352,71 @@ export const loadPrompts = <TWorkflow extends AnyWorkflow>(
     step.examples = structuredClone(saved.examples)
   }
   return workflow
+}
+
+export const compiledSchema = z.object({ prompts: promptsSchema })
+
+const scoredSchema = z.object({ prompts: promptsSchema, score: z.number() })
+
+/**
+ * The tail every compile-style optimizer workflow shares, as three steps over
+ * a `{ prompts }` payload: persist through savePrompts, score the compiled
+ * workflow over the trainingSet, and land the prompt state in place on the
+ * target workflow — returning the optimizer result shape.
+ */
+export const finishingSteps = (
+  workflow: AnyWorkflow,
+  options: {
+    metric: Metric
+    savePrompts: SavePrompts
+    trainingSet: readonly Example[]
+  }
+) => {
+  const save = createStep({
+    description: "Persist the compiled prompts through savePrompts",
+    execute: async ({ inputData }) => {
+      await options.savePrompts(inputData.prompts)
+      return inputData
+    },
+    id: "save",
+    inputSchema: compiledSchema,
+    outputSchema: compiledSchema,
+  })
+
+  const evaluate = createStep({
+    description: "Score the compiled workflow over the trainingSet",
+    execute: async ({ inputData }) => {
+      const compiled = programFromPrompts(
+        workflowToProgram(workflow),
+        inputData.prompts
+      )
+      const score = await evaluateProgram(
+        compiled,
+        options.trainingSet,
+        options.metric
+      )
+      return { ...inputData, score }
+    },
+    id: "evaluate",
+    inputSchema: compiledSchema,
+    outputSchema: scoredSchema,
+  })
+
+  const apply = createStep({
+    description: "Land the compiled prompt state on the target workflow",
+    execute: ({ inputData }) => {
+      const { prompts } = inputData
+      loadPrompts(workflow, prompts)
+      const winner: [Prompts, { score: number }] = [
+        prompts,
+        { score: inputData.score },
+      ]
+      return Promise.resolve({ candidates: [winner], score: inputData.score })
+    },
+    id: "apply",
+    inputSchema: scoredSchema,
+    outputSchema: optimizerResultSchema,
+  })
+
+  return { apply, evaluate, save }
 }

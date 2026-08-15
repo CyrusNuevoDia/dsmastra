@@ -1,16 +1,19 @@
 import type { AnyWorkflow } from "@mastra/core/workflows"
+import { createStep, createWorkflow } from "@mastra/core/workflows"
+import { z } from "zod"
 
-import { labeledFewShotProgram } from "@/optimizers/bootstrap"
+import { labeledFewShotProgram } from "../optimizers/bootstrap"
 import {
-  applyProgram,
-  evaluateProgram,
+  compiledSchema,
+  finishingSteps,
+  optimizerResultSchema,
   promptsOf,
   workflowToProgram,
-} from "@/optimizers/utils"
-import type { Prompts, SavePrompts } from "@/optimizers/utils"
-import type { Example } from "@/program"
-import { resolveScorer, scorerMetric } from "@/scorers"
-import type { ScorerRef } from "@/scorers"
+} from "../optimizers/utils"
+import type { SavePrompts } from "../optimizers/utils"
+import type { Example } from "../program"
+import { resolveScorer, scorerMetric } from "../scorers"
+import type { ScorerRef } from "../scorers"
 
 export type LabeledFewShotConfig = {
   maxFewShotExamples?: number
@@ -22,29 +25,49 @@ export type LabeledFewShotConfig = {
 }
 
 /**
- * Install up to `maxFewShotExamples` labeled trainingSet examples as few-shot
- * examples on every step (dspy.teleprompt.vanilla.LabeledFewShot). Compiling
- * makes no LM calls; scoring runs the compiled workflow once.
+ * LabeledFewShot as a Mastra workflow over the target `workflow`: install up
+ * to `maxFewShotExamples` labeled trainingSet examples as few-shot examples
+ * on every step (dspy.teleprompt.vanilla.LabeledFewShot). Compiling makes no
+ * LM calls; the evaluate step runs the compiled workflow over the trainingSet
+ * once, and the apply step lands the compiled prompt state in place on the
+ * target workflow. All inter-step state is JSON, so a storage-backed run is
+ * durable and observable step by step.
  */
-export const labeledFewShot = async (
+export const createLabeledFewShotWorkflow = (
   workflow: AnyWorkflow,
   config: LabeledFewShotConfig
-): Promise<{ candidates: [Prompts, { score: number }][]; score: number }> => {
-  const compiled = labeledFewShotProgram(
-    workflowToProgram(workflow),
-    [...config.trainingSet],
-    config.maxFewShotExamples ?? 16
-  )
-  const prompts = promptsOf(compiled)
-  await config.savePrompts(prompts)
-  // Compiling makes no LM calls, but scoring runs the compiled workflow over
-  // the trainingSet once.
-  const score = await evaluateProgram(
-    compiled,
-    config.trainingSet,
-    scorerMetric(resolveScorer(workflow, config.scorer))
-  )
-  // The compiled prompt state lands in place on the caller's workflow.
-  applyProgram(workflow, compiled)
-  return { candidates: [[prompts, { score }]], score }
+) => {
+  const compile = createStep({
+    description: "Install labeled examples as few-shot examples on every step",
+    execute: () => {
+      const compiled = labeledFewShotProgram(
+        workflowToProgram(workflow),
+        [...config.trainingSet],
+        config.maxFewShotExamples ?? 16
+      )
+      return Promise.resolve({ prompts: promptsOf(compiled) })
+    },
+    id: "compile",
+    inputSchema: z.object({}),
+    outputSchema: compiledSchema,
+  })
+
+  const { apply, evaluate, save } = finishingSteps(workflow, {
+    metric: scorerMetric(resolveScorer(workflow, config.scorer)),
+    savePrompts: config.savePrompts,
+    trainingSet: config.trainingSet,
+  })
+
+  /* oxlint-disable promise/prefer-await-to-then -- Mastra's workflow builder chains `.then(step)`: these are graph edges, not promise continuations */
+  return createWorkflow({
+    id: `${workflow.id}.labeled-few-shot`,
+    inputSchema: z.object({}),
+    outputSchema: optimizerResultSchema,
+  })
+    .then(compile)
+    .then(save)
+    .then(evaluate)
+    .then(apply)
+    .commit()
+  /* oxlint-enable promise/prefer-await-to-then */
 }

@@ -1,10 +1,12 @@
 import { createScorer } from "@mastra/core/evals"
 import type { RequestContext } from "@mastra/core/request-context"
 import { createStep } from "@mastra/core/workflows"
+import type { AnyWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import type { Example, RunContext } from "@/step"
-import { RUN_CONTEXT_KEY } from "@/step"
+import type { Prompts } from "../../src/optimizers/utils"
+import type { Example, RunContext } from "../../src/step"
+import { RUN_CONTEXT_KEY } from "../../src/step"
 
 export type Call = { ctx?: RunContext; inputData: Record<string, unknown> }
 
@@ -91,4 +93,22 @@ export const fakeStep = (
     settings: {},
   })
   return declarative
+}
+
+/** Run a factory-built optimizer workflow to completion, rethrowing failures. */
+export const runOptimizer = async (
+  optimizer: AnyWorkflow
+): Promise<{ candidates: [Prompts, { score: number }][]; score: number }> => {
+  const run = await optimizer.createRun()
+  const result = await run.start({ inputData: {} })
+  if (result.status === "failed") {
+    throw result.error
+  }
+  if (result.status !== "success") {
+    throw new Error(`Optimizer run ended with status ${result.status}`)
+  }
+  return result.result as {
+    candidates: [Prompts, { score: number }][]
+    score: number
+  }
 }

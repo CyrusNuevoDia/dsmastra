@@ -4,9 +4,13 @@ import type { RequestContext } from "@mastra/core/request-context"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import type { Fields } from "@/fields"
-import { autoBudget, gepa, gepaProgram } from "@/optimizers/gepa"
-import { createProgramAdapter } from "@/optimizers/gepa/adapter"
+import type { Fields } from "../../src/fields"
+import {
+  autoBudget,
+  createGEPAWorkflow,
+  gepaProgram,
+} from "../../src/optimizers/gepa"
+import { createProgramAdapter } from "../../src/optimizers/gepa/adapter"
 import {
   buildMergeSubsample,
   createEpochShuffledSampler,
@@ -16,21 +20,20 @@ import {
   runMergeIteration,
   selectParetoParent,
   updateParetoFront,
-} from "@/optimizers/gepa/engine"
+} from "../../src/optimizers/gepa/engine"
 import type {
   Candidate,
   EngineOptions,
   GEPAAdapter,
   GEPAState,
-} from "@/optimizers/gepa/engine"
-import type { Prompts } from "@/optimizers/utils"
-import { createProgram } from "@/program"
-import type { Example, Program } from "@/program"
-import { extractInstructionText } from "@/prompting"
-import type { AnyDeclarativeStep, RunContext } from "@/step"
-import { RUN_CONTEXT_KEY } from "@/step"
-
-import { fakeScorer } from "./helpers"
+} from "../../src/optimizers/gepa/engine"
+import type { Prompts } from "../../src/optimizers/utils"
+import { createProgram } from "../../src/program"
+import type { Example, Program } from "../../src/program"
+import { extractInstructionText } from "../../src/prompting"
+import type { AnyDeclarativeStep, RunContext } from "../../src/step"
+import { RUN_CONTEXT_KEY } from "../../src/step"
+import { fakeScorer, runOptimizer } from "./helpers"
 
 const zero = () => 0
 
@@ -607,25 +610,25 @@ test("autoBudget guards throw", () => {
   expect(() => autoBudget(1, 2, 4, 35, 0)).toThrow()
 })
 
-test("gepa budget knobs: exactly one of auto, maxFullEvals, maxScorerCalls", async () => {
+test("gepa budget knobs: exactly one of auto, maxFullEvals, maxScorerCalls", () => {
   const savePrompts = () => Promise.resolve()
   const scorer = fakeScorer(() => 0)
-  await expect(
-    gepa(mathWorkflow(), { savePrompts, scorer, trainingSet: examples(2) })
-  ).rejects.toThrow(
-    "Exactly one of auto, maxFullEvals, maxScorerCalls must be set"
-  )
-  await expect(
-    gepa(mathWorkflow(), {
+  expect(() =>
+    createGEPAWorkflow(mathWorkflow(), {
+      savePrompts,
+      scorer,
+      trainingSet: examples(2),
+    })
+  ).toThrow("Exactly one of auto, maxFullEvals, maxScorerCalls must be set")
+  expect(() =>
+    createGEPAWorkflow(mathWorkflow(), {
       maxFullEvals: 1,
       maxScorerCalls: 1,
       savePrompts,
       scorer,
       trainingSet: examples(2),
     })
-  ).rejects.toThrow(
-    "Exactly one of auto, maxFullEvals, maxScorerCalls must be set"
-  )
+  ).toThrow("Exactly one of auto, maxFullEvals, maxScorerCalls must be set")
 })
 
 test("gepa workflow: few-shot pre-pass runs un-billed, savePrompts checkpoints and finishes", async () => {
@@ -643,23 +646,25 @@ test("gepa workflow: few-shot pre-pass runs un-billed, savePrompts checkpoints a
   })
     .then(mathStep)
     .commit()
-  const { candidates, score } = await gepa(workflow, {
-    // Budget of 1: GEPA's own loop never runs (the seed eval exhausts it) —
-    // yet the pre-pass still bootstrapped examples, proving its metric calls
-    // are not billed against GEPA's budget.
-    maxFewShotExamples: 2,
-    maxScorerCalls: 1,
-    reflectionModel: () => Promise.resolve(""),
-    savePrompts: (prompts) => {
-      saved.push(structuredClone(prompts))
-      return Promise.resolve()
-    },
-    scorer: fakeScorer((gold, prediction) => {
-      metricCalls += 1
-      return prediction?.y === gold.outputData.y ? 1 : 0
-    }),
-    trainingSet,
-  })
+  const { candidates, score } = await runOptimizer(
+    createGEPAWorkflow(workflow, {
+      // Budget of 1: GEPA's own loop never runs (the seed eval exhausts it) —
+      // yet the pre-pass still bootstrapped examples, proving its metric calls
+      // are not billed against GEPA's budget.
+      maxFewShotExamples: 2,
+      maxScorerCalls: 1,
+      reflectionModel: () => Promise.resolve(""),
+      savePrompts: (prompts: Prompts) => {
+        saved.push(structuredClone(prompts))
+        return Promise.resolve()
+      },
+      scorer: fakeScorer((gold, prediction) => {
+        metricCalls += 1
+        return prediction?.y === gold.outputData.y ? 1 : 0
+      }),
+      trainingSet,
+    })
+  )
   // Identity math step: x∈[4..7] all fail (y=x ≠ 2x)? No — identity returns
   // y=x, expected 2x, so bootstrap accepts none and backfills labeled ones.
   const tunedStep = mathStep

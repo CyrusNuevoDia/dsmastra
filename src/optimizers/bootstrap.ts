@@ -1,11 +1,12 @@
 import type { LanguageModel } from "ai"
 
-import { at, last } from "@/collections"
-import type { Fields } from "@/fields"
-import type { Example, Program } from "@/program"
-import { createRNG, sample, shuffle } from "@/random"
-import type { MetricOutput } from "@/scorers"
-import type { RunContext, TraceStep } from "@/step"
+import { at, last } from "../collections"
+import type { Fields } from "../fields"
+import type { Example, Program } from "../program"
+import { createRNG, sample, shuffle } from "../random"
+import type { MetricOutput } from "../scorers"
+import type { RunContext, TraceStep } from "../step"
+import { isEqualJSON } from "../utils"
 
 /**
  * Shared bootstrap machinery, ported faithfully from
@@ -51,8 +52,8 @@ const cloneExample = (example: Example): Example => ({
 })
 
 const examplesEqual = (a: Example, b: Example): boolean =>
-  JSON.stringify(a.inputData) === JSON.stringify(b.inputData) &&
-  JSON.stringify(a.outputData) === JSON.stringify(b.outputData)
+  isEqualJSON(a.inputData, b.inputData) &&
+  isEqualJSON(a.outputData, b.outputData)
 
 /** FNV-1a over the JSON rendering — stands in for dspy's Hasher.hash. */
 const contentHash = (value: Example[]): number => {
@@ -108,39 +109,29 @@ export const labeledFewShotProgram = <
 }
 
 /**
- * BootstrapFewShot.compile: run a teacher over the trainingSet, capture the trace
- * of every metric-passing run as bootstrapped examples per step, and fill the
- * remaining slots with raw labeled examples.
+ * _prepare_student_and_teacher: reset copy for the student, deep copy for
+ * the teacher — then LabeledFewShot over a reset teacher copy when labeled
+ * examples are requested (our programs carry no _compiled flag; a provided
+ * teacher is treated as uncompiled, see the doc's deviation list). Validates
+ * _prepare_predictor_mappings: same structure, matched by position + id.
  */
-export const bootstrapFewShotProgram = async <
+export const prepareStudentAndTeacher = <
   TInput extends Fields,
   TOutput extends Fields,
 >(
   studentProgram: Program<TInput, TOutput>,
   trainingSet: Example<TInput, TOutput>[],
-  options: BootstrapOptions<TInput, TOutput> = {}
-): Promise<Program<TInput, TOutput>> => {
-  const {
-    maxErrors = DEFAULT_MAX_ERRORS,
-    maxFewShotExamples = 4,
-    maxLabeledExamples = 16,
-    maxRounds = 1,
-    metric,
-    metricThreshold,
-    teacherSettings,
-  } = options
-
-  // _prepare_student_and_teacher: reset copy for the student, deep copy for
-  // the teacher — then LabeledFewShot over a reset teacher copy when labeled
-  // examples are requested (our programs carry no _compiled flag; a provided
-  // teacher is treated as uncompiled, see the doc's deviation list).
+  options: Pick<
+    BootstrapOptions<TInput, TOutput>,
+    "maxLabeledExamples" | "teacher"
+  >
+) => {
+  const { maxLabeledExamples = 16 } = options
   const student = resetCopy(studentProgram)
   let teacher = (options.teacher ?? studentProgram).clone()
   if (maxLabeledExamples > 0) {
     teacher = labeledFewShotProgram(teacher, trainingSet, maxLabeledExamples)
   }
-
-  // _prepare_predictor_mappings: same structure, matched by position + id.
   if (student.steps.length !== teacher.steps.length) {
     throw new Error("Student and teacher must have the same number of steps.")
   }
@@ -155,104 +146,204 @@ export const bootstrapFewShotProgram = async <
       throw new Error("Student and teacher must be different objects.")
     }
   }
-  const stepIds = student.steps.map((step) => step.id)
+  return { student, teacher }
+}
+
+/**
+ * One teacher attempt over one example: hide any installed example equal to
+ * the one being bootstrapped, roll the teacher out with trace capture, and
+ * decide acceptance through the metric. Rounds past the first take a fresh
+ * rollout at temperature=1.0 to bypass caches — the round index maps onto the
+ * seed parameter, exactly like SIMBA's prepareModelsForResampling. Throws
+ * when the rollout or the metric throws; the caller owns error counting.
+ */
+export const runBootstrapAttempt = async <
+  TInput extends Fields,
+  TOutput extends Fields,
+>(
+  teacher: Program<TInput, TOutput>,
+  example: Example<TInput, TOutput>,
+  roundIdx: number,
+  options: Pick<
+    BootstrapOptions<TInput, TOutput>,
+    "metric" | "metricThreshold" | "teacherSettings"
+  >
+): Promise<{ success: boolean; trace: TraceStep[] }> => {
+  const { metric, metricThreshold, teacherSettings } = options
+  const trace: TraceStep[] = []
+  const ctx: RunContext = {
+    model: teacherSettings?.model,
+    temperature: teacherSettings?.temperature,
+    trace,
+  }
+  if (roundIdx > 0) {
+    ctx.seed = roundIdx
+    ctx.temperature = 1
+  }
+  // Hide any example equal to the one being bootstrapped, restore after.
+  const exampleCache = teacher.steps.map((step) => step.examples)
+  for (const step of teacher.steps) {
+    step.examples = step.examples.filter(
+      (installed) => !examplesEqual(installed, example)
+    )
+  }
+  let prediction: TOutput | null
+  try {
+    prediction = await teacher.run(example.inputData, ctx)
+  } finally {
+    for (const [idx, step] of teacher.steps.entries()) {
+      step.examples = at(exampleCache, idx, "teacher example cache")
+    }
+  }
+  if (!metric) {
+    return { success: true, trace }
+  }
+  const { score } = await metric(example, prediction, trace, ctx)
+  return {
+    success:
+      metricThreshold === undefined ? score > 0 : score >= metricThreshold,
+    trace,
+  }
+}
+
+/**
+ * Fold one accepted attempt's trace into the per-step example pools. Multiple
+ * traces for one step in one example: keep ONE, sampled 50/50 from the first
+ * N-1 or the last, seeded by example content.
+ */
+export const harvestTraceExamples = (
+  id2traces: Map<string, Example[]>,
+  trace: TraceStep[]
+): void => {
+  const examplesById = new Map<string, Example[]>()
+  for (const traceStep of trace) {
+    if (!id2traces.has(traceStep.stepId)) {
+      continue
+    }
+    const harvested: Example = {
+      inputData: traceStep.inputData,
+      outputData: traceStep.outputData,
+    }
+    const list = examplesById.get(traceStep.stepId) ?? []
+    list.push(harvested)
+    examplesById.set(traceStep.stepId, list)
+  }
+  for (const [stepId, harvested] of examplesById) {
+    let kept = harvested
+    if (harvested.length > 1) {
+      const rng = createRNG(contentHash(harvested))
+      kept = [
+        rng() < 0.5
+          ? at(
+              harvested,
+              Math.floor(rng() * (harvested.length - 1)),
+              "trace examples"
+            )
+          : last(harvested, "trace examples"),
+      ]
+    }
+    id2traces.get(stepId)?.push(...kept)
+  }
+}
+
+/**
+ * _train: bootstrapped examples first, labeled backfill after. The
+ * un-bootstrapped pool is seed-0 shuffled, and the Python quirk that
+ * rawExamples is REASSIGNED to each step's sample is preserved, so later
+ * steps draw from the shrinking pool. Mutates and returns `student`.
+ */
+export const installTrainExamples = <
+  TInput extends Fields,
+  TOutput extends Fields,
+>(
+  student: Program<TInput, TOutput>,
+  id2traces: Map<string, Example[]>,
+  unBootstrapped: Example<TInput, TOutput>[],
+  options: Pick<
+    Required<BootstrapOptions<TInput, TOutput>>,
+    "maxFewShotExamples" | "maxLabeledExamples"
+  >
+): Program<TInput, TOutput> => {
+  const validation = [...unBootstrapped]
+  shuffle(createRNG(0), validation)
+  const rng = createRNG(0)
+  let rawExamples: Example[] = validation
+  for (const step of student.steps) {
+    const harvested = (id2traces.get(step.id) ?? []).slice(
+      0,
+      options.maxFewShotExamples
+    )
+    const sampleSize = Math.max(
+      0,
+      Math.min(
+        options.maxLabeledExamples - harvested.length,
+        rawExamples.length
+      )
+    )
+    rawExamples = sample(rng, rawExamples, sampleSize)
+    step.examples = [...harvested, ...rawExamples.map(cloneExample)]
+  }
+  return student
+}
+
+/** dspy.settings.max_errors default, shared with the workflow driver. */
+export const BOOTSTRAP_DEFAULT_MAX_ERRORS = DEFAULT_MAX_ERRORS
+
+/**
+ * BootstrapFewShot.compile: run a teacher over the trainingSet, capture the trace
+ * of every metric-passing run as bootstrapped examples per step, and fill the
+ * remaining slots with raw labeled examples. The durable workflow driver in
+ * bootstrap-few-shot.ts runs the same helpers one attempt per loop iteration.
+ */
+export const bootstrapFewShotProgram = async <
+  TInput extends Fields,
+  TOutput extends Fields,
+>(
+  studentProgram: Program<TInput, TOutput>,
+  trainingSet: Example<TInput, TOutput>[],
+  options: BootstrapOptions<TInput, TOutput> = {}
+): Promise<Program<TInput, TOutput>> => {
+  const {
+    maxErrors = DEFAULT_MAX_ERRORS,
+    maxFewShotExamples = 4,
+    maxLabeledExamples = 16,
+    maxRounds = 1,
+  } = options
+
+  const { student, teacher } = prepareStudentAndTeacher(
+    studentProgram,
+    trainingSet,
+    options
+  )
 
   // _bootstrap ---------------------------------------------------------------
-  const id2traces = new Map<string, Example[]>(stepIds.map((id) => [id, []]))
+  const id2traces = new Map<string, Example[]>(
+    student.steps.map((step) => [step.id, []])
+  )
   let errorCount = 0
-
-  const runTeacherAttempt = async (
-    example: Example<TInput, TOutput>,
-    ctx: RunContext
-  ): Promise<TOutput | null> => {
-    // Hide any example equal to the one being bootstrapped, restore after.
-    const exampleCache = teacher.steps.map((step) => step.examples)
-    for (const step of teacher.steps) {
-      step.examples = step.examples.filter(
-        (installed) => !examplesEqual(installed, example)
-      )
-    }
-    try {
-      return await teacher.run(example.inputData, ctx)
-    } finally {
-      for (const [idx, step] of teacher.steps.entries()) {
-        step.examples = at(exampleCache, idx, "teacher example cache")
-      }
-    }
-  }
-
-  const harvestTraceExamples = (trace: TraceStep[]): void => {
-    const examplesById = new Map<string, Example[]>()
-    for (const traceStep of trace) {
-      if (!id2traces.has(traceStep.stepId)) {
-        continue
-      }
-      const harvested: Example = {
-        inputData: traceStep.inputData,
-        outputData: traceStep.outputData,
-      }
-      const list = examplesById.get(traceStep.stepId) ?? []
-      list.push(harvested)
-      examplesById.set(traceStep.stepId, list)
-    }
-    for (const [stepId, harvested] of examplesById) {
-      let kept = harvested
-      // Multiple traces for one step in one example: keep ONE, sampled
-      // 50/50 from the first N-1 or the last, seeded by example content.
-      if (harvested.length > 1) {
-        const rng = createRNG(contentHash(harvested))
-        kept = [
-          rng() < 0.5
-            ? at(
-                harvested,
-                Math.floor(rng() * (harvested.length - 1)),
-                "trace examples"
-              )
-            : last(harvested, "trace examples"),
-        ]
-      }
-      id2traces.get(stepId)?.push(...kept)
-    }
-  }
 
   const bootstrapOneExample = async (
     example: Example<TInput, TOutput>,
     roundIdx: number
   ): Promise<boolean> => {
-    const trace: TraceStep[] = []
-    // Rounds past the first take a fresh rollout at temperature=1.0 to
-    // bypass caches — the rollout id maps onto the seed parameter, exactly
-    // like SIMBA's prepareModelsForResampling.
-    const ctx: RunContext = {
-      model: teacherSettings?.model,
-      temperature: teacherSettings?.temperature,
-      trace,
-    }
-    if (roundIdx > 0) {
-      ctx.seed = roundIdx
-      ctx.temperature = 1
-    }
     let success = false
     try {
-      const prediction = await runTeacherAttempt(example, ctx)
-      if (metric) {
-        const { score } = await metric(example, prediction, trace, ctx)
-        success =
-          metricThreshold === undefined ? score > 0 : score >= metricThreshold
-      } else {
-        success = true
+      const attempt = await runBootstrapAttempt(
+        teacher,
+        example,
+        roundIdx,
+        options
+      )
+      ;({ success } = attempt)
+      if (success) {
+        harvestTraceExamples(id2traces, attempt.trace)
       }
     } catch (error) {
-      success = false
       errorCount += 1
       if (errorCount >= maxErrors) {
         throw error
       }
       console.error(`Failed to run or evaluate example due to ${error}.`)
-    }
-
-    if (success) {
-      harvestTraceExamples(trace)
     }
     return success
   }
@@ -271,27 +362,10 @@ export const bootstrapFewShotProgram = async <
     }
   }
 
-  // Un-bootstrapped examples become the labeled pool, seed-0 shuffled.
-  const validation = trainingSet.filter((_x, idx) => !bootstrapped.has(idx))
-  shuffle(createRNG(0), validation)
-
-  // _train: bootstrapped examples first, labeled backfill after — preserving
-  // the Python quirk that rawExamples is REASSIGNED to each step's sample, so
-  // later steps draw from the shrinking pool.
-  const rng = createRNG(0)
-  let rawExamples = validation
-  for (const step of student.steps) {
-    const harvested = (id2traces.get(step.id) ?? []).slice(
-      0,
-      maxFewShotExamples
-    )
-    const sampleSize = Math.max(
-      0,
-      Math.min(maxLabeledExamples - harvested.length, rawExamples.length)
-    )
-    rawExamples = sample(rng, rawExamples, sampleSize)
-    step.examples = [...harvested, ...rawExamples.map(cloneExample)]
-  }
-
-  return student
+  return installTrainExamples(
+    student,
+    id2traces,
+    trainingSet.filter((_x, idx) => !bootstrapped.has(idx)),
+    { maxFewShotExamples, maxLabeledExamples }
+  )
 }

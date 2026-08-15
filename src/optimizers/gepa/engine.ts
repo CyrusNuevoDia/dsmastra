@@ -1,11 +1,11 @@
-import { at, get, pop, prop } from "@/collections"
-import type { Fields } from "@/fields"
-import type { Example } from "@/program"
-import { shuffle, weightedChoice, weightedChoiceStrict } from "@/random"
-import type { RNG } from "@/random"
-import type { TraceStep } from "@/step"
+import { at, get, pop, prop } from "../../collections"
+import type { Fields } from "../../fields"
+import type { Example } from "../../program"
+import { shuffle, weightedChoice, weightedChoiceStrict } from "../../random"
+import type { RNG } from "../../random"
+import type { TraceStep } from "../../step"
 
-export type { RNG } from "@/random"
+export type { RNG } from "../../random"
 
 /**
  * A candidate is a map of component (step) name → instruction text,
@@ -234,21 +234,32 @@ export const selectParetoParent = (
 
 // --- Minibatch sampler ------------------------------------------------------
 
+/** The epoch sampler's whole world between draws — JSON, for durable runs. */
+export type EpochSamplerState = {
+  epoch: number
+  shuffled: number[]
+}
+
+export const initEpochSamplerState = (): EpochSamplerState => ({
+  epoch: -1,
+  shuffled: [],
+})
+
 /**
- * Epoch-shuffled minibatch sampler: shuffle the train ids once per epoch, pad
+ * Epoch-shuffled minibatch draw: shuffle the train ids once per epoch, pad
  * the tail to a multiple of bsize with the least-frequently-used id, and serve
- * sequential windows keyed by iteration number.
+ * sequential windows keyed by iteration number. Mutates `samplerState` in
+ * place; the state plus the RNG's checkpoint fully determine the stream.
  */
-export const createEpochShuffledSampler = (
+export const sampleEpochShuffled = (
   rng: RNG,
   trainSize: number,
-  bsize: number
-): ((iteration: number) => number[]) => {
-  let shuffled: number[] = []
-  let epoch = -1
-
+  bsize: number,
+  samplerState: EpochSamplerState,
+  iteration: number
+): number[] => {
   const reshuffle = () => {
-    shuffled = Array.from({ length: trainSize }, (_, i) => i)
+    const shuffled = Array.from({ length: trainSize }, (_, i) => i)
     shuffle(rng, shuffled)
     // Counter insertion order = first-occurrence order in the shuffled list;
     // Python pads with most_common()[::-1][0][0] — among the least-frequent
@@ -269,19 +280,31 @@ export const createEpochShuffledSampler = (
       shuffled.push(pick)
       counts.set(pick, pickCount + 1)
     }
+    samplerState.shuffled = shuffled
   }
 
-  return (iteration: number): number[] => {
-    const base = iteration * bsize
-    const currEpoch =
-      epoch === -1 ? 0 : Math.floor(base / Math.max(shuffled.length, 1))
-    if (shuffled.length === 0 || currEpoch > epoch) {
-      epoch = currEpoch
-      reshuffle()
-    }
-    const start = base % shuffled.length
-    return shuffled.slice(start, start + bsize)
+  const base = iteration * bsize
+  const currEpoch =
+    samplerState.epoch === -1
+      ? 0
+      : Math.floor(base / Math.max(samplerState.shuffled.length, 1))
+  if (samplerState.shuffled.length === 0 || currEpoch > samplerState.epoch) {
+    samplerState.epoch = currEpoch
+    reshuffle()
   }
+  const start = base % samplerState.shuffled.length
+  return samplerState.shuffled.slice(start, start + bsize)
+}
+
+/** Closure form of sampleEpochShuffled, for in-memory (non-durable) drivers. */
+export const createEpochShuffledSampler = (
+  rng: RNG,
+  trainSize: number,
+  bsize: number
+): ((iteration: number) => number[]) => {
+  const samplerState = initEpochSamplerState()
+  return (iteration: number): number[] =>
+    sampleEpochShuffled(rng, trainSize, bsize, samplerState, iteration)
 }
 
 // --- Merge (crossover) ------------------------------------------------------
@@ -691,28 +714,21 @@ const selectParent = (
   )
 }
 
-export const runGEPA = async <TInput, TOutput>(
-  adapter: GEPAAdapter<TInput, TOutput>,
-  options: EngineOptions<TInput, TOutput>
-): Promise<GEPAState> => {
-  const { rng, trainingSet, validationSet } = options
-  const componentNames = Object.keys(options.seedCandidate)
-
-  const seedEval = await adapter.evaluate(
-    validationSet,
-    options.seedCandidate,
-    false
-  )
+/** GEPAState after the seed candidate's full validationSet eval. */
+export const initGEPAState = (
+  seedCandidate: Candidate,
+  seedScores: number[]
+): GEPAState => {
   const state: GEPAState = {
-    candidateValidationSubscores: [toSubscores(seedEval.scores)],
+    candidateValidationSubscores: [toSubscores(seedScores)],
     i: -1,
     metricCallCountsByDiscovery: [0],
     parentProgramForCandidate: [[null]],
     paretoFrontValidationSet: new Map(),
     programAtParetoFrontValidationSet: new Map(),
-    programCandidates: [options.seedCandidate],
+    programCandidates: [seedCandidate],
     stepIdToUpdateNextForCandidate: [0],
-    totalEvalsCount: validationSet.length,
+    totalEvalsCount: seedScores.length,
     validationSetEvalsCount: 1,
   }
   updateParetoFront(
@@ -721,136 +737,251 @@ export const runGEPA = async <TInput, TOutput>(
     0,
     at(state.candidateValidationSubscores, 0, "validation subscores")
   )
+  return state
+}
 
-  const sampler = createEpochShuffledSampler(
-    rng,
-    trainingSet.length,
-    options.reflectionMinibatchSize
-  )
-  const mergeMemory: MergeMemory = {
-    producedByPair: new Set(),
-    triedTriplets: new Set(),
-  }
-  let mergesDue = 0
-  let totalMergesTested = 0
-  let lastIterFoundNewProgram = false
+/**
+ * The loop-level bookkeeping that rides alongside GEPAState between
+ * iterations: merge scheduling, the improvement watermark for onImprovement,
+ * and the minibatch sampler's position.
+ */
+export type GEPALoopState = {
+  bestAgg: number
+  lastIterFoundNewProgram: boolean
+  mergeMemory: MergeMemory
+  mergesDue: number
+  samplerState: EpochSamplerState
+  totalMergesTested: number
+}
 
-  let bestAgg = aggregateScore(
+export const initGEPALoopState = (state: GEPAState): GEPALoopState => ({
+  bestAgg: aggregateScore(
     at(state.candidateValidationSubscores, 0, "validation subscores")
+  ),
+  lastIterFoundNewProgram: false,
+  mergeMemory: { producedByPair: new Set(), triedTriplets: new Set() },
+  mergesDue: 0,
+  samplerState: initEpochSamplerState(),
+  totalMergesTested: 0,
+})
+
+const noteImprovement = async (
+  loop: GEPALoopState,
+  onImprovement: EngineOptions["onImprovement"],
+  candidate: Candidate,
+  subscores: Map<number, number>
+): Promise<void> => {
+  const agg = aggregateScore(subscores)
+  if (agg > loop.bestAgg) {
+    loop.bestAgg = agg
+    await onImprovement?.(candidate)
+  }
+}
+
+/**
+ * Everything the reflection LM call needs, and everything the acceptance
+ * decision needs afterwards — JSON, so the durable workflow driver can put
+ * the proposal call in its own step.
+ */
+export type ReflectionPlan = {
+  /** Components that actually have reflective records — the proposal targets. */
+  components: string[]
+  minibatchIds: number[]
+  parentIdx: number
+  parentScores: number[]
+  reflectiveDataset: ReflectiveDataset
+}
+
+/**
+ * The reflection prologue: pick a parent, evaluate it on the epoch-shuffled
+ * minibatch with traces, advance the component cursor, and build the
+ * reflective dataset. Returns null when the iteration produces nothing to
+ * reflect on (no trajectories, all-perfect scores, or no component records) —
+ * budget is still billed, exactly like upstream.
+ */
+export const prepareReflection = async <TInput, TOutput>(
+  adapter: GEPAAdapter<TInput, TOutput>,
+  state: GEPAState,
+  loop: GEPALoopState,
+  options: EngineOptions<TInput, TOutput>
+): Promise<ReflectionPlan | null> => {
+  const componentNames = Object.keys(options.seedCandidate)
+  const parentIdx = selectParent(state, options)
+  const parent = at(state.programCandidates, parentIdx, "candidates")
+
+  const minibatchIds = sampleEpochShuffled(
+    options.rng,
+    options.trainingSet.length,
+    options.reflectionMinibatchSize,
+    loop.samplerState,
+    state.i
   )
-  const noteImprovement = async (
-    candidate: Candidate,
-    subscores: Map<number, number>
-  ): Promise<void> => {
-    const agg = aggregateScore(subscores)
-    if (agg > bestAgg) {
-      bestAgg = agg
-      await options.onImprovement?.(candidate)
-    }
+  const batch = minibatchIds.map((id) =>
+    at(options.trainingSet, id, "trainingSet")
+  )
+  const parentEval = await adapter.evaluate(batch, parent, true)
+  state.totalEvalsCount += batch.length
+
+  if (!parentEval.trajectories || parentEval.trajectories.length === 0) {
+    return null
+  }
+  if (
+    options.skipPerfectScore &&
+    parentEval.scores.every((score) => score >= options.perfectScore)
+  ) {
+    return null
   }
 
-  const runReflection = async (): Promise<void> => {
-    const parentIdx = selectParent(state, options)
-    const parent = at(state.programCandidates, parentIdx, "candidates")
-
-    const minibatchIds = sampler(state.i)
-    const batch = minibatchIds.map((id) => at(trainingSet, id, "trainingSet"))
-    const parentEval = await adapter.evaluate(batch, parent, true)
-    state.totalEvalsCount += batch.length
-
-    if (!parentEval.trajectories || parentEval.trajectories.length === 0) {
-      return
-    }
-    if (
-      options.skipPerfectScore &&
-      parentEval.scores.every((score) => score >= options.perfectScore)
-    ) {
-      return
-    }
-
-    let components: string[]
-    if (options.componentSelector === "all") {
-      components = componentNames
-    } else {
-      // The cursor advances on the parent even if the proposal is rejected.
-      const cursor = at(
-        state.stepIdToUpdateNextForCandidate,
-        parentIdx,
-        "step cursors"
-      )
-      components = [
-        at(componentNames, cursor % componentNames.length, "component names"),
-      ]
-      state.stepIdToUpdateNextForCandidate[parentIdx] =
-        (cursor + 1) % componentNames.length
-    }
-
-    const reflectiveDataset = await adapter.makeReflectiveDataset(
-      parent,
-      parentEval,
-      components
+  let components: string[]
+  if (options.componentSelector === "all") {
+    components = componentNames
+  } else {
+    // The cursor advances on the parent even if the proposal is rejected.
+    const cursor = at(
+      state.stepIdToUpdateNextForCandidate,
+      parentIdx,
+      "step cursors"
     )
-    const componentsWithData = components.filter(
-      (name) => (reflectiveDataset[name] ?? []).length > 0
-    )
-    if (componentsWithData.length === 0) {
-      return
-    }
-
-    const newTexts = await adapter.proposeNewTexts(
-      parent,
-      reflectiveDataset,
-      componentsWithData
-    )
-    // Python keeps empty extracted text as a real proposal; only an empty
-    // proposal DICT skips the round.
-    const applicable = Object.entries(newTexts).filter(
-      ([name]) => name in parent
-    )
-    if (applicable.length === 0) {
-      return
-    }
-    const child = { ...parent }
-    for (const [name, text] of applicable) {
-      child[name] = text
-    }
-
-    // Python evaluates children with capture_traces=True (used only for
-    // logging upstream, but it keeps the adapter call shape identical).
-    const childEval = await adapter.evaluate(batch, child, true)
-    state.totalEvalsCount += batch.length
-
-    // Strict > on SUMS (not means) for reflection acceptance.
-    if (sum(childEval.scores) > sum(parentEval.scores)) {
-      const fullEval = await adapter.evaluate(validationSet, child, false)
-      const subscores = toSubscores(fullEval.scores)
-      addCandidate(state, child, [parentIdx], subscores, validationSet.length)
-      await noteImprovement(child, subscores)
-      lastIterFoundNewProgram = true
-      if (totalMergesTested < options.maxMergeInvocations) {
-        mergesDue += 1
-      }
-      console.log(
-        `GEPA iteration ${state.i}: accepted child of ${parentIdx} (component ${components.join(", ")})`
-      )
-    }
+    components = [
+      at(componentNames, cursor % componentNames.length, "component names"),
+    ]
+    state.stepIdToUpdateNextForCandidate[parentIdx] =
+      (cursor + 1) % componentNames.length
   }
+
+  const reflectiveDataset = await adapter.makeReflectiveDataset(
+    parent,
+    parentEval,
+    components
+  )
+  const componentsWithData = components.filter(
+    (name) => (reflectiveDataset[name] ?? []).length > 0
+  )
+  if (componentsWithData.length === 0) {
+    return null
+  }
+
+  return {
+    components: componentsWithData,
+    minibatchIds,
+    parentIdx,
+    parentScores: parentEval.scores,
+    reflectiveDataset,
+  }
+}
+
+/**
+ * The reflection epilogue: apply the proposed texts to the parent, evaluate
+ * the child on the same minibatch, and accept iff its score SUM strictly
+ * beats the parent's (upstream's rule) — acceptance bills a full
+ * validationSet eval, registers the candidate, and schedules a merge.
+ */
+export const acceptReflection = async <TInput, TOutput>(
+  adapter: GEPAAdapter<TInput, TOutput>,
+  state: GEPAState,
+  loop: GEPALoopState,
+  options: EngineOptions<TInput, TOutput>,
+  plan: ReflectionPlan,
+  newTexts: Record<string, string>
+): Promise<boolean> => {
+  const parent = at(state.programCandidates, plan.parentIdx, "candidates")
+  // Python keeps empty extracted text as a real proposal; only an empty
+  // proposal DICT skips the round.
+  const applicable = Object.entries(newTexts).filter(([name]) => name in parent)
+  if (applicable.length === 0) {
+    return false
+  }
+  const child = { ...parent }
+  for (const [name, text] of applicable) {
+    child[name] = text
+  }
+
+  const batch = plan.minibatchIds.map((id) =>
+    at(options.trainingSet, id, "trainingSet")
+  )
+  // Python evaluates children with capture_traces=True (used only for
+  // logging upstream, but it keeps the adapter call shape identical).
+  const childEval = await adapter.evaluate(batch, child, true)
+  state.totalEvalsCount += batch.length
+
+  // Strict > on SUMS (not means) for reflection acceptance.
+  if (sum(childEval.scores) <= sum(plan.parentScores)) {
+    return false
+  }
+  const fullEval = await adapter.evaluate(options.validationSet, child, false)
+  const subscores = toSubscores(fullEval.scores)
+  addCandidate(
+    state,
+    child,
+    [plan.parentIdx],
+    subscores,
+    options.validationSet.length
+  )
+  await noteImprovement(loop, options.onImprovement, child, subscores)
+  loop.lastIterFoundNewProgram = true
+  if (loop.totalMergesTested < options.maxMergeInvocations) {
+    loop.mergesDue += 1
+  }
+  console.log(
+    `GEPA iteration ${state.i}: accepted child of ${plan.parentIdx} (component ${plan.components.join(", ")})`
+  )
+  return true
+}
+
+/**
+ * The merge branch of one iteration, when it is due: returns the outcome and
+ * does the loop bookkeeping. "none" means the search was fruitless and the
+ * iteration should fall through to reflection.
+ */
+export const runMergeBranch = async <TInput, TOutput>(
+  adapter: GEPAAdapter<TInput, TOutput>,
+  state: GEPAState,
+  loop: GEPALoopState,
+  options: EngineOptions<TInput, TOutput>
+): Promise<MergeOutcome> => {
+  loop.lastIterFoundNewProgram = false
+  const outcome = await runMergeIteration(
+    adapter,
+    state,
+    {
+      onAccepted: (candidate, subscores) =>
+        noteImprovement(loop, options.onImprovement, candidate, subscores),
+      rng: options.rng,
+      validationSet: options.validationSet,
+    },
+    loop.mergeMemory
+  )
+  if (outcome === "accepted") {
+    loop.mergesDue -= 1
+    loop.totalMergesTested += 1
+  }
+  return outcome
+}
+
+/** Whether the next iteration should try a merge before reflecting. */
+export const mergeDue = (
+  loop: GEPALoopState,
+  options: Pick<EngineOptions, "useMerge">
+): boolean =>
+  options.useMerge && loop.mergesDue > 0 && loop.lastIterFoundNewProgram
+
+export const runGEPA = async <TInput, TOutput>(
+  adapter: GEPAAdapter<TInput, TOutput>,
+  options: EngineOptions<TInput, TOutput>
+): Promise<GEPAState> => {
+  const seedEval = await adapter.evaluate(
+    options.validationSet,
+    options.seedCandidate,
+    false
+  )
+  const state = initGEPAState(options.seedCandidate, seedEval.scores)
+  const loop = initGEPALoopState(state)
 
   while (state.totalEvalsCount < options.maxMetricCalls) {
     state.i += 1
-    if (options.useMerge && mergesDue > 0 && lastIterFoundNewProgram) {
-      lastIterFoundNewProgram = false
+    if (mergeDue(loop, options)) {
       // oxlint-disable-next-line no-await-in-loop -- iterations are inherently sequential
-      const outcome = await runMergeIteration(
-        adapter,
-        state,
-        { onAccepted: noteImprovement, rng, validationSet },
-        mergeMemory
-      )
-      if (outcome === "accepted") {
-        mergesDue -= 1
-        totalMergesTested += 1
-      }
+      const outcome = await runMergeBranch(adapter, state, loop, options)
       // A PRODUCED merge proposal ends the iteration whether accepted or
       // rejected; a fruitless search falls through to reflection.
       if (outcome !== "none") {
@@ -858,8 +989,119 @@ export const runGEPA = async <TInput, TOutput>(
       }
     }
     // oxlint-disable-next-line no-await-in-loop -- GEPA iterations are inherently sequential: each reflection reads state the previous one wrote
-    await runReflection()
+    const plan = await prepareReflection(adapter, state, loop, options)
+    if (!plan) {
+      continue
+    }
+    const parent = at(state.programCandidates, plan.parentIdx, "candidates")
+    // oxlint-disable-next-line no-await-in-loop -- see above
+    const newTexts = await adapter.proposeNewTexts(
+      parent,
+      plan.reflectiveDataset,
+      plan.components
+    )
+    // oxlint-disable-next-line no-await-in-loop -- see above
+    await acceptReflection(adapter, state, loop, options, plan, newTexts)
   }
 
   return state
 }
+
+// --- Durable-state codec ------------------------------------------------------
+//
+// GEPAState and GEPALoopState keep Maps and Sets for the hot paths; the
+// durable workflow driver moves them between steps as JSON via this codec.
+
+export type SerializedGEPAState = {
+  candidateValidationSubscores: [number, number][][]
+  i: number
+  metricCallCountsByDiscovery: number[]
+  paretoFrontValidationSet: [number, number][]
+  parentProgramForCandidate: (number | null)[][]
+  programAtParetoFrontValidationSet: [number, number[]][]
+  programCandidates: Candidate[]
+  stepIdToUpdateNextForCandidate: number[]
+  totalEvalsCount: number
+  validationSetEvalsCount: number
+}
+
+export type SerializedGEPALoopState = {
+  bestAgg: number
+  lastIterFoundNewProgram: boolean
+  mergeMemory: { producedByPair: string[]; triedTriplets: string[] }
+  mergesDue: number
+  samplerState: EpochSamplerState
+  totalMergesTested: number
+}
+
+export const serializeGEPAState = (state: GEPAState): SerializedGEPAState => ({
+  candidateValidationSubscores: state.candidateValidationSubscores.map(
+    (subscores) => [...subscores.entries()]
+  ),
+  i: state.i,
+  metricCallCountsByDiscovery: [...state.metricCallCountsByDiscovery],
+  parentProgramForCandidate: state.parentProgramForCandidate.map((parents) => [
+    ...parents,
+  ]),
+  paretoFrontValidationSet: [...state.paretoFrontValidationSet.entries()],
+  programAtParetoFrontValidationSet: [
+    ...state.programAtParetoFrontValidationSet.entries(),
+  ].map(([validationId, programs]) => [validationId, [...programs]]),
+  programCandidates: structuredClone(state.programCandidates),
+  stepIdToUpdateNextForCandidate: [...state.stepIdToUpdateNextForCandidate],
+  totalEvalsCount: state.totalEvalsCount,
+  validationSetEvalsCount: state.validationSetEvalsCount,
+})
+
+export const deserializeGEPAState = (
+  serialized: SerializedGEPAState
+): GEPAState => ({
+  candidateValidationSubscores: serialized.candidateValidationSubscores.map(
+    (subscores) => new Map(subscores)
+  ),
+  i: serialized.i,
+  metricCallCountsByDiscovery: [...serialized.metricCallCountsByDiscovery],
+  parentProgramForCandidate: serialized.parentProgramForCandidate.map(
+    (parents) => [...parents]
+  ),
+  paretoFrontValidationSet: new Map(serialized.paretoFrontValidationSet),
+  programAtParetoFrontValidationSet: new Map(
+    serialized.programAtParetoFrontValidationSet.map(
+      ([validationId, programs]) => [validationId, new Set(programs)]
+    )
+  ),
+  programCandidates: structuredClone(serialized.programCandidates),
+  stepIdToUpdateNextForCandidate: [
+    ...serialized.stepIdToUpdateNextForCandidate,
+  ],
+  totalEvalsCount: serialized.totalEvalsCount,
+  validationSetEvalsCount: serialized.validationSetEvalsCount,
+})
+
+export const serializeGEPALoopState = (
+  loop: GEPALoopState
+): SerializedGEPALoopState => ({
+  bestAgg: loop.bestAgg,
+  lastIterFoundNewProgram: loop.lastIterFoundNewProgram,
+  mergeMemory: {
+    producedByPair: [...loop.mergeMemory.producedByPair],
+    triedTriplets: [...loop.mergeMemory.triedTriplets],
+  },
+  mergesDue: loop.mergesDue,
+  samplerState: structuredClone(loop.samplerState),
+  totalMergesTested: loop.totalMergesTested,
+})
+
+export const deserializeGEPALoopState = (
+  serialized: SerializedGEPALoopState
+): GEPALoopState => ({
+  bestAgg: serialized.bestAgg,
+  lastIterFoundNewProgram: serialized.lastIterFoundNewProgram,
+  mergeMemory: {
+    producedByPair: new Set(serialized.mergeMemory.producedByPair),
+    triedTriplets: new Set(serialized.mergeMemory.triedTriplets),
+  },
+  mergesDue: serialized.mergesDue,
+  samplerState: structuredClone(serialized.samplerState),
+  totalMergesTested: serialized.totalMergesTested,
+})

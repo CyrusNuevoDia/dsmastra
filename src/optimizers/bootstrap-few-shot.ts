@@ -1,19 +1,36 @@
 import type { AnyWorkflow } from "@mastra/core/workflows"
+import { createStep, createWorkflow } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
+import { z } from "zod"
 
-import { bootstrapFewShotProgram } from "@/optimizers/bootstrap"
+import { at } from "../collections"
+import type { BootstrapMetric } from "../optimizers/bootstrap"
 import {
-  applyProgram,
-  evaluateProgram,
+  BOOTSTRAP_DEFAULT_MAX_ERRORS,
+  harvestTraceExamples,
+  installTrainExamples,
+  prepareStudentAndTeacher,
+  runBootstrapAttempt,
+} from "../optimizers/bootstrap"
+import {
+  compiledSchema,
+  exampleSchema,
+  finishingSteps,
+  optimizerResultSchema,
+  programFromPrompts,
   promptsOf,
+  promptsSchema,
   workflowToProgram,
-} from "@/optimizers/utils"
-import type { Prompts, SavePrompts } from "@/optimizers/utils"
-import type { Example } from "@/program"
-import { resolveScorer, scorerMetric, trajectoryScorerMetric } from "@/scorers"
-import type { ScorerRef } from "@/scorers"
+} from "../optimizers/utils"
+import type { OptimizerCheckpoint, SavePrompts } from "../optimizers/utils"
+import type { Example } from "../program"
+import { resolveScorer, scorerMetric, trajectoryScorerMetric } from "../scorers"
+import type { ScorerRef } from "../scorers"
 
 export type BootstrapFewShotConfig = {
+  /** Pause hook: called before every teacher attempt; returning true suspends
+   * the run durably, to be continued with `run.resume()`. */
+  checkpoint?: OptimizerCheckpoint
   /** Optional trajectory gate: a Mastra `type: "trajectory"` scorer (or its
    * registration key) that sees each teacher rollout as a Trajectory in
    * `run.output` — one workflow_step entry per engine-executed step (agents,
@@ -45,59 +62,212 @@ export type BootstrapFewShotConfig = {
   teacherSettings?: { model?: LanguageModel; temperature?: number }
 }
 
+/** The loop's whole world between attempts, as JSON. */
+const bootstrapStateSchema = z.object({
+  bootstrapped: z.array(z.number()),
+  errorCount: z.number(),
+  exampleIdx: z.number(),
+  id2traces: z.record(z.string(), z.array(exampleSchema)),
+  iteration: z.number(),
+  roundIdx: z.number(),
+  teacherPrompts: promptsSchema,
+})
+
+type BootstrapState = z.infer<typeof bootstrapStateSchema>
+
 /**
- * Run a teacher over the trainingSet, capture the trace of every
- * scorer-passing run as few-shot examples per step, and backfill the remaining
- * slots with labeled examples (dspy.teleprompt.bootstrap.BootstrapFewShot).
+ * BootstrapFewShot (dspy.teleprompt.bootstrap.BootstrapFewShot) as a Mastra
+ * workflow over the target `workflow`: a prepare step compiles the teacher's
+ * prompt state, a durable dountil loop runs ONE teacher attempt per
+ * iteration — capturing the trace of every scorer-passing run as few-shot
+ * examples per step — and a compile step backfills the remaining slots with
+ * labeled examples before the shared save/evaluate/apply tail. All inter-step
+ * state is JSON (teacher prompts, harvested traces, counters), so a
+ * storage-backed run resumes mid-bootstrap without redoing completed attempts.
  */
-export const bootstrapFewShot = async (
+export const createBootstrapFewShotWorkflow = (
   workflow: AnyWorkflow,
   config: BootstrapFewShotConfig
-): Promise<{ candidates: [Prompts, { score: number }][]; score: number }> => {
+) => {
   const {
+    checkpoint,
     gate,
-    savePrompts,
-    scorer,
+    maxErrors = BOOTSTRAP_DEFAULT_MAX_ERRORS,
+    maxFewShotExamples = 4,
+    maxLabeledExamples = 16,
+    maxRounds = 1,
     scoreThreshold,
     teacher,
     trainingSet,
-    ...options
   } = config
   if (gate && scoreThreshold !== undefined) {
     throw new Error(
       "scoreThreshold gates the objective scorer, which does not gate acceptance when a gate is set — use gate.threshold instead"
     )
   }
-  const metric = scorerMetric(resolveScorer(workflow, scorer))
+  const metric = scorerMetric(resolveScorer(workflow, config.scorer))
   const gateMetric =
     gate && trajectoryScorerMetric(resolveScorer(workflow, gate.scorer))
   const acceptThreshold = gate ? gate.threshold : scoreThreshold
-  const compiled = await bootstrapFewShotProgram(
-    workflowToProgram(workflow),
-    [...trainingSet],
-    {
-      ...options,
-      metric: gateMetric
-        ? (gold, _prediction, _trace, ctx) => {
-            if (!ctx?.trajectory) {
-              throw new Error(
-                "Gate scorer has no trajectory to score (the teacher rollout did not run through Mastra's engine)"
-              )
-            }
-            return gateMetric(gold, ctx.trajectory)
+  const attemptMetric: BootstrapMetric = gateMetric
+    ? (gold, _prediction, _trace, ctx) => {
+        if (!ctx?.trajectory) {
+          throw new Error(
+            "Gate scorer has no trajectory to score (the teacher rollout did not run through Mastra's engine)"
+          )
+        }
+        return gateMetric(gold, ctx.trajectory)
+      }
+    : (gold, prediction) => metric(gold, prediction ?? undefined)
+
+  const done = (state: BootstrapState): boolean =>
+    state.bootstrapped.length >= maxFewShotExamples ||
+    state.exampleIdx >= trainingSet.length
+
+  const prepare = createStep({
+    description:
+      "Compile the teacher's prompt state (labeled few-shot install)",
+    execute: () => {
+      // Validates student/teacher structure and installs the labeled
+      // examples on the teacher — the loop reconstructs the teacher from
+      // this snapshot on every attempt.
+      const prepared = prepareStudentAndTeacher(
+        workflowToProgram(workflow),
+        [...trainingSet],
+        {
+          maxLabeledExamples,
+          teacher: teacher && workflowToProgram(teacher),
+        }
+      )
+      return Promise.resolve({
+        bootstrapped: [],
+        errorCount: 0,
+        exampleIdx: 0,
+        id2traces: Object.fromEntries(
+          prepared.student.steps.map((step) => [step.id, []])
+        ),
+        iteration: 0,
+        roundIdx: 0,
+        teacherPrompts: promptsOf(prepared.teacher),
+      } satisfies BootstrapState)
+    },
+    id: "prepare",
+    inputSchema: z.object({}),
+    outputSchema: bootstrapStateSchema,
+  })
+
+  const attempt = createStep({
+    description: "One teacher attempt: rollout, gate, harvest on success",
+    execute: async ({ inputData, resumeData, suspend }) => {
+      const state: BootstrapState = inputData
+      if (done(state)) {
+        // The dountil body runs at least once even when there is nothing to
+        // bootstrap; make that first iteration a no-op.
+        return state
+      }
+      if (!resumeData && (await checkpoint?.({ iteration: state.iteration }))) {
+        return await suspend({ iteration: state.iteration })
+      }
+      const teacherBase = teacher
+        ? workflowToProgram(teacher)
+        : workflowToProgram(workflow)
+      const builtTeacher = programFromPrompts(teacherBase, state.teacherPrompts)
+      const example = at([...trainingSet], state.exampleIdx, "trainingSet")
+      const next: BootstrapState = {
+        ...state,
+        id2traces: structuredClone(state.id2traces),
+        iteration: state.iteration + 1,
+      }
+      let success = false
+      try {
+        const result = await runBootstrapAttempt(
+          builtTeacher,
+          example,
+          state.roundIdx,
+          {
+            metric: attemptMetric,
+            ...(acceptThreshold !== undefined && {
+              metricThreshold: acceptThreshold,
+            }),
+            teacherSettings: config.teacherSettings,
           }
-        : (gold, prediction) => metric(gold, prediction ?? undefined),
-      ...(acceptThreshold !== undefined && {
-        metricThreshold: acceptThreshold,
-      }),
-      teacher: teacher && workflowToProgram(teacher),
-    }
-  )
-  const prompts = promptsOf(compiled)
-  await savePrompts(prompts)
-  // Score the compiled program over the trainingSet.
-  const score = await evaluateProgram(compiled, trainingSet, metric)
-  // The compiled prompt state lands in place on the caller's workflow.
-  applyProgram(workflow, compiled)
-  return { candidates: [[prompts, { score }]], score }
+        )
+        ;({ success } = result)
+        if (success) {
+          const id2traces = new Map(Object.entries(next.id2traces))
+          harvestTraceExamples(id2traces, result.trace)
+          next.id2traces = Object.fromEntries(id2traces)
+        }
+      } catch (error) {
+        next.errorCount += 1
+        if (next.errorCount >= maxErrors) {
+          throw error
+        }
+        console.error(`Failed to run or evaluate example due to ${error}.`)
+      }
+      if (success) {
+        next.bootstrapped = [...next.bootstrapped, state.exampleIdx]
+        next.exampleIdx += 1
+        next.roundIdx = 0
+      } else if (state.roundIdx + 1 >= maxRounds) {
+        next.exampleIdx += 1
+        next.roundIdx = 0
+      } else {
+        next.roundIdx = state.roundIdx + 1
+      }
+      return next
+    },
+    id: "attempt",
+    inputSchema: bootstrapStateSchema,
+    outputSchema: bootstrapStateSchema,
+    resumeSchema: z.object({}),
+    suspendSchema: z.object({ iteration: z.number() }),
+  })
+
+  const compile = createStep({
+    description: "Install harvested examples plus labeled backfill",
+    execute: ({ inputData }) => {
+      const state: BootstrapState = inputData
+      const bootstrapped = new Set(state.bootstrapped)
+      const student = installTrainExamples(
+        // A fresh reset copy: base descriptions, no examples.
+        prepareStudentAndTeacher(
+          workflowToProgram(workflow),
+          [...trainingSet],
+          {
+            maxLabeledExamples: 0,
+            teacher: teacher && workflowToProgram(teacher),
+          }
+        ).student,
+        new Map(Object.entries(state.id2traces)),
+        trainingSet.filter((_x, idx) => !bootstrapped.has(idx)),
+        { maxFewShotExamples, maxLabeledExamples }
+      )
+      return Promise.resolve({ prompts: promptsOf(student) })
+    },
+    id: "compile",
+    inputSchema: bootstrapStateSchema,
+    outputSchema: compiledSchema,
+  })
+
+  const { apply, evaluate, save } = finishingSteps(workflow, {
+    metric,
+    savePrompts: config.savePrompts,
+    trainingSet,
+  })
+
+  /* oxlint-disable promise/prefer-await-to-then, promise/no-return-wrap -- Mastra's workflow builder chains `.then(step)`: these are graph edges, not promise continuations */
+  return createWorkflow({
+    id: `${workflow.id}.bootstrap-few-shot`,
+    inputSchema: z.object({}),
+    outputSchema: optimizerResultSchema,
+  })
+    .then(prepare)
+    .dountil(attempt, ({ inputData }) => Promise.resolve(done(inputData)))
+    .then(compile)
+    .then(save)
+    .then(evaluate)
+    .then(apply)
+    .commit()
+  /* oxlint-enable promise/prefer-await-to-then, promise/no-return-wrap */
 }

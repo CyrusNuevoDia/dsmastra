@@ -23,7 +23,7 @@ import { openai } from "@ai-sdk/openai"
 import { readFile, writeFile } from "node:fs/promises"
 import { createScorer } from "@mastra/core/evals"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
-import { declareStep, gepa, loadPrompts } from "dsmastra"
+import { createGEPAWorkflow, declareStep, loadPrompts } from "dsmastra"
 import { z } from "zod"
 
 // Two declarative steps. A rough instruction is enough — the optimizer
@@ -84,7 +84,8 @@ const trainingSet = [
   },
   {
     inputData: {
-      email: "Subject: CSV export? Is there a way to export the dashboard table?",
+      email:
+        "Subject: CSV export? Is there a way to export the dashboard table?",
     },
     outputData: { category: "how-to", priority: "low", queue: "how-to" },
   },
@@ -112,7 +113,9 @@ const triageAccuracy = createScorer({
       : `Category should be ${run.groundTruth?.category}, got ${run.output?.category}.`
   )
 
-const { score } = await gepa(workflow, {
+// Each optimizer is itself a Mastra workflow: build it once over the target
+// workflow, then run it through Mastra's engine like any other workflow.
+const optimizer = createGEPAWorkflow(workflow, {
   trainingSet,
   maxScorerCalls: 200,
   reflectionModel: openai("gpt-5.6-sol"), // a big model proposes the rewrites
@@ -121,7 +124,12 @@ const { score } = await gepa(workflow, {
     writeFile("prompts.json", JSON.stringify(prompts, null, 2)),
 })
 
-console.log(score, extract.description, triage.description) // the score, then the rewritten instructions
+const optimizerRun = await optimizer.createRun()
+const optimized = await optimizerRun.start({ inputData: {} })
+if (optimized.status === "success") {
+  const { score } = optimized.result
+  console.log(score, extract.description, triage.description) // the score, then the rewritten instructions
+}
 
 // In this script gepa already tuned the steps in place. Later, in a fresh
 // process — e.g. at deploy time — rebuild the workflow from the code above,
@@ -135,17 +143,25 @@ const result = await run.start({
 console.log(result)
 ```
 
-The optimizer tunes the workflow in place — there's nothing to reassign — and returns `{ candidates, score }`: every candidate it tried as a `[prompts, { score }]` pair plus the winner's score. `savePrompts` is required and doubles as checkpointing: GEPA and SIMBA — the search optimizers, below — call it on each new aggregate-score best and once with the final result; the few-shot optimizers call it once. The payload is `{ version: 1, steps: { [stepId]: { description, examples } } }`; keep example inputs and outputs JSON-serializable when the storage format is JSON. `loadPrompts` applies a payload to the workflow's live steps and throws when the saved step IDs don't exactly match, so a stale checkpoint can't be partially applied.
+The optimizer tunes the workflow in place — there's nothing to reassign — and its run result is `{ candidates, score }`: every candidate it tried as a `[prompts, { score }]` pair plus the winner's score. `savePrompts` is required and doubles as checkpointing: GEPA and SIMBA — the search optimizers, below — call it on each new aggregate-score best and once with the final result; the few-shot optimizers call it once. The payload is `{ version: 1, steps: { [stepId]: { description, examples } } }`; keep example inputs and outputs JSON-serializable when the storage format is JSON. `loadPrompts` applies a payload to the workflow's live steps and throws when the saved step IDs don't exactly match, so a stale checkpoint can't be partially applied.
 
 ## Optimizers
 
-All four optimizers — `gepa`, `simba`, `bootstrapFewShot`, `labeledFewShot` — take the same shape of input (a committed workflow, a `trainingSet`, a `scorer`, and `savePrompts`) and return the same `{ candidates, score }`.
+All four optimizer factories — `createGEPAWorkflow`, `createSIMBAWorkflow`, `createBootstrapFewShotWorkflow`, `createLabeledFewShotWorkflow` — take the same shape of input (a committed workflow, a `trainingSet`, a `scorer`, and `savePrompts`) and return a Mastra workflow whose run result is the same `{ candidates, score }`.
+
+### Optimizers are durable workflows
+
+Each factory builds a real Mastra workflow with its own steps — pure phases as computed steps, the optimizer's own LM calls as dedicated steps — so an optimization run is observable and durable exactly the way any Mastra workflow is:
+
+- **Observability.** Every phase is a step with its own span: GEPA's loop runs `reflect → propose → accept` per iteration (the reflection-LM call lives in `propose`), SIMBA's runs `rollout → propose-candidates → score-candidates` (the introspective `offerFeedback` calls live in `propose-candidates`), and BootstrapFewShot runs one teacher `attempt` per iteration. `run.watch(...)` streams them live, and registered on a Mastra instance they land in tracing/Studio.
+- **Durability.** All inter-step state is JSON — candidates cross step boundaries as prompt snapshots, randomness as checkpointed RNG state — so with storage-backed Mastra a run survives the process. The loop optimizers accept a `checkpoint` hook (`checkpoint: ({ iteration }) => boolean | Promise<boolean>`): return true to suspend the run durably, then continue it later — even from a fresh process — with `createRun({ runId })` + `resume()`, without redoing completed iterations.
+- **Composability.** An optimizer workflow is a plain workflow: register it on your Mastra instance, schedule it, or nest it inside a larger pipeline.
 
 ### GEPA
 
 [GEPA](https://github.com/gepa-ai/gepa) — Genetic-Pareto reflective prompt evolution ([paper](https://arxiv.org/abs/2507.19457)) — evaluates the workflow, gives a reflection model the execution traces and scorer feedback, and asks it to propose better instructions. It keeps a Pareto frontier of candidates that perform well on different examples, so a prompt that solves one hard case can remain useful even when another candidate has the better average score.
 
-GEPA requires a non-empty `trainingSet` and exactly one budget:
+GEPA requires a non-empty `trainingSet` and exactly one budget (validated when the factory is called):
 
 - `auto: "light" | "medium" | "heavy"` estimates a budget from the workflow and validation-set sizes.
 - `maxScorerCalls` sets the scorer-run budget directly; an iteration already underway can finish slightly beyond it.
@@ -163,9 +179,9 @@ The implementation follows DSPy's GEPA control flow; [`docs/gepa.md`](docs/gepa.
 
 ### Few-shot bootstrapping
 
-`bootstrapFewShot` and `labeledFewShot` (ports of DSPy's [BootstrapFewShot](https://dspy.ai/api/optimizers/BootstrapFewShot/) and LabeledFewShot) install few-shot examples without touching the instructions. Unlike their DSPy counterparts they score the compiled workflow over the training set (one evaluation pass), so they return the same result shape as GEPA and SIMBA.
+`createBootstrapFewShotWorkflow` and `createLabeledFewShotWorkflow` (ports of DSPy's [BootstrapFewShot](https://dspy.ai/api/optimizers/BootstrapFewShot/) and LabeledFewShot) install few-shot examples without touching the instructions. Unlike their DSPy counterparts they score the compiled workflow over the training set (one evaluation pass), so they return the same result shape as GEPA and SIMBA.
 
-`labeledFewShot` installs labeled examples directly. `bootstrapFewShot` runs a `teacher` workflow (or the student itself) over the training set — `teacherSettings` can override the teacher's model or temperature either way — installs the per-step traces of passing rollouts as demos, and backfills each step's remaining slots with labeled examples up to `maxLabeledExamples`. A rollout passes when the objective scorer scores it above zero, or at or above `scoreThreshold` when set. An optional `gate: { scorer, threshold? }` — a Mastra `type: "trajectory"` scorer that sees each teacher rollout as a Trajectory in `run.output`, one entry per engine-executed step — decides instead which rollouts qualify; the TSDoc on `gate` describes the Trajectory shape in detail.
+LabeledFewShot installs labeled examples directly. BootstrapFewShot runs a `teacher` workflow (or the student itself) over the training set — `teacherSettings` can override the teacher's model or temperature either way — installs the per-step traces of passing rollouts as demos, and backfills each step's remaining slots with labeled examples up to `maxLabeledExamples`. A rollout passes when the objective scorer scores it above zero, or at or above `scoreThreshold` when set. An optional `gate: { scorer, threshold? }` — a Mastra `type: "trajectory"` scorer that sees each teacher rollout as a Trajectory in `run.output`, one entry per engine-executed step — decides instead which rollouts qualify; the TSDoc on `gate` describes the Trajectory shape in detail.
 
 ## Scorers
 

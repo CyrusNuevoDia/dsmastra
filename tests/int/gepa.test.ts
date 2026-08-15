@@ -4,9 +4,8 @@ import { createScorer } from "@mastra/core/evals"
 import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { declareStep, gepa } from "@/index"
-import type { Example } from "@/index"
-
+import { createGEPAWorkflow, declareStep } from "../../src/index"
+import type { Example } from "../../src/index"
 import { model } from "../_helpers"
 
 const trainingSet: Example[] = [1, 2, 3, 5, 8, 13].map((x) => ({
@@ -53,7 +52,7 @@ test(
           : `Wrong: for x=${input.x} the answer should be y=${gold.y}, but the assistant returned y=${prediction?.y}.`
       })
 
-    const { score } = await gepa(workflow, {
+    const optimizer = createGEPAWorkflow(workflow, {
       // Few-shot pre-pass first, then description evolution — one call.
       maxFewShotExamples: 2,
       maxScorerCalls: 60,
@@ -63,6 +62,12 @@ test(
       seed: 0,
       trainingSet,
     })
+    const run = await optimizer.createRun()
+    const result = await run.start({ inputData: {} })
+    if (result.status !== "success") {
+      throw new Error(`GEPA run ended with status ${result.status}`)
+    }
+    const { score } = result.result as { score: number }
 
     // Tuning is in place: the caller's own step reference carries the result.
     const tunedStep = step

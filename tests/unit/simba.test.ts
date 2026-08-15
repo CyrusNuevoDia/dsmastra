@@ -5,25 +5,24 @@ import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
-import type { Fields } from "@/fields"
+import type { Fields } from "../../src/fields"
 import {
   appendAnExample,
   appendARule,
+  createSIMBAWorkflow,
   dropExamples,
   makeBuckets,
   percentile,
-  simba,
   softmaxSample,
   topKPlusBaseline,
-} from "@/optimizers/simba"
-import type { Bucket, Rollout } from "@/optimizers/simba"
-import type { Prompts } from "@/optimizers/utils"
-import type { Example, Program } from "@/program"
-import { createProgram } from "@/program"
-import { createRNG, samplePoisson } from "@/random"
-import { declareStep } from "@/step"
-
-import { fakeScorer } from "./helpers"
+} from "../../src/optimizers/simba"
+import type { Bucket, Rollout } from "../../src/optimizers/simba"
+import type { Prompts } from "../../src/optimizers/utils"
+import type { Example, Program } from "../../src/program"
+import { createProgram } from "../../src/program"
+import { createRNG, samplePoisson } from "../../src/random"
+import { declareStep } from "../../src/step"
+import { fakeScorer, runOptimizer } from "./helpers"
 
 const usage = {
   inputTokens: {
@@ -417,20 +416,22 @@ describe("simba end-to-end", () => {
     )
 
     const saved: Prompts[] = []
-    const result = await simba(workflow, {
-      batchSize: 4,
-      candidates: 2,
-      maxFewShotExamples: 2,
-      maxSteps: 2,
-      promptModel,
-      savePrompts: (prompts) => {
-        saved.push(structuredClone(prompts))
-        return Promise.resolve()
-      },
-      scorer,
-      seed: 0,
-      trainingSet,
-    })
+    const result = await runOptimizer(
+      createSIMBAWorkflow(workflow, {
+        batchSize: 4,
+        candidates: 2,
+        maxFewShotExamples: 2,
+        maxSteps: 2,
+        promptModel,
+        savePrompts: (prompts: Prompts) => {
+          saved.push(structuredClone(prompts))
+          return Promise.resolve()
+        },
+        scorer,
+        seed: 0,
+        trainingSet,
+      })
+    )
 
     expect(result.score).toBe(1)
     // Tuning lands in place: the caller's own step reference carries the
@@ -476,19 +477,21 @@ describe("simba end-to-end", () => {
       { inputData: { text: "pos" }, outputData: { label: "pos" } },
       { inputData: { text: "neg" }, outputData: { label: "neg" } },
     ]
-    const result = await simba(workflow, {
-      batchSize: 2,
-      candidates: 2,
-      maxFewShotExamples: 0,
-      maxSteps: 1,
-      promptModel: deadModel,
-      savePrompts: () => Promise.resolve(),
-      scorer: fakeScorer(() => {
-        throw new Error("scorer down")
-      }),
-      seed: 0,
-      trainingSet,
-    })
+    const result = await runOptimizer(
+      createSIMBAWorkflow(workflow, {
+        batchSize: 2,
+        candidates: 2,
+        maxFewShotExamples: 0,
+        maxSteps: 1,
+        promptModel: deadModel,
+        savePrompts: () => Promise.resolve(),
+        scorer: fakeScorer(() => {
+          throw new Error("scorer down")
+        }),
+        seed: 0,
+        trainingSet,
+      })
+    )
     expect(result.score).toBe(0)
   })
 })

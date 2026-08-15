@@ -1,14 +1,22 @@
 /** Seeded RNG + sampling utilities shared by the optimizers. */
 
-import { at, last } from "@/collections"
+import { at, last } from "./collections"
 
 export type RNG = () => number
 
+/**
+ * A seeded RNG whose entire internal state is the single uint32 `state` —
+ * read it to checkpoint the stream, write it to restore. `createRNG(seed)`
+ * and a restored `state` produce byte-identical sequences, which is what
+ * lets the durable optimizer workflows serialize randomness between steps.
+ */
+export type SerializableRNG = RNG & { state: number }
+
 /** mulberry32 — small seeded PRNG; only the distributions matter for the port. */
-export const createRNG = (seed: number): RNG => {
+export const createRNG = (seed: number): SerializableRNG => {
   /* oxlint-disable no-bitwise -- mulberry32 is bit-twiddling by design */
   let state = seed >>> 0
-  return () => {
+  const rng = () => {
     // oxlint-disable-next-line unicorn/prefer-math-trunc -- `| 0` wraps to 32 bits here, which is the point; Math.trunc would leave the value above 2^31 and break the sequence
     state = (state + 0x6d_2b_79_f5) | 0
     let t = state
@@ -16,7 +24,22 @@ export const createRNG = (seed: number): RNG => {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
     return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296
   }
+  // SAFETY: the defineProperty call right here installs the `state` accessor
+  // the SerializableRNG shape adds on top of the bare function.
+  return Object.defineProperty(rng, "state", {
+    get: () => state,
+    set: (next: number) => {
+      state = next >>> 0
+    },
+  }) as SerializableRNG
   /* oxlint-enable no-bitwise */
+}
+
+/** An RNG resumed from a checkpointed `state` (uint32), mid-stream. */
+export const restoreRNG = (state: number): SerializableRNG => {
+  const rng = createRNG(0)
+  rng.state = state
+  return rng
 }
 
 /** Knuth's Poisson sampler. */

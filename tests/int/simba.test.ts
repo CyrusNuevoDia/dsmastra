@@ -5,7 +5,7 @@ import { createScorer } from "@mastra/core/evals"
 import { createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { declareStep, simba } from "@/index"
+import { createSIMBAWorkflow, declareStep } from "../../src/index"
 
 // A temperature-capable (non-reasoning) model: SIMBA's rollout sampling and
 // the rule strategy both need it.
@@ -107,7 +107,7 @@ test(
     const before = await score()
     expect(before).toBeLessThan(1)
 
-    await simba(wf, {
+    const optimizer = createSIMBAWorkflow(wf, {
       batchSize: trainingSet.length,
       candidates: 3,
       maxFewShotExamples: 2,
@@ -117,6 +117,11 @@ test(
       seed: 0,
       trainingSet,
     })
+    const run = await optimizer.createRun()
+    const result = await run.start({ inputData: {} })
+    if (result.status !== "success") {
+      throw new Error(`SIMBA run ended with status ${result.status}`)
+    }
 
     const after = await score()
     console.log(`SIMBA int test: before=${before}, after=${after}`)
