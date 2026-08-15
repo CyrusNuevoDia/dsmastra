@@ -1,3 +1,4 @@
+import type { Trajectory } from "@mastra/core/evals"
 import type { RequestContext } from "@mastra/core/request-context"
 import type { InferPublicSchema } from "@mastra/core/schema"
 import { createStep } from "@mastra/core/workflows"
@@ -45,6 +46,9 @@ export type RunContext = {
   target?: ScoreTarget
   temperature?: number
   trace?: TraceStep[]
+  /** Every engine-executed step as Mastra's Trajectory (agents, tools, plain
+   * steps included) — written by the engine runner after a successful run. */
+  trajectory?: Trajectory
 }
 
 /** AI SDK call settings supported first-class on a step, forwarded verbatim to generateText. */

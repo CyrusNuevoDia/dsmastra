@@ -24,7 +24,10 @@ import type { RunContext, TraceStep } from "@/step"
 export type BootstrapMetric<TInput = Fields, TOutput = Fields> = (
   gold: Example<TInput, TOutput>,
   prediction: TOutput | null,
-  trace: TraceStep[]
+  trace: TraceStep[],
+  /** The attempt's RunContext after the rollout — carries the engine-derived
+   * `trajectory` when the teacher runs through Mastra's engine. */
+  ctx?: RunContext
 ) => MetricOutput
 
 export type BootstrapOptions<TInput = Fields, TOutput = Fields> = {
@@ -160,21 +163,8 @@ export const bootstrapFewShotProgram = async <
 
   const runTeacherAttempt = async (
     example: Example<TInput, TOutput>,
-    roundIdx: number,
-    trace: TraceStep[]
+    ctx: RunContext
   ): Promise<TOutput | null> => {
-    // Rounds past the first take a fresh rollout at temperature=1.0 to
-    // bypass caches — the rollout id maps onto the seed parameter, exactly
-    // like SIMBA's prepareModelsForResampling.
-    const ctx: RunContext = {
-      model: teacherSettings?.model,
-      temperature: teacherSettings?.temperature,
-      trace,
-    }
-    if (roundIdx > 0) {
-      ctx.seed = roundIdx
-      ctx.temperature = 1
-    }
     // Hide any example equal to the one being bootstrapped, restore after.
     const exampleCache = teacher.steps.map((step) => step.examples)
     for (const step of teacher.steps) {
@@ -230,11 +220,23 @@ export const bootstrapFewShotProgram = async <
     roundIdx: number
   ): Promise<boolean> => {
     const trace: TraceStep[] = []
+    // Rounds past the first take a fresh rollout at temperature=1.0 to
+    // bypass caches — the rollout id maps onto the seed parameter, exactly
+    // like SIMBA's prepareModelsForResampling.
+    const ctx: RunContext = {
+      model: teacherSettings?.model,
+      temperature: teacherSettings?.temperature,
+      trace,
+    }
+    if (roundIdx > 0) {
+      ctx.seed = roundIdx
+      ctx.temperature = 1
+    }
     let success = false
     try {
-      const prediction = await runTeacherAttempt(example, roundIdx, trace)
+      const prediction = await runTeacherAttempt(example, ctx)
       if (metric) {
-        const { score } = await metric(example, prediction, trace)
+        const { score } = await metric(example, prediction, trace, ctx)
         success =
           metricThreshold === undefined ? score > 0 : score >= metricThreshold
       } else {

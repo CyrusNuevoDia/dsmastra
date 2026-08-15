@@ -1,3 +1,4 @@
+import { extractWorkflowTrajectory } from "@mastra/core/evals"
 import { RequestContext } from "@mastra/core/request-context"
 import type { AnyWorkflow, SingleStepEntry, Step } from "@mastra/core/workflows"
 
@@ -166,6 +167,13 @@ export const workflowToProgram = (
           // Trace linkage for the scorer: scores attach to this rollout's
           // trace in Mastra observability when tracing is configured.
           ctx.target = { spanId: result.spanId, traceId: result.traceId }
+          // Every engine-executed step — agents, tools, plain steps, nested
+          // workflows as single entries — via Mastra's own extractor, the same
+          // Trajectory its runEvals hands to trajectory scorers.
+          ctx.trajectory = extractWorkflowTrajectory(
+            result.steps,
+            result.stepExecutionPath
+          )
         }
         // SAFETY: a successful run's `result` was produced by the workflow's
         // final step and validated against its output schema by the engine;
