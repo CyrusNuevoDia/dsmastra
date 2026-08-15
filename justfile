@@ -17,11 +17,10 @@ lint:
 fix:
     bunx ultracite fix
 
-# Typecheck and bundle to dist/. Deps stay external; `@/*` paths get inlined.
+# Typecheck and bundle to dist/ with type declarations. Deps stay external.
 build:
     bunx tsc --noEmit
-    bun build src/index.ts --outdir dist --target node --format esm \
-      --external '@ai-sdk/*' --external '@mastra/*' --external ai --external zod
+    bunx tsdown
 
 # Unit tests, run concurrently.
 test:

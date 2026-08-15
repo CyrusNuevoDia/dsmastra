@@ -5,7 +5,7 @@ import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
-import { declareStep } from "@/step"
+import { declareStep } from "../../src/step"
 
 const usage = {
   inputTokens: {

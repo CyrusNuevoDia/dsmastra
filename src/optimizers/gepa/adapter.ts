@@ -1,8 +1,8 @@
 import { generateText } from "ai"
 import type { LanguageModel } from "ai"
 
-import { at } from "@/collections"
-import type { Fields } from "@/fields"
+import { at } from "../../collections"
+import type { Fields } from "../../fields"
 import type {
   Candidate,
   EvaluationBatch,
@@ -12,16 +12,16 @@ import type {
   ReflectiveExample,
   RNG,
   Trajectory,
-} from "@/optimizers/gepa/engine"
-import type { Example, Program } from "@/program"
+} from "../../optimizers/gepa/engine"
+import type { Example, Program } from "../../program"
 import {
   expectedStructure,
   extractInstructionText,
   renderSideInfo,
   stringifyFields,
-} from "@/prompting"
-import type { MetricOutput, MetricResult } from "@/scorers"
-import type { ScoreTarget } from "@/step"
+} from "../../prompting"
+import type { MetricOutput, MetricResult } from "../../scorers"
+import type { ScoreTarget } from "../../step"
 
 /** A metric result that names the feedback field GEPA's reflection LM reads. */
 export type ScoreWithFeedback = MetricResult & { feedback?: string }

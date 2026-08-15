@@ -1,7 +1,7 @@
-import type { Fields } from "@/fields"
-import type { AnyDeclarativeStep, RunContext } from "@/step"
+import type { Fields } from "./fields"
+import type { AnyDeclarativeStep, RunContext } from "./step"
 
-export type { Example } from "@/step"
+export type { Example } from "./step"
 
 export type ProgramForward<TInput, TOutput> = (
   call: (stepId: string, inputData: Fields) => Promise<Fields>,

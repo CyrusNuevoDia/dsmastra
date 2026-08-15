@@ -1,15 +1,14 @@
 import { expect, test } from "bun:test"
 
-import type { Fields } from "@/fields"
+import type { Fields } from "../../src/fields"
 import {
   bootstrapFewShotProgram,
   labeledFewShotProgram,
-} from "@/optimizers/bootstrap"
-import { gepaProgram } from "@/optimizers/gepa"
-import { createProgram } from "@/program"
-import type { Example, Program } from "@/program"
-import type { AnyDeclarativeStep, RunContext } from "@/step"
-
+} from "../../src/optimizers/bootstrap"
+import { gepaProgram } from "../../src/optimizers/gepa"
+import { createProgram } from "../../src/program"
+import type { Example, Program } from "../../src/program"
+import type { AnyDeclarativeStep, RunContext } from "../../src/step"
 import { fakeStep } from "./helpers"
 import type { Call } from "./helpers"
 

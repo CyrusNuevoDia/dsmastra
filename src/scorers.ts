@@ -2,8 +2,8 @@ import { createScorer } from "@mastra/core/evals"
 import type { MastraScorer, Trajectory } from "@mastra/core/evals"
 import type { AnyWorkflow } from "@mastra/core/workflows"
 
-import type { Fields } from "@/fields"
-import type { Example, ScoreTarget } from "@/step"
+import type { Fields } from "./fields"
+import type { Example, ScoreTarget } from "./step"
 
 // oxlint-disable-next-line typescript/no-explicit-any -- MastraScorer's own defaults collapse `score` to never; `any` is the widest scorer Mastra itself uses (see Mastra's Workflow typing)
 export type AnyScorer = MastraScorer<any, any, any, any>
