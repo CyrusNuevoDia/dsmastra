@@ -121,10 +121,11 @@ const { score } = await gepa(workflow, {
     writeFile("prompts.json", JSON.stringify(prompts, null, 2)),
 })
 
-console.log(score, extract.description, triage.description) // the rewritten instructions
+console.log(score, extract.description, triage.description) // the score, then the rewritten instructions
 
-// Later, in a fresh process — e.g. at deploy time — apply the saved prompts
-// to the same workflow and run it through Mastra as usual.
+// In this script gepa already tuned the steps in place. Later, in a fresh
+// process — e.g. at deploy time — rebuild the workflow from the code above,
+// then loadPrompts is how it catches up to the saved state.
 loadPrompts(workflow, JSON.parse(await readFile("prompts.json", "utf8")))
 
 const run = await workflow.createRun()
@@ -134,7 +135,7 @@ const result = await run.start({
 console.log(result)
 ```
 
-The optimizer tunes the workflow in place — there's nothing to reassign — and returns `{ candidates, score }`: every candidate it tried as a `[prompts, { score }]` pair plus the winner's score. `savePrompts` is required and doubles as checkpointing: GEPA and SIMBA call it on each new aggregate-score best and once with the final result, the few-shot optimizers once. The payload is `{ version: 1, steps: { [stepId]: { description, examples } } }`; keep example inputs and outputs JSON-serializable when the storage format is JSON. `loadPrompts` applies a payload to the workflow's live steps and throws when the saved step IDs don't exactly match, so a stale checkpoint can't be partially applied.
+The optimizer tunes the workflow in place — there's nothing to reassign — and returns `{ candidates, score }`: every candidate it tried as a `[prompts, { score }]` pair plus the winner's score. `savePrompts` is required and doubles as checkpointing: GEPA and SIMBA — the search optimizers, below — call it on each new aggregate-score best and once with the final result; the few-shot optimizers call it once. The payload is `{ version: 1, steps: { [stepId]: { description, examples } } }`; keep example inputs and outputs JSON-serializable when the storage format is JSON. `loadPrompts` applies a payload to the workflow's live steps and throws when the saved step IDs don't exactly match, so a stale checkpoint can't be partially applied.
 
 ## Optimizers
 
@@ -164,7 +165,7 @@ The implementation follows DSPy's GEPA control flow; [`docs/gepa.md`](docs/gepa.
 
 `bootstrapFewShot` and `labeledFewShot` (ports of DSPy's [BootstrapFewShot](https://dspy.ai/api/optimizers/BootstrapFewShot/) and LabeledFewShot) install few-shot examples without touching the instructions. Unlike their DSPy counterparts they score the compiled workflow over the training set (one evaluation pass), so they return the same result shape as GEPA and SIMBA.
 
-`labeledFewShot` installs labeled examples directly. `bootstrapFewShot` runs a `teacher` workflow (or the student itself) over the training set — `teacherSettings` can override the teacher's model or temperature either way — installs the per-step traces of passing rollouts as demos, and backfills each step's remaining slots with labeled examples up to `maxLabeledExamples`. A rollout passes when the objective scorer scores it above zero, or above `scoreThreshold` when set. An optional `gate: { scorer, threshold? }` — a Mastra `type: "trajectory"` scorer that sees each teacher rollout as a Trajectory in `run.output`, one entry per engine-executed step — decides instead which rollouts qualify; the TSDoc on `gate` describes the Trajectory shape in detail.
+`labeledFewShot` installs labeled examples directly. `bootstrapFewShot` runs a `teacher` workflow (or the student itself) over the training set — `teacherSettings` can override the teacher's model or temperature either way — installs the per-step traces of passing rollouts as demos, and backfills each step's remaining slots with labeled examples up to `maxLabeledExamples`. A rollout passes when the objective scorer scores it above zero, or at or above `scoreThreshold` when set. An optional `gate: { scorer, threshold? }` — a Mastra `type: "trajectory"` scorer that sees each teacher rollout as a Trajectory in `run.output`, one entry per engine-executed step — decides instead which rollouts qualify; the TSDoc on `gate` describes the Trajectory shape in detail.
 
 ## Scorers
 
@@ -174,7 +175,7 @@ A `scorer` is required on every optimizer: a Mastra scorer built with `createSco
 
 `declareStep` builds a real Mastra step whose prompt is rendered from three parts: the `description` (the instruction), the current `examples` (few-shot demos), and the live input shaped by the Zod schemas. The description and examples are the step's mutable prompt state — that's all an optimizer is allowed to change; the schemas, model, and call settings are fixed config. Any AI SDK-compatible `LanguageModel` works, and dsmastra reads no provider environment variables itself — authentication belongs to the model provider you supply.
 
-During optimization, every candidate is evaluated by running the workflow through Mastra's own engine (`createRun()` + `start()`), so any native graph works — serial chains, `.parallel()`, `.branch()`, loops, and mixes of declarative and ordinary steps all execute with their real semantics, and optimization runs show up in Mastra observability. Only the `declareStep` steps get tuned; everything else runs untouched. Steps inside a nested workflow are opaque to tuning, and a workflow with no `declareStep` steps is rejected. Each rollout's per-step traces and scorer feedback are what the optimizer reasons over when proposing better prompts, and the winning prompt state is written back onto the live steps.
+During optimization, every candidate is evaluated by running the workflow through Mastra's own engine (`createRun()` + `start()`), so any native graph works — serial chains, `.parallel()`, `.branch()`, loops, and mixes of declarative and ordinary steps all execute with their real semantics, and optimization runs show up in Mastra observability. Only the `declareStep` steps get tuned; everything else runs untouched. Steps inside a nested workflow are opaque to tuning, and a workflow with no `declareStep` steps is rejected.
 
 `declareStep` forwards a `scorers` option to Mastra for live evaluation in production. During optimization rollouts those attached scorers are disabled (`createRun({ disableScorers: true })`) so the objective scorer is the only one billed per rollout — the same guard Mastra's `runEvals` applies.
 
