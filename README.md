@@ -8,26 +8,42 @@ Written in TypeScript on the Vercel AI SDK, following DSPy's optimizer implement
 
 ```sh
 bun add github:CyrusNuevoDia/dsmastra
+# or: npm install github:CyrusNuevoDia/dsmastra
+# or: pnpm add github:CyrusNuevoDia/dsmastra
 ```
 
-The package ships TypeScript source and currently targets Bun projects. It expects `@mastra/core`, `ai`, and `zod` as peers — which you already have in a Mastra project — plus your model provider (e.g. `@ai-sdk/openai`).
+The repo ships a built `dist/`, so any package manager works. It expects `@mastra/core`, `ai`, `zod`, and `typescript` as peers — which you already have in a Mastra project — plus your model provider (e.g. `@ai-sdk/openai`).
 
-## Example: tuning a support-ticket triage step
+## Example: tuning a support-ticket pipeline
 
 Declare steps with `declareStep`, compose them with Mastra's `createWorkflow`, then pass the committed workflow to an optimizer with labeled data and a scorer:
 
 ```ts
 import { openai } from "@ai-sdk/openai"
-import { writeFile } from "node:fs/promises"
+import { readFile, writeFile } from "node:fs/promises"
 import { createScorer } from "@mastra/core/evals"
-import { createWorkflow } from "@mastra/core/workflows"
-import { declareStep, gepa } from "dsmastra"
+import { createStep, createWorkflow } from "@mastra/core/workflows"
+import { declareStep, gepa, loadPrompts } from "dsmastra"
 import { z } from "zod"
+
+// Two declarative steps. A rough instruction is enough — the optimizer
+// rewrites descriptions and installs few-shot examples on both.
+const extract = declareStep({
+  id: "extract",
+  description: "Pull the product, issue, and sentiment out of the email.",
+  inputSchema: z.object({ email: z.string() }),
+  outputSchema: z.object({
+    product: z.string(),
+    issue: z.string(),
+    sentiment: z.enum(["calm", "frustrated", "angry"]),
+  }),
+  model: openai("gpt-5.6-terra"),
+})
 
 const triage = declareStep({
   id: "triage",
-  description: "Categorize the support ticket.", // a rough draft is enough — GEPA rewrites it
-  inputSchema: z.object({ subject: z.string(), body: z.string() }),
+  description: "Categorize the ticket.",
+  inputSchema: extract.outputSchema,
   outputSchema: z.object({
     category: z.enum(["billing", "bug", "how-to", "feature-request"]),
     priority: z.enum(["low", "normal", "urgent"]),
@@ -35,12 +51,25 @@ const triage = declareStep({
   model: openai("gpt-5.6-terra"),
 })
 
+// An ordinary Mastra step — deterministic, never touched by the optimizer.
+const route = createStep({
+  id: "route",
+  inputSchema: triage.outputSchema,
+  outputSchema: triage.outputSchema.extend({ queue: z.string() }),
+  execute: async ({ inputData }) => ({
+    ...inputData,
+    queue: inputData.priority === "urgent" ? "oncall" : inputData.category,
+  }),
+})
+
 const workflow = createWorkflow({
   id: "support-triage",
-  inputSchema: triage.inputSchema,
-  outputSchema: triage.outputSchema,
+  inputSchema: extract.inputSchema,
+  outputSchema: route.outputSchema,
 })
+  .then(extract)
   .then(triage)
+  .then(route)
   .commit()
 
 // Labeled tickets — pulled from your helpdesk, categorized by your team.
@@ -48,23 +77,22 @@ const workflow = createWorkflow({
 const trainingSet = [
   {
     inputData: {
-      subject: "Charged twice this month",
-      body: "My card shows two charges for the Pro plan on the 3rd and the 5th.",
+      email:
+        "Subject: Charged twice. My card shows two charges for the Pro plan this month.",
     },
-    outputData: { category: "billing", priority: "urgent" },
+    outputData: { category: "billing", priority: "urgent", queue: "oncall" },
   },
   {
     inputData: {
-      subject: "Export to CSV?",
-      body: "Is there a way to export the dashboard table to CSV?",
+      email: "Subject: CSV export? Is there a way to export the dashboard table?",
     },
-    outputData: { category: "how-to", priority: "low" },
+    outputData: { category: "how-to", priority: "low", queue: "how-to" },
   },
   // ...more labeled tickets
 ]
 
 // The scorer is the optimization objective. Its reason becomes the feedback
-// GEPA's reflection model reads, so say what was wrong, not just the score.
+// the reflection model reads, so say what was wrong, not just the score.
 const triageAccuracy = createScorer({
   id: "triage-accuracy",
   description: "Category must match; priority is worth half.",
@@ -93,21 +121,24 @@ const { score } = await gepa(workflow, {
     writeFile("prompts.json", JSON.stringify(prompts, null, 2)),
 })
 
-console.log(score, triage.description) // the rewritten instruction
+console.log(score, extract.description, triage.description) // the rewritten instructions
 
-// The workflow is tuned in place — run it through Mastra as usual.
+// Later, in a fresh process — e.g. at deploy time — apply the saved prompts
+// to the same workflow and run it through Mastra as usual.
+loadPrompts(workflow, JSON.parse(await readFile("prompts.json", "utf8")))
+
 const run = await workflow.createRun()
 const result = await run.start({
-  inputData: { subject: "App crashes on login", body: "Since this morning..." },
+  inputData: { email: "Subject: Crash on login. The app dies every time..." },
 })
 console.log(result)
 ```
 
-The optimizer applies the best prompt state to the workflow's live steps and returns `{ candidates, score }`: every candidate it tried as a `[prompts, { score }]` pair plus the winner's score. The workflow itself is the tuned artifact — there's nothing to reassign.
+The optimizer tunes the workflow in place — there's nothing to reassign — and returns `{ candidates, score }`: every candidate it tried as a `[prompts, { score }]` pair plus the winner's score. `savePrompts` is required and doubles as checkpointing: GEPA and SIMBA call it on each new aggregate-score best and once with the final result, the few-shot optimizers once. The payload is `{ version: 1, steps: { [stepId]: { description, examples } } }`; keep example inputs and outputs JSON-serializable when the storage format is JSON. `loadPrompts` applies a payload to the workflow's live steps and throws when the saved step IDs don't exactly match, so a stale checkpoint can't be partially applied.
 
 ## Optimizers
 
-All four optimizers take the same shape of input — a committed workflow, a `trainingSet`, a `scorer`, and `savePrompts` — and return the same `{ candidates: [prompts, { score }][], score }`.
+All four optimizers — `gepa`, `simba`, `bootstrapFewShot`, `labeledFewShot` — take the same shape of input (a committed workflow, a `trainingSet`, a `scorer`, and `savePrompts`) and return the same `{ candidates, score }`.
 
 ### GEPA
 
@@ -119,7 +150,7 @@ GEPA requires a non-empty `trainingSet` and exactly one budget:
 - `maxScorerCalls` sets the scorer-run budget directly; an iteration already underway can finish slightly beyond it.
 - `maxFullEvals` expresses the budget in full passes over the supplied datasets.
 
-`reflectionModel` is the LM that proposes new instructions; it defaults to the first step's model, but prompt rewriting benefits from a stronger model than the one being tuned, so supply one. If your scorer's scale doesn't top out at 1, set `perfectScore` to its actual maximum so GEPA knows when an example can't improve further.
+`reflectionModel` is the LM that proposes new instructions; it defaults to the first step's model, but prompt rewriting benefits from a stronger model than the one being tuned, so supply one. If your scorer's scale doesn't top out at 1, set `perfectScore` to its actual maximum — GEPA skips reflecting on minibatches whose every score reaches it, and with the default of 1 on a 0–5 scorer it would wrongly skip batches that still have headroom.
 
 By default, the training set is also the validation set. Supply `validationSet` when candidate selection should be measured on held-out examples. Set `maxFewShotExamples` above zero only when GEPA should run a few-shot bootstrap before evolving the instructions.
 
@@ -131,32 +162,21 @@ The implementation follows DSPy's GEPA control flow; [`docs/gepa.md`](docs/gepa.
 
 ### Few-shot bootstrapping
 
-`bootstrapFewShot` and `labeledFewShot` (ports of DSPy's [BootstrapFewShot](https://dspy.ai/api/optimizers/BootstrapFewShot/) and LabeledFewShot) install examples from teacher traces or labeled data. Unlike their DSPy counterparts they score the compiled workflow over the training set (one evaluation pass), so they return the same result shape as GEPA and SIMBA. `bootstrapFewShot` runs a `teacher` workflow (or the student itself, optionally with `teacherSettings` overriding its model or temperature) over the training set and installs successful rollouts as demos. An optional `gate: { scorer, threshold? }` — a Mastra `type: "trajectory"` scorer that sees each teacher rollout as a Trajectory in `run.output` — decides which rollouts qualify, while the objective `scorer` still scores the compiled workflow; the `gate` option's docs describe the Trajectory shape.
+`bootstrapFewShot` and `labeledFewShot` (ports of DSPy's [BootstrapFewShot](https://dspy.ai/api/optimizers/BootstrapFewShot/) and LabeledFewShot) install few-shot examples without touching the instructions. Unlike their DSPy counterparts they score the compiled workflow over the training set (one evaluation pass), so they return the same result shape as GEPA and SIMBA.
+
+`labeledFewShot` installs labeled examples directly. `bootstrapFewShot` runs a `teacher` workflow (or the student itself) over the training set — `teacherSettings` can override the teacher's model or temperature either way — installs the per-step traces of passing rollouts as demos, and backfills each step's remaining slots with labeled examples up to `maxLabeledExamples`. A rollout passes when the objective scorer scores it above zero, or above `scoreThreshold` when set. An optional `gate: { scorer, threshold? }` — a Mastra `type: "trajectory"` scorer that sees each teacher rollout as a Trajectory in `run.output`, one entry per engine-executed step — decides instead which rollouts qualify; the TSDoc on `gate` describes the Trajectory shape in detail.
 
 ## Scorers
 
-A `scorer` is required on every optimizer: a Mastra scorer built with `createScorer`, or the registration key of one when the workflow is registered on a Mastra instance (`scorer: "answerQuality"`). Define a scorer once and reuse it everywhere — live evals, experiments, and optimization. The exported `createExactMatchScorer()` covers exact-match scoring across every expected output field. Each evaluation calls `scorer.run()` with the example's `inputData` as `input`, the rollout result as `output`, and the expected `outputData` as `groundTruth` — the same mapping Mastra's own `runEvals` uses — and links the score to the rollout's trace when tracing is configured. A scorer's `generateReason` output becomes GEPA's reflection feedback, giving the model a concrete reason to change the instructions. Scores must be finite numbers, higher is better.
+A `scorer` is required on every optimizer: a Mastra scorer built with `createScorer`, or the registration key of one when the workflow is registered on a Mastra instance (`scorer: "answerQuality"`). Define a scorer once and reuse it everywhere — live evals, experiments, and optimization. The exported `createExactMatchScorer()` covers exact-match scoring across every expected output field. Each evaluation calls `scorer.run()` with the example's `inputData` as `input`, the rollout result as `output`, and the expected `outputData` as `groundTruth` — the same mapping Mastra's own `runEvals` uses — and links the score to the rollout's trace when tracing is configured. A scorer's `generateReason` output becomes the optimizer's feedback, giving the reflection model a concrete reason to change the instructions. Scores must be finite numbers, higher is better.
 
-## Saving and loading prompts
+## How it works
 
-Every optimizer requires `savePrompts`. GEPA calls it when a new aggregate-score best is found and once more with the final result, so the latest persisted value is a usable checkpoint:
+`declareStep` builds a real Mastra step whose prompt is rendered from three parts: the `description` (the instruction), the current `examples` (few-shot demos), and the live input shaped by the Zod schemas. The description and examples are the step's mutable prompt state — that's all an optimizer is allowed to change; the schemas, model, and call settings are fixed config. Any AI SDK-compatible `LanguageModel` works, and dsmastra reads no provider environment variables itself — authentication belongs to the model provider you supply.
 
-```ts
-import { readFile } from "node:fs/promises"
-import { loadPrompts } from "dsmastra"
-
-loadPrompts(workflow, JSON.parse(await readFile("prompts.json", "utf8")))
-```
-
-The payload is `{ version: 1, steps: { [stepId]: { description, examples } } }`. `loadPrompts` applies it to the workflow's live steps and throws when the saved step IDs don't exactly match, preventing a stale checkpoint from being partially applied. Keep example inputs and outputs JSON-serializable when the storage format is JSON.
-
-## Supported workflows
-
-Optimizers accept any native Mastra workflow — serial chains, `.parallel()`, `.branch()`, loops, and mixes of declarative and ordinary steps. Rollouts run through Mastra's own engine (`createRun()` + `start()`), so every graph executes with its real semantics and optimization runs show up in Mastra observability. Only the `declareStep` steps get tuned; everything else runs untouched. Steps inside a nested workflow are opaque to tuning. A workflow with no `declareStep` steps is rejected.
+During optimization, every candidate is evaluated by running the workflow through Mastra's own engine (`createRun()` + `start()`), so any native graph works — serial chains, `.parallel()`, `.branch()`, loops, and mixes of declarative and ordinary steps all execute with their real semantics, and optimization runs show up in Mastra observability. Only the `declareStep` steps get tuned; everything else runs untouched. Steps inside a nested workflow are opaque to tuning, and a workflow with no `declareStep` steps is rejected. Each rollout's per-step traces and scorer feedback are what the optimizer reasons over when proposing better prompts, and the winning prompt state is written back onto the live steps.
 
 `declareStep` forwards a `scorers` option to Mastra for live evaluation in production. During optimization rollouts those attached scorers are disabled (`createRun({ disableScorers: true })`) so the objective scorer is the only one billed per rollout — the same guard Mastra's `runEvals` applies.
-
-Each step uses Zod input and output schemas and any AI SDK-compatible `LanguageModel`. dsmastra reads no provider environment variables itself; authentication belongs to the model provider you supply.
 
 ## Development
 
@@ -168,6 +188,7 @@ just test       # unit tests
 just test-int   # paid integration tests; requires OPENAI_API_KEY in .env
 just check      # formatting, lint, typecheck, and unit tests
 just fmt
+just build      # bundle + type declarations to dist/
 ```
 
 To trace the original optimizer implementations, clone DSPy into `dspy/` — it's gitignored and referenced by the docs, not part of the package.
