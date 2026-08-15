@@ -5,7 +5,6 @@ import type { AnyWorkflow, SingleStepEntry, Step } from "@mastra/core/workflows"
 import { z } from "zod"
 
 import type { Fields } from "../fields"
-import type { Program } from "../program"
 import type { Metric } from "../scorers"
 import type { AnyDeclarativeStep, Example, RunContext } from "../step"
 import { RUN_CONTEXT_KEY } from "../step"
@@ -29,7 +28,7 @@ export type Prompts = {
 export type SavePrompts = (prompts: Prompts) => Promise<unknown>
 
 const isDeclarativeStep = (step: Step): step is Step & AnyDeclarativeStep =>
-  "description" in step && "examples" in step && "clone" in step
+  "description" in step && "examples" in step
 
 const singleEntrySteps = (entry: SingleStepEntry): Step[] =>
   entry.type === "step" ? [entry.step] : []
@@ -65,14 +64,12 @@ export const declarativeSteps = (workflow: AnyWorkflow): AnyDeclarativeStep[] =>
 // Engine rollouts execute the workflow's LIVE steps, so a candidate's prompt
 // state must be installed on them before its rollouts run — and two candidates
 // must never be in flight at once. The gate serializes across holders (one
-// candidate's step array identifies it) while letting one holder's rollouts
+// candidate's Prompts value identifies it) while letting one holder's rollouts
 // run concurrently.
-
-type CandidateSteps = AnyDeclarativeStep[]
 
 type Gate = {
   count: number
-  holder: CandidateSteps | null
+  holder: Prompts | null
   wake: (() => void)[]
 }
 
@@ -80,7 +77,7 @@ const gates = new WeakMap<AnyWorkflow, Gate>()
 
 const acquire = async (
   workflow: AnyWorkflow,
-  holder: CandidateSteps
+  holder: Prompts
 ): Promise<{ fresh: boolean; gate: Gate }> => {
   let gate = gates.get(workflow)
   if (!gate) {
@@ -103,7 +100,7 @@ const releaseGate = (gate: Gate): void => {
   gate.count -= 1
   if (gate.count === 0) {
     // Forget the holder: a candidate mutated between evaluation waves (SIMBA
-    // strategies edit step state in place) must reinstall, not be trusted as
+    // strategies edit a Prompts value in place) must reinstall, not be trusted as
     // already current.
     gate.holder = null
     for (const wake of gate.wake.splice(0)) {
@@ -112,116 +109,109 @@ const releaseGate = (gate: Gate): void => {
   }
 }
 
-/**
- * Wrap a workflow as a Program whose rollouts run through Mastra's engine —
- * any graph shape works, and every run shows up in Mastra observability. Each
- * clone carries its own prompt state (a candidate); `run` installs that state
- * onto the live steps under the gate, starts an engine run with the
- * RunContext smuggled through the request context, and maps a non-success
- * run to a throw (callers score it as a failure).
- */
-export const workflowToProgram = (
-  workflow: AnyWorkflow
-): Program<Fields, Fields> => {
+/** Snapshot a workflow's tuned prompt state as a JSON-safe payload. */
+export const promptsOf = (workflow: AnyWorkflow): Prompts => {
   const liveSteps = declarativeSteps(workflow)
   if (liveSteps.length === 0) {
     throw new Error(
       `Workflow ${workflow.id} has no declareStep steps to optimize`
     )
   }
-  const code = `workflow ${workflow.id}: ${liveSteps
+  return {
+    steps: Object.fromEntries(
+      liveSteps.map((step) => [
+        step.id,
+        {
+          description: step.description,
+          examples: structuredClone(step.examples),
+        },
+      ])
+    ),
+    version: 1,
+  }
+}
+
+export const codeOf = (workflow: AnyWorkflow): string =>
+  `workflow ${workflow.id}: ${declarativeSteps(workflow)
     .map((step) => step.id)
     .join(" -> ")}`
 
-  const make = (steps: AnyDeclarativeStep[]): Program<Fields, Fields> => ({
-    clone: () => make(steps.map((step) => step.clone())),
-    code,
-    run: async (inputData: Fields, ctx?: RunContext): Promise<Fields> => {
-      const { fresh, gate } = await acquire(workflow, steps)
-      try {
-        if (fresh) {
-          const byId = new Map(steps.map((step) => [step.id, step]))
-          for (const live of liveSteps) {
-            const candidate = byId.get(live.id)
-            if (!candidate) {
-              throw new Error(`Candidate program lost step ${live.id}`)
-            }
-            live.description = candidate.description
-            live.examples = structuredClone(candidate.examples)
-          }
-        }
-        // Live-eval scorers attached to steps are disabled for the rollout:
-        // the optimizer scores through its own scorer, and letting both run
-        // would double every evaluation (Mastra's runEvals does the same).
-        const run = await workflow.createRun({ disableScorers: true })
-        const result = await run.start({
-          inputData,
-          requestContext: new RequestContext([[RUN_CONTEXT_KEY, ctx]]),
-        })
-        if (result.status !== "success") {
-          throw result.status === "failed" && result.error instanceof Error
-            ? result.error
-            : new Error(
-                `Workflow ${workflow.id} run ended with status ${result.status}`
-              )
-        }
-        if (ctx) {
-          // Trace linkage for the scorer: scores attach to this rollout's
-          // trace in Mastra observability when tracing is configured.
-          ctx.target = { spanId: result.spanId, traceId: result.traceId }
-          // Every engine-executed step — agents, tools, plain steps, nested
-          // workflows as single entries — via Mastra's own extractor, the same
-          // Trajectory its runEvals hands to trajectory scorers.
-          ctx.trajectory = extractWorkflowTrajectory(
-            result.steps,
-            result.stepExecutionPath
-          )
-        }
-        // SAFETY: a successful run's `result` was produced by the workflow's
-        // final step and validated against its output schema by the engine;
-        // `Fields` is the optimizers' untyped view of that same record.
-        return result.result as Fields
-      } finally {
-        releaseGate(gate)
-      }
-    },
-    steps,
-  })
-
-  return make(liveSteps.map((step) => step.clone()))
-}
-
 /**
- * Write a tuned program's prompt state back onto the workflow's live steps.
- * Mutates in place on purpose: the caller's own step references — and any
- * Mastra instance the workflow is registered with — see the tuned prompts
- * immediately, and the same workflow instance stays re-optimizable.
+ * Run a workflow through Mastra's engine with a candidate's prompts installed
+ * on its live declarative steps. The RunContext is threaded through the
+ * request context, and non-successful runs throw so callers can score them as
+ * failures.
  */
-export const applyProgram = <TWorkflow extends AnyWorkflow>(
-  workflow: TWorkflow,
-  program: Program<Fields, Fields>
-): TWorkflow => {
-  for (const step of declarativeSteps(workflow)) {
-    const tuned = program.steps.find((candidate) => candidate.id === step.id)
-    if (!tuned) {
-      throw new Error(`Tuned program lost step ${step.id}`)
-    }
-    step.description = tuned.description
-    step.examples = structuredClone(tuned.examples)
+export const runWith = async (
+  workflow: AnyWorkflow,
+  prompts: Prompts,
+  inputData: Fields,
+  ctx?: RunContext
+): Promise<Fields> => {
+  const liveSteps = declarativeSteps(workflow)
+  if (liveSteps.length === 0) {
+    throw new Error(
+      `Workflow ${workflow.id} has no declareStep steps to optimize`
+    )
   }
-  return workflow
+  const { fresh, gate } = await acquire(workflow, prompts)
+  try {
+    if (fresh) {
+      for (const live of liveSteps) {
+        const candidate = prompts.steps[live.id]
+        if (!candidate) {
+          throw new Error(`Candidate prompts lost step ${live.id}`)
+        }
+        live.description = candidate.description
+        live.examples = structuredClone(candidate.examples)
+      }
+    }
+    // Live-eval scorers attached to steps are disabled for the rollout:
+    // the optimizer scores through its own scorer, and letting both run
+    // would double every evaluation (Mastra's runEvals does the same).
+    const run = await workflow.createRun({ disableScorers: true })
+    const result = await run.start({
+      inputData,
+      requestContext: new RequestContext([[RUN_CONTEXT_KEY, ctx]]),
+    })
+    if (result.status !== "success") {
+      throw result.status === "failed" && result.error instanceof Error
+        ? result.error
+        : new Error(
+            `Workflow ${workflow.id} run ended with status ${result.status}`
+          )
+    }
+    if (ctx) {
+      // Trace linkage for the scorer: scores attach to this rollout's trace in
+      // Mastra observability when tracing is configured.
+      ctx.target = { spanId: result.spanId, traceId: result.traceId }
+      // Every engine-executed step — agents, tools, plain steps, nested
+      // workflows as single entries — via Mastra's own extractor, the same
+      // Trajectory its runEvals hands to trajectory scorers.
+      ctx.trajectory = extractWorkflowTrajectory(
+        result.steps,
+        result.stepExecutionPath
+      )
+    }
+    // SAFETY: a successful run's `result` was produced by the workflow's
+    // final step and validated against its output schema by the engine;
+    // `Fields` is the optimizers' untyped view of that same record.
+    return result.result as Fields
+  } finally {
+    releaseGate(gate)
+  }
 }
 
 /**
- * Mean metric score of a program over a set of examples, rollouts running
- * concurrently through the program (and so through Mastra's engine for
- * workflow-backed programs). A failed rollout or metric throw scores 0, same
- * as the optimizers' own rollout handling. Deliberate divergence from DSPy,
- * which leaves its few-shot compilers unscored (the evaluation in
- * `BootstrapFewShot._bootstrap` is commented out upstream).
+ * Mean metric score of a candidate over a set of examples, rollouts running
+ * concurrently through Mastra's engine. A failed rollout or metric throw
+ * scores 0, same as the optimizers' own rollout handling. Deliberate
+ * divergence from DSPy, which leaves its few-shot compilers unscored (the
+ * evaluation in `BootstrapFewShot._bootstrap` is commented out upstream).
  */
-export const evaluateProgram = async (
-  program: Program<Fields, Fields>,
+export const evaluateWith = async (
+  workflow: AnyWorkflow,
+  prompts: Prompts,
   examples: readonly Example[],
   metric: Metric
 ): Promise<number> => {
@@ -229,7 +219,12 @@ export const evaluateProgram = async (
     examples.map(async (example) => {
       const ctx: RunContext = {}
       try {
-        const prediction = await program.run(example.inputData, ctx)
+        const prediction = await runWith(
+          workflow,
+          prompts,
+          example.inputData,
+          ctx
+        )
         const { score } = await metric(example, prediction, ctx.target)
         return score
       } catch (error) {
@@ -247,8 +242,7 @@ export const evaluateProgram = async (
 //
 // The optimizer workflows move ALL inter-step state as JSON: candidates cross
 // step boundaries as Prompts snapshots, randomness as checkpointed RNG state.
-// These schemas type that currency on the workflow steps, and
-// programFromPrompts turns a snapshot back into a runnable Program.
+// These schemas type that currency on the workflow steps.
 
 export const fieldsSchema = z.record(z.string(), z.unknown())
 
@@ -277,27 +271,6 @@ export const optimizerResultSchema = z.object({
 export type OptimizerResult = z.infer<typeof optimizerResultSchema>
 
 /**
- * Rebuild a runnable candidate from its JSON snapshot: clone the base program
- * and install the snapshot's descriptions and examples. Inverse of promptsOf,
- * up to the base program's fixed config (models, schemas, settings).
- */
-export const programFromPrompts = (
-  base: Program<Fields, Fields>,
-  prompts: Prompts
-): Program<Fields, Fields> => {
-  const built = base.clone()
-  for (const step of built.steps) {
-    const saved = prompts.steps[step.id]
-    if (!saved) {
-      throw new Error(`Prompts lost step ${step.id}`)
-    }
-    step.description = saved.description
-    step.examples = structuredClone(saved.examples)
-  }
-  return built
-}
-
-/**
  * Pause hook shared by the optimizer workflows: called at the top of every
  * loop iteration with the optimizer's progress; returning true suspends the
  * run (durably, via Mastra's suspend), to be continued later with
@@ -306,20 +279,6 @@ export const programFromPrompts = (
 export type OptimizerCheckpoint = (progress: {
   iteration: number
 }) => boolean | Promise<boolean>
-
-/** Snapshot a program's tuned prompt state as a JSON-safe payload. */
-export const promptsOf = (program: Program<Fields, Fields>): Prompts => ({
-  steps: Object.fromEntries(
-    program.steps.map((step) => [
-      step.id,
-      {
-        description: step.description,
-        examples: structuredClone(step.examples),
-      },
-    ])
-  ),
-  version: 1,
-})
 
 /**
  * Apply saved prompts to a workflow's live steps, in place, and return the
@@ -386,12 +345,9 @@ export const finishingSteps = (
   const evaluate = createStep({
     description: "Score the compiled workflow over the trainingSet",
     execute: async ({ inputData }) => {
-      const compiled = programFromPrompts(
-        workflowToProgram(workflow),
-        inputData.prompts
-      )
-      const score = await evaluateProgram(
-        compiled,
+      const score = await evaluateWith(
+        workflow,
+        inputData.prompts,
         options.trainingSet,
         options.metric
       )

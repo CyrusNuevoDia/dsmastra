@@ -42,7 +42,7 @@ export type ScoreTarget = {
 export type RunContext = {
   model?: LanguageModel
   seed?: number
-  /** Written by the engine runner after a successful run — see workflowToProgram. */
+  /** Written by the engine runner after a successful run. */
   target?: ScoreTarget
   temperature?: number
   trace?: TraceStep[]
@@ -101,7 +101,6 @@ export type DeclarativeStep<
   TInputSchema extends FieldSchema = FieldSchema,
   TOutputSchema extends FieldSchema = FieldSchema,
 > = {
-  clone: () => DeclarativeStep<TStepId, TInputSchema, TOutputSchema>
   description: string
   examples: Example[]
   // oxlint-disable-next-line typescript/method-signature-style -- bivariance is the point; see the doc comment above
@@ -216,19 +215,8 @@ export const declareStep = <
   // Mastra's step stores the schemas re-wrapped as standard-schema objects and
   // types `execute` for in-workflow invocation. Overwriting them restores the
   // library's own view of the step without disturbing what Mastra runs, and
-  // the tuning fields (description, examples, settings, clone) ride alongside.
+  // the tuning fields (description, examples, settings) ride alongside.
   declarative = Object.assign(step, {
-    clone: () =>
-      declareStep({
-        ...declarative.settings,
-        description: declarative.description,
-        examples: declarative.examples,
-        id,
-        inputSchema,
-        model: declarative.model,
-        outputSchema,
-        scorers: declarative.scorers,
-      }),
     description,
     examples: structuredClone(examples ?? []),
     execute: runStep,

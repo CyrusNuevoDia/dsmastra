@@ -4,13 +4,12 @@ import type { RequestContext } from "@mastra/core/request-context"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import type { Fields } from "../../src/fields"
 import {
   autoBudget,
   createGEPAWorkflow,
-  gepaProgram,
+  gepaPrompts,
 } from "../../src/optimizers/gepa"
-import { createProgramAdapter } from "../../src/optimizers/gepa/adapter"
+import { createWorkflowAdapter } from "../../src/optimizers/gepa/adapter"
 import {
   buildMergeSubsample,
   createEpochShuffledSampler,
@@ -27,13 +26,12 @@ import type {
   GEPAAdapter,
   GEPAState,
 } from "../../src/optimizers/gepa/engine"
+import { promptsOf } from "../../src/optimizers/utils"
 import type { Prompts } from "../../src/optimizers/utils"
-import { createProgram } from "../../src/program"
-import type { Example, Program } from "../../src/program"
 import { extractInstructionText } from "../../src/prompting"
-import type { AnyDeclarativeStep, RunContext } from "../../src/step"
+import type { Example, RunContext } from "../../src/step"
 import { RUN_CONTEXT_KEY } from "../../src/step"
-import { fakeScorer, runOptimizer } from "./helpers"
+import { fakeScorer, promptStep, runOptimizer } from "./helpers"
 
 const zero = () => 0
 
@@ -484,12 +482,6 @@ const makeMathStep = (id: string) => {
   const declarative = Object.assign(
     createStep({ execute, id, inputSchema, outputSchema }),
     {
-      clone: () => {
-        const cloned = makeMathStep(id)
-        cloned.description = declarative.description
-        cloned.examples = structuredClone(declarative.examples)
-        return cloned
-      },
       description: "identity",
       examples: [] as Example[],
       execute,
@@ -502,16 +494,21 @@ const makeMathStep = (id: string) => {
   return declarative
 }
 
-const makeMathProgram = (): Program =>
-  createProgram({
-    forward: (call, inputData: Fields) => call("math", inputData),
-    steps: [makeMathStep("math")],
+const makeMathWorkflow = () =>
+  createWorkflow({
+    id: "math",
+    inputSchema: z.object({ x: z.number() }),
+    outputSchema: z.object({ y: z.number() }),
   })
+    .then(makeMathStep("math"))
+    .commit()
 
 test("evaluate never throws per example: failures score failureScore with null output", async () => {
-  const adapter = createProgramAdapter({
+  const workflow = makeMathWorkflow()
+  const adapter = createWorkflowAdapter({
     adapterRNG: zero,
     addFormatFailureAsFeedback: false,
+    basePrompts: promptsOf(workflow),
     failureScore: -1,
     metric: (_gold, prediction) => {
       if (!prediction) {
@@ -519,9 +516,9 @@ test("evaluate never throws per example: failures score failureScore with null o
       }
       return { score: 1 }
     },
-    program: makeMathProgram(),
     reflectionModel: () => Promise.resolve(""),
     warnOnScoreMismatch: true,
+    workflow,
   })
   const batch: Example[] = [
     { inputData: { x: 1 }, outputData: { y: 1 } },
@@ -536,9 +533,14 @@ test("evaluate never throws per example: failures score failureScore with null o
 
 test("student examples survive gepa untouched; candidates stay description-only", async () => {
   const example: Example = { inputData: { x: 5 }, outputData: { y: 10 } }
-  const program = makeMathProgram()
-  ;(program.steps[0] as AnyDeclarativeStep).examples = [example]
-  const result = await gepaProgram(program, examples(3), {
+  const workflow = makeMathWorkflow()
+  const prompts = promptsOf(workflow)
+  promptStep(prompts, "math").examples = [example]
+  const trainingSet: Example[] = Array.from({ length: 3 }, (_, x) => ({
+    inputData: { x },
+    outputData: { y: x },
+  }))
+  const result = await gepaPrompts(workflow, prompts, trainingSet, {
     // The seed eval alone exceeds this, so the loop never runs.
     maxMetricCalls: 1,
     metric: () => ({ score: 0 }),
@@ -546,8 +548,8 @@ test("student examples survive gepa untouched; candidates stay description-only"
   })
   // The candidate is a bare description map, exactly upstream's dict[str, str].
   expect(result.candidates[0]).toEqual({ math: "identity" })
-  // The rebuilt best program still carries the pre-installed examples.
-  expect(result.program.steps[0]?.examples).toEqual([example])
+  // The best prompts still carry the pre-installed examples.
+  expect(promptStep(result.prompts, "math").examples).toEqual([example])
 })
 
 // --- End-to-end toy run ------------------------------------------------------
@@ -557,7 +559,8 @@ test("gepa e2e: budget enforced, best candidate beats or matches the seed", asyn
     inputData: { x: i + 1 },
     outputData: { y: (i + 1) * 2 },
   }))
-  const result = await gepaProgram(makeMathProgram(), trainingSet, {
+  const workflow = makeMathWorkflow()
+  const result = await gepaPrompts(workflow, promptsOf(workflow), trainingSet, {
     maxMetricCalls: 60,
     metric: (gold, prediction) => ({
       score: prediction?.y === gold.outputData.y ? 1 : 0,
@@ -575,20 +578,15 @@ test("gepa e2e: budget enforced, best candidate beats or matches the seed", asyn
     result.validationAggregateScores[result.bestIdx]
   ).toBeGreaterThanOrEqual(result.validationAggregateScores[0] as number)
   expect(result.validationAggregateScores[result.bestIdx]).toBe(1)
-  // The returned program actually carries the improved description.
-  expect(result.program.steps[0]?.description.includes("double")).toBe(true)
+  // The returned prompts actually carry the improved description.
+  expect(
+    promptStep(result.prompts, "math").description.includes("double")
+  ).toBe(true)
 })
 
 // --- Workflow-level gepa ------------------------------------------------------
 
-const mathWorkflow = () =>
-  createWorkflow({
-    id: "math",
-    inputSchema: z.object({ x: z.number() }),
-    outputSchema: z.object({ y: z.number() }),
-  })
-    .then(makeMathStep("math"))
-    .commit()
+const mathWorkflow = makeMathWorkflow
 
 test("autoBudget matches hand-computed values", () => {
   // stepsCount=1, n=6, V=10: N = floor(max(4*log2(6), 9)) = 10

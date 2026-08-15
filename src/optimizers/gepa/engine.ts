@@ -1,9 +1,8 @@
 import { at, get, pop, prop } from "../../collections"
 import type { Fields } from "../../fields"
-import type { Example } from "../../program"
 import { shuffle, weightedChoice, weightedChoiceStrict } from "../../random"
 import type { RNG } from "../../random"
-import type { TraceStep } from "../../step"
+import type { Example, TraceStep } from "../../step"
 
 export type { RNG } from "../../random"
 

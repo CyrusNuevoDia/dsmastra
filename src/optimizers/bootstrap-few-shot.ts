@@ -10,6 +10,7 @@ import {
   harvestTraceExamples,
   installTrainExamples,
   prepareStudentAndTeacher,
+  resetCopy,
   runBootstrapAttempt,
 } from "../optimizers/bootstrap"
 import {
@@ -17,15 +18,13 @@ import {
   exampleSchema,
   finishingSteps,
   optimizerResultSchema,
-  programFromPrompts,
   promptsOf,
   promptsSchema,
-  workflowToProgram,
 } from "../optimizers/utils"
 import type { OptimizerCheckpoint, SavePrompts } from "../optimizers/utils"
-import type { Example } from "../program"
 import { resolveScorer, scorerMetric, trajectoryScorerMetric } from "../scorers"
 import type { ScorerRef } from "../scorers"
+import type { Example } from "../step"
 
 export type BootstrapFewShotConfig = {
   /** Pause hook: called before every teacher attempt; returning true suspends
@@ -129,14 +128,13 @@ export const createBootstrapFewShotWorkflow = (
       "Compile the teacher's prompt state (labeled few-shot install)",
     execute: () => {
       // Validates student/teacher structure and installs the labeled
-      // examples on the teacher — the loop reconstructs the teacher from
-      // this snapshot on every attempt.
+      // examples on the teacher snapshot used by every attempt.
       const prepared = prepareStudentAndTeacher(
-        workflowToProgram(workflow),
+        promptsOf(workflow),
         [...trainingSet],
         {
           maxLabeledExamples,
-          teacher: teacher && workflowToProgram(teacher),
+          teacherPrompts: teacher && promptsOf(teacher),
         }
       )
       return Promise.resolve({
@@ -144,11 +142,11 @@ export const createBootstrapFewShotWorkflow = (
         errorCount: 0,
         exampleIdx: 0,
         id2traces: Object.fromEntries(
-          prepared.student.steps.map((step) => [step.id, []])
+          Object.keys(prepared.student.steps).map((stepId) => [stepId, []])
         ),
         iteration: 0,
         roundIdx: 0,
-        teacherPrompts: promptsOf(prepared.teacher),
+        teacherPrompts: prepared.teacher,
       } satisfies BootstrapState)
     },
     id: "prepare",
@@ -168,10 +166,6 @@ export const createBootstrapFewShotWorkflow = (
       if (!resumeData && (await checkpoint?.({ iteration: state.iteration }))) {
         return await suspend({ iteration: state.iteration })
       }
-      const teacherBase = teacher
-        ? workflowToProgram(teacher)
-        : workflowToProgram(workflow)
-      const builtTeacher = programFromPrompts(teacherBase, state.teacherPrompts)
       const example = at([...trainingSet], state.exampleIdx, "trainingSet")
       const next: BootstrapState = {
         ...state,
@@ -181,7 +175,8 @@ export const createBootstrapFewShotWorkflow = (
       let success = false
       try {
         const result = await runBootstrapAttempt(
-          builtTeacher,
+          teacher ?? workflow,
+          state.teacherPrompts,
           example,
           state.roundIdx,
           {
@@ -229,21 +224,14 @@ export const createBootstrapFewShotWorkflow = (
     execute: ({ inputData }) => {
       const state: BootstrapState = inputData
       const bootstrapped = new Set(state.bootstrapped)
-      const student = installTrainExamples(
+      const prompts = installTrainExamples(
         // A fresh reset copy: base descriptions, no examples.
-        prepareStudentAndTeacher(
-          workflowToProgram(workflow),
-          [...trainingSet],
-          {
-            maxLabeledExamples: 0,
-            teacher: teacher && workflowToProgram(teacher),
-          }
-        ).student,
+        resetCopy(promptsOf(workflow)),
         new Map(Object.entries(state.id2traces)),
         trainingSet.filter((_x, idx) => !bootstrapped.has(idx)),
         { maxFewShotExamples, maxLabeledExamples }
       )
-      return Promise.resolve({ prompts: promptsOf(student) })
+      return Promise.resolve({ prompts })
     },
     id: "compile",
     inputSchema: bootstrapStateSchema,

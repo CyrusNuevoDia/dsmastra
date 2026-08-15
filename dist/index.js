@@ -43,269 +43,6 @@ const get = (map, key, what) => {
 	return value;
 };
 //#endregion
-//#region src/random.ts
-/** Seeded RNG + sampling utilities shared by the optimizers. */
-/** mulberry32 — small seeded PRNG; only the distributions matter for the port. */
-const createRNG = (seed) => {
-	let state = seed >>> 0;
-	const rng = () => {
-		state = state + 1831565813 | 0;
-		let t = state;
-		t = Math.imul(t ^ t >>> 15, t | 1);
-		t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-		return ((t ^ t >>> 14) >>> 0) / 4294967296;
-	};
-	return Object.defineProperty(rng, "state", {
-		get: () => state,
-		set: (next) => {
-			state = next >>> 0;
-		}
-	});
-};
-/** An RNG resumed from a checkpointed `state` (uint32), mid-stream. */
-const restoreRNG = (state) => {
-	const rng = createRNG(0);
-	rng.state = state;
-	return rng;
-};
-/** Knuth's Poisson sampler. */
-const samplePoisson = (rng, lambda) => {
-	if (lambda <= 0) return 0;
-	const limit = Math.exp(-lambda);
-	let k = 0;
-	let p = 1;
-	do {
-		k += 1;
-		p *= rng();
-	} while (p > limit);
-	return k - 1;
-};
-/** In-place Fisher–Yates shuffle. */
-const shuffle = (rng, items) => {
-	for (let i = items.length - 1; i > 0; i -= 1) {
-		const j = Math.floor(rng() * (i + 1));
-		const a = at(items, i, "shuffle");
-		items[i] = at(items, j, "shuffle");
-		items[j] = a;
-	}
-};
-/** Python `random.sample` parity: k items without replacement. */
-const sample = (rng, items, k) => {
-	if (k > items.length) throw new Error("Sample larger than population");
-	const pool = [...items];
-	shuffle(rng, pool);
-	return pool.slice(0, k);
-};
-/**
-* Pick an item with probability proportional to its weight; uniform fallback
-* when the weight sum is not positive or not finite.
-*/
-const weightedChoice = (rng, items, weights) => {
-	const total = weights.reduce((acc, w) => acc + w, 0);
-	if (total <= 0 || !Number.isFinite(total)) return at(items, Math.floor(rng() * items.length), "weightedChoice pool");
-	let r = rng() * total;
-	for (const [idx, weight] of weights.entries()) {
-		r -= weight;
-		if (r <= 0) return at(items, idx, "weightedChoice pool");
-	}
-	return last(items, "weightedChoice pool");
-};
-/**
-* Python `random.choices` parity: throws when the weight total is not
-* positive, exactly like the reference (which aborts the run under
-* raise_on_exception). Use where the Python side passes score weights.
-*/
-const weightedChoiceStrict = (rng, items, weights) => {
-	if (weights.reduce((acc, w) => acc + w, 0) <= 0) throw new Error("Total of weights must be greater than zero");
-	return weightedChoice(rng, items, weights);
-};
-//#endregion
-//#region src/utils.ts
-/** Structural equality via JSON rendering — for JSON-safe values only (the
-* optimizer currency: examples, prompts, fields). Key order matters, which is
-* fine here because compared values come from the same construction sites. */
-const isEqualJSON = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-//#endregion
-//#region src/optimizers/bootstrap.ts
-/** dspy.settings.max_errors default. */
-const DEFAULT_MAX_ERRORS = 10;
-const cloneExample = (example) => ({
-	inputData: structuredClone(example.inputData),
-	outputData: structuredClone(example.outputData)
-});
-const examplesEqual = (a, b) => isEqualJSON(a.inputData, b.inputData) && isEqualJSON(a.outputData, b.outputData);
-/** FNV-1a over the JSON rendering — stands in for dspy's Hasher.hash. */
-const contentHash = (value) => {
-	const text = JSON.stringify(value);
-	let hash = 2166136261;
-	for (let i = 0; i < text.length; i += 1) {
-		hash ^= text.charCodeAt(i);
-		hash = Math.imul(hash, 16777619);
-	}
-	return hash >>> 0;
-};
-/** Reset copy: fresh clone with step examples cleared (dspy reset_copy). */
-const resetCopy = (program) => {
-	const copy = program.clone();
-	for (const step of copy.steps) step.examples = [];
-	return copy;
-};
-/**
-* dspy.teleprompt.vanilla.LabeledFewShot: install k labeled examples as
-* few-shot examples on a reset copy of the student. Each step draws its own
-* sample from the same seed-0 RNG stream; nothing else is shuffled.
-*/
-const labeledFewShotProgram = (student, trainingSet, k = 16) => {
-	const compiled = resetCopy(student);
-	if (trainingSet.length === 0) return compiled;
-	const rng = createRNG(0);
-	for (const step of compiled.steps) step.examples = sample(rng, trainingSet, Math.min(k, trainingSet.length)).map(cloneExample);
-	return compiled;
-};
-/**
-* _prepare_student_and_teacher: reset copy for the student, deep copy for
-* the teacher — then LabeledFewShot over a reset teacher copy when labeled
-* examples are requested (our programs carry no _compiled flag; a provided
-* teacher is treated as uncompiled, see the doc's deviation list). Validates
-* _prepare_predictor_mappings: same structure, matched by position + id.
-*/
-const prepareStudentAndTeacher = (studentProgram, trainingSet, options) => {
-	const { maxLabeledExamples = 16 } = options;
-	const student = resetCopy(studentProgram);
-	let teacher = (options.teacher ?? studentProgram).clone();
-	if (maxLabeledExamples > 0) teacher = labeledFewShotProgram(teacher, trainingSet, maxLabeledExamples);
-	if (student.steps.length !== teacher.steps.length) throw new Error("Student and teacher must have the same number of steps.");
-	for (const [idx, studentStep] of student.steps.entries()) {
-		const teacherStep = teacher.steps[idx];
-		if (studentStep.id !== teacherStep?.id) throw new Error("Student and teacher must have the same program structure.");
-		if (studentStep === teacherStep) throw new Error("Student and teacher must be different objects.");
-	}
-	return {
-		student,
-		teacher
-	};
-};
-/**
-* One teacher attempt over one example: hide any installed example equal to
-* the one being bootstrapped, roll the teacher out with trace capture, and
-* decide acceptance through the metric. Rounds past the first take a fresh
-* rollout at temperature=1.0 to bypass caches — the round index maps onto the
-* seed parameter, exactly like SIMBA's prepareModelsForResampling. Throws
-* when the rollout or the metric throws; the caller owns error counting.
-*/
-const runBootstrapAttempt = async (teacher, example, roundIdx, options) => {
-	const { metric, metricThreshold, teacherSettings } = options;
-	const trace = [];
-	const ctx = {
-		model: teacherSettings?.model,
-		temperature: teacherSettings?.temperature,
-		trace
-	};
-	if (roundIdx > 0) {
-		ctx.seed = roundIdx;
-		ctx.temperature = 1;
-	}
-	const exampleCache = teacher.steps.map((step) => step.examples);
-	for (const step of teacher.steps) step.examples = step.examples.filter((installed) => !examplesEqual(installed, example));
-	let prediction;
-	try {
-		prediction = await teacher.run(example.inputData, ctx);
-	} finally {
-		for (const [idx, step] of teacher.steps.entries()) step.examples = at(exampleCache, idx, "teacher example cache");
-	}
-	if (!metric) return {
-		success: true,
-		trace
-	};
-	const { score } = await metric(example, prediction, trace, ctx);
-	return {
-		success: metricThreshold === void 0 ? score > 0 : score >= metricThreshold,
-		trace
-	};
-};
-/**
-* Fold one accepted attempt's trace into the per-step example pools. Multiple
-* traces for one step in one example: keep ONE, sampled 50/50 from the first
-* N-1 or the last, seeded by example content.
-*/
-const harvestTraceExamples = (id2traces, trace) => {
-	const examplesById = /* @__PURE__ */ new Map();
-	for (const traceStep of trace) {
-		if (!id2traces.has(traceStep.stepId)) continue;
-		const harvested = {
-			inputData: traceStep.inputData,
-			outputData: traceStep.outputData
-		};
-		const list = examplesById.get(traceStep.stepId) ?? [];
-		list.push(harvested);
-		examplesById.set(traceStep.stepId, list);
-	}
-	for (const [stepId, harvested] of examplesById) {
-		let kept = harvested;
-		if (harvested.length > 1) {
-			const rng = createRNG(contentHash(harvested));
-			kept = [rng() < .5 ? at(harvested, Math.floor(rng() * (harvested.length - 1)), "trace examples") : last(harvested, "trace examples")];
-		}
-		id2traces.get(stepId)?.push(...kept);
-	}
-};
-/**
-* _train: bootstrapped examples first, labeled backfill after. The
-* un-bootstrapped pool is seed-0 shuffled, and the Python quirk that
-* rawExamples is REASSIGNED to each step's sample is preserved, so later
-* steps draw from the shrinking pool. Mutates and returns `student`.
-*/
-const installTrainExamples = (student, id2traces, unBootstrapped, options) => {
-	const validation = [...unBootstrapped];
-	shuffle(createRNG(0), validation);
-	const rng = createRNG(0);
-	let rawExamples = validation;
-	for (const step of student.steps) {
-		const harvested = (id2traces.get(step.id) ?? []).slice(0, options.maxFewShotExamples);
-		const sampleSize = Math.max(0, Math.min(options.maxLabeledExamples - harvested.length, rawExamples.length));
-		rawExamples = sample(rng, rawExamples, sampleSize);
-		step.examples = [...harvested, ...rawExamples.map(cloneExample)];
-	}
-	return student;
-};
-/**
-* BootstrapFewShot.compile: run a teacher over the trainingSet, capture the trace
-* of every metric-passing run as bootstrapped examples per step, and fill the
-* remaining slots with raw labeled examples. The durable workflow driver in
-* bootstrap-few-shot.ts runs the same helpers one attempt per loop iteration.
-*/
-const bootstrapFewShotProgram = async (studentProgram, trainingSet, options = {}) => {
-	const { maxErrors = DEFAULT_MAX_ERRORS, maxFewShotExamples = 4, maxLabeledExamples = 16, maxRounds = 1 } = options;
-	const { student, teacher } = prepareStudentAndTeacher(studentProgram, trainingSet, options);
-	const id2traces = new Map(student.steps.map((step) => [step.id, []]));
-	let errorCount = 0;
-	const bootstrapOneExample = async (example, roundIdx) => {
-		let success = false;
-		try {
-			const attempt = await runBootstrapAttempt(teacher, example, roundIdx, options);
-			({success} = attempt);
-			if (success) harvestTraceExamples(id2traces, attempt.trace);
-		} catch (error) {
-			errorCount += 1;
-			if (errorCount >= maxErrors) throw error;
-			console.error(`Failed to run or evaluate example due to ${error}.`);
-		}
-		return success;
-	};
-	const bootstrapped = /* @__PURE__ */ new Set();
-	for (const [exampleIdx, example] of trainingSet.entries()) {
-		if (bootstrapped.size >= maxFewShotExamples) break;
-		for (let roundIdx = 0; roundIdx < maxRounds; roundIdx += 1) if (await bootstrapOneExample(example, roundIdx)) {
-			bootstrapped.add(exampleIdx);
-			break;
-		}
-	}
-	return installTrainExamples(student, id2traces, trainingSet.filter((_x, idx) => !bootstrapped.has(idx)), {
-		maxFewShotExamples,
-		maxLabeledExamples
-	});
-};
-//#endregion
 //#region src/schema.ts
 /**
 * The slice of a JSON-schema property we render. `z.toJSONSchema` hands back the
@@ -370,9 +107,9 @@ const expectedStructure = (schema) => Object.entries(schemaProperties(schema)).m
 const indentContinuations = (text) => ["", ...text.split("\n")].join("\n		");
 const MODULE_SEPARATOR = "-".repeat(80);
 /** Every module's I/O fields and current instructions, DSPy inspect-style. */
-const inspectModules = (program) => {
+const inspectModules = (modules) => {
 	const blocks = [MODULE_SEPARATOR];
-	for (const step of program.steps) blocks.push(`Module ${step.id}`, `\n\tInput Fields:${indentContinuations(fieldDescriptionLines(step.inputSchema))}`, `\tOutput Fields:${indentContinuations(fieldDescriptionLines(step.outputSchema))}`, `\tOriginal Instructions: ${indentContinuations(step.description)}`, MODULE_SEPARATOR);
+	for (const step of modules) blocks.push(`Module ${step.id}`, `\n\tInput Fields:${indentContinuations(fieldDescriptionLines(step.inputSchema))}`, `\tOutput Fields:${indentContinuations(fieldDescriptionLines(step.outputSchema))}`, `\tOriginal Instructions: ${indentContinuations(step.description)}`, MODULE_SEPARATOR);
 	return blocks.map((block) => block.replaceAll(/^\n+|\n+$/gu, "")).join("\n");
 };
 const MAX_HEADER_DEPTH = 6;
@@ -478,16 +215,6 @@ const declareStep = (config) => {
 		scorers
 	});
 	declarative = Object.assign(step, {
-		clone: () => declareStep({
-			...declarative.settings,
-			description: declarative.description,
-			examples: declarative.examples,
-			id,
-			inputSchema,
-			model: declarative.model,
-			outputSchema,
-			scorers: declarative.scorers
-		}),
 		description,
 		examples: structuredClone(examples ?? []),
 		execute: runStep,
@@ -501,7 +228,7 @@ const declareStep = (config) => {
 };
 //#endregion
 //#region src/optimizers/utils.ts
-const isDeclarativeStep = (step) => "description" in step && "examples" in step && "clone" in step;
+const isDeclarativeStep = (step) => "description" in step && "examples" in step;
 const singleEntrySteps = (entry) => entry.type === "step" ? [entry.step] : [];
 /**
 * A workflow's declarative steps in graph order, read from Mastra's step graph.
@@ -550,82 +277,65 @@ const releaseGate = (gate) => {
 		for (const wake of gate.wake.splice(0)) wake();
 	}
 };
-/**
-* Wrap a workflow as a Program whose rollouts run through Mastra's engine —
-* any graph shape works, and every run shows up in Mastra observability. Each
-* clone carries its own prompt state (a candidate); `run` installs that state
-* onto the live steps under the gate, starts an engine run with the
-* RunContext smuggled through the request context, and maps a non-success
-* run to a throw (callers score it as a failure).
-*/
-const workflowToProgram = (workflow) => {
+/** Snapshot a workflow's tuned prompt state as a JSON-safe payload. */
+const promptsOf = (workflow) => {
 	const liveSteps = declarativeSteps(workflow);
 	if (liveSteps.length === 0) throw new Error(`Workflow ${workflow.id} has no declareStep steps to optimize`);
-	const code = `workflow ${workflow.id}: ${liveSteps.map((step) => step.id).join(" -> ")}`;
-	const make = (steps) => ({
-		clone: () => make(steps.map((step) => step.clone())),
-		code,
-		run: async (inputData, ctx) => {
-			const { fresh, gate } = await acquire(workflow, steps);
-			try {
-				if (fresh) {
-					const byId = new Map(steps.map((step) => [step.id, step]));
-					for (const live of liveSteps) {
-						const candidate = byId.get(live.id);
-						if (!candidate) throw new Error(`Candidate program lost step ${live.id}`);
-						live.description = candidate.description;
-						live.examples = structuredClone(candidate.examples);
-					}
-				}
-				const result = await (await workflow.createRun({ disableScorers: true })).start({
-					inputData,
-					requestContext: new RequestContext([[RUN_CONTEXT_KEY, ctx]])
-				});
-				if (result.status !== "success") throw result.status === "failed" && result.error instanceof Error ? result.error : /* @__PURE__ */ new Error(`Workflow ${workflow.id} run ended with status ${result.status}`);
-				if (ctx) {
-					ctx.target = {
-						spanId: result.spanId,
-						traceId: result.traceId
-					};
-					ctx.trajectory = extractWorkflowTrajectory(result.steps, result.stepExecutionPath);
-				}
-				return result.result;
-			} finally {
-				releaseGate(gate);
-			}
-		},
-		steps
-	});
-	return make(liveSteps.map((step) => step.clone()));
+	return {
+		steps: Object.fromEntries(liveSteps.map((step) => [step.id, {
+			description: step.description,
+			examples: structuredClone(step.examples)
+		}])),
+		version: 1
+	};
 };
+const codeOf = (workflow) => `workflow ${workflow.id}: ${declarativeSteps(workflow).map((step) => step.id).join(" -> ")}`;
 /**
-* Write a tuned program's prompt state back onto the workflow's live steps.
-* Mutates in place on purpose: the caller's own step references — and any
-* Mastra instance the workflow is registered with — see the tuned prompts
-* immediately, and the same workflow instance stays re-optimizable.
+* Run a workflow through Mastra's engine with a candidate's prompts installed
+* on its live declarative steps. The RunContext is threaded through the
+* request context, and non-successful runs throw so callers can score them as
+* failures.
 */
-const applyProgram = (workflow, program) => {
-	for (const step of declarativeSteps(workflow)) {
-		const tuned = program.steps.find((candidate) => candidate.id === step.id);
-		if (!tuned) throw new Error(`Tuned program lost step ${step.id}`);
-		step.description = tuned.description;
-		step.examples = structuredClone(tuned.examples);
+const runWith = async (workflow, prompts, inputData, ctx) => {
+	const liveSteps = declarativeSteps(workflow);
+	if (liveSteps.length === 0) throw new Error(`Workflow ${workflow.id} has no declareStep steps to optimize`);
+	const { fresh, gate } = await acquire(workflow, prompts);
+	try {
+		if (fresh) for (const live of liveSteps) {
+			const candidate = prompts.steps[live.id];
+			if (!candidate) throw new Error(`Candidate prompts lost step ${live.id}`);
+			live.description = candidate.description;
+			live.examples = structuredClone(candidate.examples);
+		}
+		const result = await (await workflow.createRun({ disableScorers: true })).start({
+			inputData,
+			requestContext: new RequestContext([[RUN_CONTEXT_KEY, ctx]])
+		});
+		if (result.status !== "success") throw result.status === "failed" && result.error instanceof Error ? result.error : /* @__PURE__ */ new Error(`Workflow ${workflow.id} run ended with status ${result.status}`);
+		if (ctx) {
+			ctx.target = {
+				spanId: result.spanId,
+				traceId: result.traceId
+			};
+			ctx.trajectory = extractWorkflowTrajectory(result.steps, result.stepExecutionPath);
+		}
+		return result.result;
+	} finally {
+		releaseGate(gate);
 	}
-	return workflow;
 };
 /**
-* Mean metric score of a program over a set of examples, rollouts running
-* concurrently through the program (and so through Mastra's engine for
-* workflow-backed programs). A failed rollout or metric throw scores 0, same
-* as the optimizers' own rollout handling. Deliberate divergence from DSPy,
-* which leaves its few-shot compilers unscored (the evaluation in
-* `BootstrapFewShot._bootstrap` is commented out upstream).
+* Mean metric score of a candidate over a set of examples, rollouts running
+* concurrently through Mastra's engine. A failed rollout or metric throw
+* scores 0, same as the optimizers' own rollout handling. Deliberate
+* divergence from DSPy, which leaves its few-shot compilers unscored (the
+* evaluation in `BootstrapFewShot._bootstrap` is commented out upstream).
 */
-const evaluateProgram = async (program, examples, metric) => {
+const evaluateWith = async (workflow, prompts, examples, metric) => {
 	const scores = await Promise.all(examples.map(async (example) => {
 		const ctx = {};
 		try {
-			const { score } = await metric(example, await program.run(example.inputData, ctx), ctx.target);
+			const { score } = await metric(example, await runWith(workflow, prompts, example.inputData, ctx), ctx.target);
 			return score;
 		} catch (error) {
 			console.warn(error);
@@ -651,29 +361,6 @@ const promptsSchema = z.object({
 const optimizerResultSchema = z.object({
 	candidates: z.array(z.tuple([promptsSchema, z.object({ score: z.number() })])),
 	score: z.number()
-});
-/**
-* Rebuild a runnable candidate from its JSON snapshot: clone the base program
-* and install the snapshot's descriptions and examples. Inverse of promptsOf,
-* up to the base program's fixed config (models, schemas, settings).
-*/
-const programFromPrompts = (base, prompts) => {
-	const built = base.clone();
-	for (const step of built.steps) {
-		const saved = prompts.steps[step.id];
-		if (!saved) throw new Error(`Prompts lost step ${step.id}`);
-		step.description = saved.description;
-		step.examples = structuredClone(saved.examples);
-	}
-	return built;
-};
-/** Snapshot a program's tuned prompt state as a JSON-safe payload. */
-const promptsOf = (program) => ({
-	steps: Object.fromEntries(program.steps.map((step) => [step.id, {
-		description: step.description,
-		examples: structuredClone(step.examples)
-	}])),
-	version: 1
 });
 /**
 * Apply saved prompts to a workflow's live steps, in place, and return the
@@ -721,8 +408,7 @@ const finishingSteps = (workflow, options) => {
 	const evaluate = createStep({
 		description: "Score the compiled workflow over the trainingSet",
 		execute: async ({ inputData }) => {
-			const compiled = programFromPrompts(workflowToProgram(workflow), inputData.prompts);
-			const score = await evaluateProgram(compiled, options.trainingSet, options.metric);
+			const score = await evaluateWith(workflow, inputData.prompts, options.trainingSet, options.metric);
 			return {
 				...inputData,
 				score
@@ -751,6 +437,271 @@ const finishingSteps = (workflow, options) => {
 		evaluate,
 		save
 	};
+};
+//#endregion
+//#region src/random.ts
+/** Seeded RNG + sampling utilities shared by the optimizers. */
+/** mulberry32 — small seeded PRNG; only the distributions matter for the port. */
+const createRNG = (seed) => {
+	let state = seed >>> 0;
+	const rng = () => {
+		state = state + 1831565813 | 0;
+		let t = state;
+		t = Math.imul(t ^ t >>> 15, t | 1);
+		t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+		return ((t ^ t >>> 14) >>> 0) / 4294967296;
+	};
+	return Object.defineProperty(rng, "state", {
+		get: () => state,
+		set: (next) => {
+			state = next >>> 0;
+		}
+	});
+};
+/** An RNG resumed from a checkpointed `state` (uint32), mid-stream. */
+const restoreRNG = (state) => {
+	const rng = createRNG(0);
+	rng.state = state;
+	return rng;
+};
+/** Knuth's Poisson sampler. */
+const samplePoisson = (rng, lambda) => {
+	if (lambda <= 0) return 0;
+	const limit = Math.exp(-lambda);
+	let k = 0;
+	let p = 1;
+	do {
+		k += 1;
+		p *= rng();
+	} while (p > limit);
+	return k - 1;
+};
+/** In-place Fisher–Yates shuffle. */
+const shuffle = (rng, items) => {
+	for (let i = items.length - 1; i > 0; i -= 1) {
+		const j = Math.floor(rng() * (i + 1));
+		const a = at(items, i, "shuffle");
+		items[i] = at(items, j, "shuffle");
+		items[j] = a;
+	}
+};
+/** Python `random.sample` parity: k items without replacement. */
+const sample = (rng, items, k) => {
+	if (k > items.length) throw new Error("Sample larger than population");
+	const pool = [...items];
+	shuffle(rng, pool);
+	return pool.slice(0, k);
+};
+/**
+* Pick an item with probability proportional to its weight; uniform fallback
+* when the weight sum is not positive or not finite.
+*/
+const weightedChoice = (rng, items, weights) => {
+	const total = weights.reduce((acc, w) => acc + w, 0);
+	if (total <= 0 || !Number.isFinite(total)) return at(items, Math.floor(rng() * items.length), "weightedChoice pool");
+	let r = rng() * total;
+	for (const [idx, weight] of weights.entries()) {
+		r -= weight;
+		if (r <= 0) return at(items, idx, "weightedChoice pool");
+	}
+	return last(items, "weightedChoice pool");
+};
+/**
+* Python `random.choices` parity: throws when the weight total is not
+* positive, exactly like the reference (which aborts the run under
+* raise_on_exception). Use where the Python side passes score weights.
+*/
+const weightedChoiceStrict = (rng, items, weights) => {
+	if (weights.reduce((acc, w) => acc + w, 0) <= 0) throw new Error("Total of weights must be greater than zero");
+	return weightedChoice(rng, items, weights);
+};
+//#endregion
+//#region src/utils.ts
+/** Structural equality via JSON rendering — for JSON-safe values only (the
+* optimizer currency: examples, prompts, fields). Key order matters, which is
+* fine here because compared values come from the same construction sites. */
+const isEqualJSON = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+//#endregion
+//#region src/optimizers/bootstrap.ts
+/** dspy.settings.max_errors default. */
+const DEFAULT_MAX_ERRORS = 10;
+const cloneExample = (example) => ({
+	inputData: structuredClone(example.inputData),
+	outputData: structuredClone(example.outputData)
+});
+/** FNV-1a over the JSON rendering — stands in for dspy's Hasher.hash. */
+const contentHash = (value) => {
+	const text = JSON.stringify(value);
+	let hash = 2166136261;
+	for (let i = 0; i < text.length; i += 1) {
+		hash ^= text.charCodeAt(i);
+		hash = Math.imul(hash, 16777619);
+	}
+	return hash >>> 0;
+};
+/** Reset copy: fresh snapshot with step examples cleared (dspy reset_copy). */
+const resetCopy = (prompts) => {
+	const copy = structuredClone(prompts);
+	for (const step of Object.values(copy.steps)) step.examples = [];
+	return copy;
+};
+/**
+* dspy.teleprompt.vanilla.LabeledFewShot: install k labeled examples as
+* few-shot examples on a reset copy of the student. Each step draws its own
+* sample from the same seed-0 RNG stream; nothing else is shuffled.
+*/
+const labeledFewShotPrompts = (prompts, trainingSet, k = 16) => {
+	const compiled = resetCopy(prompts);
+	if (trainingSet.length === 0) return compiled;
+	const rng = createRNG(0);
+	for (const step of Object.values(compiled.steps)) step.examples = sample(rng, trainingSet, Math.min(k, trainingSet.length)).map(cloneExample);
+	return compiled;
+};
+/**
+* _prepare_student_and_teacher: reset copy for the student, deep copy for
+* the teacher — then LabeledFewShot over a reset teacher copy when labeled
+* examples are requested (our prompt snapshots carry no _compiled flag; a provided
+* teacher is treated as uncompiled, see the doc's deviation list). Validates
+* _prepare_predictor_mappings: same structure, matched by position + id.
+*/
+const prepareStudentAndTeacher = (studentPrompts, trainingSet, options) => {
+	const { maxLabeledExamples = 16 } = options;
+	const student = resetCopy(studentPrompts);
+	let teacher = structuredClone(options.teacherPrompts ?? studentPrompts);
+	if (maxLabeledExamples > 0) teacher = labeledFewShotPrompts(teacher, trainingSet, maxLabeledExamples);
+	const studentSteps = Object.entries(student.steps);
+	const teacherSteps = Object.entries(teacher.steps);
+	if (studentSteps.length !== teacherSteps.length) throw new Error("Student and teacher must have the same number of steps.");
+	for (const [idx, [studentId, studentStep]] of studentSteps.entries()) {
+		const [teacherId, teacherStep] = at(teacherSteps, idx, "teacher prompt steps");
+		if (studentId !== teacherId) throw new Error("Student and teacher must have the same program structure.");
+		if (studentStep === teacherStep) throw new Error("Student and teacher must be different objects.");
+	}
+	return {
+		student,
+		teacher
+	};
+};
+/**
+* One teacher attempt over one example: hide any installed example equal to
+* the one being bootstrapped, roll the teacher out with trace capture, and
+* decide acceptance through the metric. Rounds past the first take a fresh
+* rollout at temperature=1.0 to bypass caches — the round index maps onto the
+* seed parameter, exactly like SIMBA's prepareModelsForResampling. Throws
+* when the rollout or the metric throws; the caller owns error counting.
+*/
+const runBootstrapAttempt = async (teacherWorkflow, teacherPrompts, example, roundIdx, options) => {
+	const { metric, metricThreshold, teacherSettings } = options;
+	const trace = [];
+	const ctx = {
+		model: teacherSettings?.model,
+		temperature: teacherSettings?.temperature,
+		trace
+	};
+	if (roundIdx > 0) {
+		ctx.seed = roundIdx;
+		ctx.temperature = 1;
+	}
+	const attemptPrompts = structuredClone(teacherPrompts);
+	for (const step of Object.values(attemptPrompts.steps)) step.examples = step.examples.filter((installed) => !isEqualJSON(installed, example));
+	const prediction = await runWith(teacherWorkflow, attemptPrompts, example.inputData, ctx);
+	if (!metric) return {
+		success: true,
+		trace
+	};
+	const { score } = await metric(example, prediction, trace, ctx);
+	return {
+		success: metricThreshold === void 0 ? score > 0 : score >= metricThreshold,
+		trace
+	};
+};
+/**
+* Fold one accepted attempt's trace into the per-step example pools. Multiple
+* traces for one step in one example: keep ONE, sampled 50/50 from the first
+* N-1 or the last, seeded by example content.
+*/
+const harvestTraceExamples = (id2traces, trace) => {
+	const examplesById = /* @__PURE__ */ new Map();
+	for (const traceStep of trace) {
+		if (!id2traces.has(traceStep.stepId)) continue;
+		const harvested = {
+			inputData: traceStep.inputData,
+			outputData: traceStep.outputData
+		};
+		const list = examplesById.get(traceStep.stepId) ?? [];
+		list.push(harvested);
+		examplesById.set(traceStep.stepId, list);
+	}
+	for (const [stepId, harvested] of examplesById) {
+		let kept = harvested;
+		if (harvested.length > 1) {
+			const rng = createRNG(contentHash(harvested));
+			kept = [rng() < .5 ? at(harvested, Math.floor(rng() * (harvested.length - 1)), "trace examples") : last(harvested, "trace examples")];
+		}
+		id2traces.get(stepId)?.push(...kept);
+	}
+};
+/**
+* _train: bootstrapped examples first, labeled backfill after. The
+* un-bootstrapped pool is seed-0 shuffled, and the Python quirk that
+* rawExamples is REASSIGNED to each step's sample is preserved, so later
+* steps draw from the shrinking pool. Returns an updated cloned snapshot.
+*/
+const installTrainExamples = (studentPrompts, id2traces, unBootstrapped, options) => {
+	const student = structuredClone(studentPrompts);
+	const validation = [...unBootstrapped];
+	shuffle(createRNG(0), validation);
+	const rng = createRNG(0);
+	let rawExamples = validation;
+	for (const [stepId, step] of Object.entries(student.steps)) {
+		const harvested = (id2traces.get(stepId) ?? []).slice(0, options.maxFewShotExamples);
+		const sampleSize = Math.max(0, Math.min(options.maxLabeledExamples - harvested.length, rawExamples.length));
+		rawExamples = sample(rng, rawExamples, sampleSize);
+		step.examples = [...harvested, ...rawExamples.map(cloneExample)];
+	}
+	return student;
+};
+/**
+* BootstrapFewShot.compile: run a teacher over the trainingSet, capture the trace
+* of every metric-passing run as bootstrapped examples per step, and fill the
+* remaining slots with raw labeled examples. The durable workflow driver in
+* bootstrap-few-shot.ts runs the same helpers one attempt per loop iteration.
+*/
+const bootstrapFewShotPrompts = async (workflow, prompts, trainingSet, options = {}) => {
+	const { maxErrors = DEFAULT_MAX_ERRORS, maxFewShotExamples = 4, maxLabeledExamples = 16, maxRounds = 1 } = options;
+	const teacherWorkflow = options.teacher?.workflow ?? workflow;
+	const teacherPrompts = options.teacher?.prompts ?? prompts;
+	const { student, teacher } = prepareStudentAndTeacher(prompts, [...trainingSet], {
+		maxLabeledExamples,
+		teacherPrompts
+	});
+	const id2traces = new Map(Object.keys(student.steps).map((stepId) => [stepId, []]));
+	let errorCount = 0;
+	const bootstrapOneExample = async (example, roundIdx) => {
+		let success = false;
+		try {
+			const attempt = await runBootstrapAttempt(teacherWorkflow, teacher, example, roundIdx, options);
+			({success} = attempt);
+			if (success) harvestTraceExamples(id2traces, attempt.trace);
+		} catch (error) {
+			errorCount += 1;
+			if (errorCount >= maxErrors) throw error;
+			console.error(`Failed to run or evaluate example due to ${error}.`);
+		}
+		return success;
+	};
+	const bootstrapped = /* @__PURE__ */ new Set();
+	for (const [exampleIdx, example] of trainingSet.entries()) {
+		if (bootstrapped.size >= maxFewShotExamples) break;
+		for (let roundIdx = 0; roundIdx < maxRounds; roundIdx += 1) if (await bootstrapOneExample(example, roundIdx)) {
+			bootstrapped.add(exampleIdx);
+			break;
+		}
+	}
+	return installTrainExamples(student, id2traces, trainingSet.filter((_x, idx) => !bootstrapped.has(idx)), {
+		maxFewShotExamples,
+		maxLabeledExamples
+	});
 };
 //#endregion
 //#region src/scorers.ts
@@ -854,18 +805,18 @@ const createBootstrapFewShotWorkflow = (workflow, config) => {
 	const prepare = createStep({
 		description: "Compile the teacher's prompt state (labeled few-shot install)",
 		execute: () => {
-			const prepared = prepareStudentAndTeacher(workflowToProgram(workflow), [...trainingSet], {
+			const prepared = prepareStudentAndTeacher(promptsOf(workflow), [...trainingSet], {
 				maxLabeledExamples,
-				teacher: teacher && workflowToProgram(teacher)
+				teacherPrompts: teacher && promptsOf(teacher)
 			});
 			return Promise.resolve({
 				bootstrapped: [],
 				errorCount: 0,
 				exampleIdx: 0,
-				id2traces: Object.fromEntries(prepared.student.steps.map((step) => [step.id, []])),
+				id2traces: Object.fromEntries(Object.keys(prepared.student.steps).map((stepId) => [stepId, []])),
 				iteration: 0,
 				roundIdx: 0,
-				teacherPrompts: promptsOf(prepared.teacher)
+				teacherPrompts: prepared.teacher
 			});
 		},
 		id: "prepare",
@@ -878,8 +829,6 @@ const createBootstrapFewShotWorkflow = (workflow, config) => {
 			const state = inputData;
 			if (done(state)) return state;
 			if (!resumeData && await checkpoint?.({ iteration: state.iteration })) return await suspend({ iteration: state.iteration });
-			const teacherBase = teacher ? workflowToProgram(teacher) : workflowToProgram(workflow);
-			const builtTeacher = programFromPrompts(teacherBase, state.teacherPrompts);
 			const example = at([...trainingSet], state.exampleIdx, "trainingSet");
 			const next = {
 				...state,
@@ -888,7 +837,7 @@ const createBootstrapFewShotWorkflow = (workflow, config) => {
 			};
 			let success = false;
 			try {
-				const result = await runBootstrapAttempt(builtTeacher, example, state.roundIdx, {
+				const result = await runBootstrapAttempt(teacher ?? workflow, state.teacherPrompts, example, state.roundIdx, {
 					metric: attemptMetric,
 					...acceptThreshold !== void 0 && { metricThreshold: acceptThreshold },
 					teacherSettings: config.teacherSettings
@@ -925,14 +874,11 @@ const createBootstrapFewShotWorkflow = (workflow, config) => {
 		execute: ({ inputData }) => {
 			const state = inputData;
 			const bootstrapped = new Set(state.bootstrapped);
-			const student = installTrainExamples(prepareStudentAndTeacher(workflowToProgram(workflow), [...trainingSet], {
-				maxLabeledExamples: 0,
-				teacher: teacher && workflowToProgram(teacher)
-			}).student, new Map(Object.entries(state.id2traces)), trainingSet.filter((_x, idx) => !bootstrapped.has(idx)), {
+			const prompts = installTrainExamples(resetCopy(promptsOf(workflow)), new Map(Object.entries(state.id2traces)), trainingSet.filter((_x, idx) => !bootstrapped.has(idx)), {
 				maxFewShotExamples,
 				maxLabeledExamples
 			});
-			return Promise.resolve({ prompts: promptsOf(student) });
+			return Promise.resolve({ prompts });
 		},
 		id: "compile",
 		inputSchema: bootstrapStateSchema,
@@ -979,8 +925,8 @@ Read the inputs carefully and identify the input format and infer detailed task 
 Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well.
 
 Provide the new instructions within \`\`\` blocks.`;
-const createProgramAdapter = (config) => {
-	const { adapterRNG, failureScore, metric, program, reflectionModel } = config;
+const createWorkflowAdapter = (config) => {
+	const { adapterRNG, basePrompts, failureScore, metric, reflectionModel, workflow } = config;
 	let warnedScoreMismatch = false;
 	const proposeText = typeof reflectionModel === "function" ? reflectionModel : async (prompt) => {
 		const { text } = await generateText({
@@ -989,22 +935,23 @@ const createProgramAdapter = (config) => {
 		});
 		return text;
 	};
-	const buildProgram = (candidate) => {
-		const built = program.clone();
-		for (const step of built.steps) {
-			const description = candidate[step.id];
-			if (description !== void 0) step.description = description;
+	const buildPrompts = (candidate) => {
+		const built = structuredClone(basePrompts);
+		for (const [componentName, description] of Object.entries(candidate)) {
+			const step = built.steps[componentName];
+			if (!step) throw new Error(`Candidate prompts lost step ${componentName}`);
+			step.description = description;
 		}
 		return built;
 	};
 	const evaluate = async (batch, candidate, captureTraces) => {
-		const built = buildProgram(candidate);
+		const built = buildPrompts(candidate);
 		const trajectories = await Promise.all(batch.map(async (example) => {
 			const trace = [];
 			const ctx = { trace };
 			let prediction = null;
 			try {
-				prediction = await built.run(example.inputData, ctx);
+				prediction = await runWith(workflow, built, example.inputData, ctx);
 			} catch (error) {
 				console.warn(error);
 			}
@@ -1030,7 +977,7 @@ const createProgramAdapter = (config) => {
 	};
 	const recordForStep = async (trajectory, traceStep, componentName) => {
 		if (traceStep.parseFailure !== void 0) {
-			const step = program.steps.find((s) => s.id === componentName);
+			const step = declarativeSteps(workflow).find((candidate) => candidate.id === componentName);
 			return {
 				Feedback: PARSE_FAILURE_FEEDBACK_PREFIX + expectedStructure(step?.outputSchema),
 				"Generated Outputs": PARSE_FAILURE_OUTPUT(traceStep.parseFailure),
@@ -1087,7 +1034,7 @@ const createProgramAdapter = (config) => {
 		return texts;
 	};
 	return {
-		buildProgram,
+		buildPrompts,
 		evaluate,
 		makeReflectiveDataset,
 		proposeNewTexts
@@ -1584,7 +1531,9 @@ const resolveBudget = (config, stepsCount, trainingSet, validationSetSize) => {
 	if (config.auto === void 0) throw new Error("Exactly one of auto, maxFullEvals, maxMetricCalls must be set");
 	return autoBudget(Math.max(stepsCount, 1), AUTO_CANDIDATES[config.auto], validationSetSize);
 };
-const buildResult = (state, validationSetSize, seed, buildProgram) => {
+/** The description-only Candidate view of a student snapshot. */
+const seedCandidateOf = (studentPrompts) => Object.fromEntries(Object.entries(studentPrompts.steps).map(([id, step]) => [id, step.description]));
+const buildResult = (state, validationSetSize, seed, buildPrompts) => {
 	const validationAggregateScores = state.candidateValidationSubscores.map(aggregateScore);
 	const bestIdx = argmax(validationAggregateScores);
 	return {
@@ -1593,7 +1542,7 @@ const buildResult = (state, validationSetSize, seed, buildProgram) => {
 		discoveryEvalCounts: state.metricCallCountsByDiscovery,
 		parents: state.parentProgramForCandidate,
 		perValidationInstanceBestCandidates: state.programAtParetoFrontValidationSet,
-		program: buildProgram(at(state.programCandidates, bestIdx, "candidates")),
+		prompts: buildPrompts(at(state.programCandidates, bestIdx, "candidates")),
 		seed,
 		totalMetricCalls: state.totalEvalsCount,
 		validationAggregateScores,
@@ -1651,8 +1600,6 @@ const iterationSchema = z.object({
 });
 const reflectedSchema = iterationSchema.extend({ plan: reflectionPlanSchema.nullable() });
 const proposedSchema$1 = reflectedSchema.extend({ newTexts: z.record(z.string(), z.string()).nullable() });
-/** The description-only Candidate view of a student snapshot. */
-const seedCandidateOf = (studentPrompts) => Object.fromEntries(Object.entries(studentPrompts.steps).map(([id, step]) => [id, step.description]));
 /**
 * Genetic-Pareto reflective prompt evolution as a Mastra workflow over the
 * target `workflow`: a pre-pass step optionally bootstraps few-shot examples
@@ -1679,7 +1626,7 @@ const createGEPAWorkflow = (workflow, config) => {
 	const validationSet = tuning.validationSet ?? examples;
 	if (!tuning.validationSet) console.warn("GEPA: no validationSet provided; using the trainingSet for validation.");
 	if (validationSet.length > VALIDATION_SET_SIZE_NOTE) console.warn(`GEPA: validationSet has ${validationSet.length} examples; every accepted candidate costs a full validationSet eval.`);
-	const stepsCount = workflowToProgram(workflow).steps.length;
+	const stepsCount = declarativeSteps(workflow).length;
 	const maxMetricCalls = resolveBudget({
 		...tuning,
 		maxMetricCalls: maxScorerCalls
@@ -1704,20 +1651,19 @@ const createGEPAWorkflow = (workflow, config) => {
 	};
 	const gepaMetric = (gold, prediction, _trace, _stepId, _stepTrace, target) => cachedMetric(gold, prediction, target);
 	const buildAdapter = (studentPrompts, adapterRNGState) => {
-		const student = programFromPrompts(workflowToProgram(workflow), studentPrompts);
 		const adapterRNG = restoreRNG(adapterRNGState);
 		return {
-			adapter: createProgramAdapter({
+			adapter: createWorkflowAdapter({
 				adapterRNG,
 				addFormatFailureAsFeedback: tuning.addFormatFailureAsFeedback ?? false,
+				basePrompts: studentPrompts,
 				failureScore: tuning.failureScore ?? 0,
 				metric: gepaMetric,
-				program: student,
-				reflectionModel: reflectionModel ?? first(student.steps, "workflow steps").model,
-				warnOnScoreMismatch: tuning.warnOnScoreMismatch ?? true
+				reflectionModel: reflectionModel ?? first(declarativeSteps(workflow), "workflow steps").model,
+				warnOnScoreMismatch: tuning.warnOnScoreMismatch ?? true,
+				workflow
 			}),
-			adapterRNG,
-			student
+			adapterRNG
 		};
 	};
 	const engineOptionsFor = (rng, adapter, seedCandidate) => ({
@@ -1726,7 +1672,7 @@ const createGEPAWorkflow = (workflow, config) => {
 		maxMergeInvocations: tuning.maxMergeInvocations ?? 5,
 		maxMetricCalls,
 		onImprovement: async (candidate) => {
-			await savePrompts(promptsOf(adapter.buildProgram(candidate)));
+			await savePrompts(adapter.buildPrompts(candidate));
 		},
 		perfectScore: tuning.perfectScore ?? 1,
 		reflectionMinibatchSize: tuning.reflectionMinibatchSize ?? 3,
@@ -1740,13 +1686,13 @@ const createGEPAWorkflow = (workflow, config) => {
 	const prepass = createStep({
 		description: "Optional BootstrapFewShot pre-pass installing few-shot examples",
 		execute: async () => {
-			let student = workflowToProgram(workflow);
-			if (maxFewShotExamples > 0) student = await bootstrapFewShotProgram(student, examples, {
+			let studentPrompts = promptsOf(workflow);
+			if (maxFewShotExamples > 0) studentPrompts = await bootstrapFewShotPrompts(workflow, studentPrompts, examples, {
 				maxFewShotExamples,
 				maxLabeledExamples: maxLabeledExamples ?? maxFewShotExamples,
 				metric: (gold, prediction) => cachedMetric(gold, prediction)
 			});
-			return { studentPrompts: promptsOf(student) };
+			return { studentPrompts };
 		},
 		id: "prepass",
 		inputSchema: z.object({}),
@@ -1866,18 +1812,13 @@ const createGEPAWorkflow = (workflow, config) => {
 		execute: async ({ inputData }) => {
 			const payload = inputData;
 			const state = deserializeGEPAState(payload.state);
-			const { adapter, student } = buildAdapter(payload.studentPrompts, payload.rng.adapter);
-			const result = buildResult(state, validationSet.length, seed, adapter.buildProgram);
-			await savePrompts(promptsOf(result.program));
-			applyProgram(workflow, result.program);
+			const { adapter } = buildAdapter(payload.studentPrompts, payload.rng.adapter);
+			const result = buildResult(state, validationSet.length, seed, adapter.buildPrompts);
+			await savePrompts(result.prompts);
+			loadPrompts(workflow, result.prompts);
 			return {
 				candidates: result.candidates.map((candidate, idx) => {
-					const snapshot = student.clone();
-					for (const step of snapshot.steps) {
-						const description = candidate[step.id];
-						if (description !== void 0) step.description = description;
-					}
-					return [promptsOf(snapshot), { score: at(result.validationAggregateScores, idx, "aggregate scores") }];
+					return [adapter.buildPrompts(candidate), { score: at(result.validationAggregateScores, idx, "aggregate scores") }];
 				}),
 				score: at(result.validationAggregateScores, result.bestIdx, "aggregate scores")
 			};
@@ -1906,10 +1847,7 @@ const createGEPAWorkflow = (workflow, config) => {
 const createLabeledFewShotWorkflow = (workflow, config) => {
 	const compile = createStep({
 		description: "Install labeled examples as few-shot examples on every step",
-		execute: () => {
-			const compiled = labeledFewShotProgram(workflowToProgram(workflow), [...config.trainingSet], config.maxFewShotExamples ?? 16);
-			return Promise.resolve({ prompts: promptsOf(compiled) });
-		},
+		execute: () => Promise.resolve({ prompts: labeledFewShotPrompts(promptsOf(workflow), [...config.trainingSet], config.maxFewShotExamples ?? 16) }),
 		id: "compile",
 		inputSchema: z.object({}),
 		outputSchema: compiledSchema
@@ -1999,12 +1937,12 @@ const makeBuckets = (rollouts, batchSize) => {
 */
 const dropExamples = (candidate, maxFewShotExamples, rng, poissonRNG) => {
 	const cap = maxFewShotExamples > 0 ? maxFewShotExamples : 3;
-	const examplesCount = Math.max(0, ...candidate.steps.map((step) => step.examples.length));
+	const examplesCount = Math.max(0, ...Object.values(candidate.steps).map((step) => step.examples.length));
 	let toDrop = Math.max(samplePoisson(poissonRNG, examplesCount / cap), examplesCount >= cap ? 1 : 0);
 	toDrop = Math.min(toDrop, examplesCount);
 	const dropIdxs = /* @__PURE__ */ new Set();
 	for (let i = 0; i < toDrop; i += 1) dropIdxs.add(Math.floor(rng() * examplesCount));
-	for (const step of candidate.steps) step.examples = step.examples.filter((_, idx) => !dropIdxs.has(idx));
+	for (const step of Object.values(candidate.steps)) step.examples = step.examples.filter((_, idx) => !dropIdxs.has(idx));
 	return toDrop;
 };
 const appendAnExample = (bucket, candidate, opts) => {
@@ -2027,7 +1965,7 @@ const appendAnExample = (bucket, candidate, opts) => {
 	}
 	let added = 0;
 	for (const [stepId, example] of idToExample) {
-		const step = candidate.steps.find((s) => s.id === stepId);
+		const step = candidate.steps[stepId];
 		if (!step) continue;
 		step.examples.push(example);
 		added += 1;
@@ -2091,7 +2029,7 @@ const BLANKED_CONTRAST = {
 	score: "N/A",
 	trace: []
 };
-const appendARule = async (bucket, candidate, opts) => {
+const appendARule = async (workflow, bucket, candidate, opts) => {
 	const good = first(bucket.rollouts, "bucket rollouts");
 	const bad = last(bucket.rollouts, "bucket rollouts");
 	if (good.score <= opts.p10 || bad.score >= opts.p90) {
@@ -2121,31 +2059,44 @@ const appendARule = async (bucket, candidate, opts) => {
 		};
 	}
 	const { example } = good;
-	const result = await offerFeedback(opts.promptModel, candidate.steps.map((step) => step.id), {
+	const modules = declarativeSteps(workflow).map((step) => {
+		const prompt = candidate.steps[step.id];
+		if (!prompt) throw new Error(`Candidate prompts lost step ${step.id}`);
+		return {
+			description: prompt.description,
+			id: step.id,
+			inputSchema: step.inputSchema,
+			outputSchema: step.outputSchema
+		};
+	});
+	const moduleNames = modules.map((module) => module.id);
+	const result = await offerFeedback(opts.promptModel, moduleNames, {
 		better_program_outputs: goodView.prediction ?? {},
 		better_program_trajectory: toTrajectory(goodView.trace),
 		better_reward_info: goodView.outputMetadata,
 		better_reward_value: goodView.score,
-		module_names: candidate.steps.map((step) => step.id),
-		modules_defn: inspectModules(candidate),
+		module_names: moduleNames,
+		modules_defn: inspectModules(modules),
 		oracle_metadata: example.outputData,
-		program_code: candidate.code,
+		program_code: codeOf(workflow),
 		program_inputs: example.inputData,
 		worse_program_outputs: badView.prediction ?? {},
 		worse_program_trajectory: toTrajectory(badView.trace),
 		worse_reward_info: badView.outputMetadata,
 		worse_reward_value: badView.score
 	});
-	for (const step of candidate.steps) {
-		const advice = result.moduleAdvice[step.id];
+	for (const module of modules) {
+		const advice = result.moduleAdvice[module.id];
 		if (advice !== void 0) {
-			console.log(`Advice for ${step.id}: ${advice}`);
-			step.description = `${step.description}\n\n${advice}`;
+			console.log(`Advice for ${module.id}: ${advice}`);
+			const prompt = candidate.steps[module.id];
+			if (!prompt) throw new Error(`Candidate prompts lost step ${module.id}`);
+			prompt.description = `${prompt.description}\n\n${advice}`;
 		}
 	}
 	return true;
 };
-const runRollout = async (program, example, metric, ctx) => {
+const runRollout = async (workflow, prompts, example, metric, ctx) => {
 	const trace = [];
 	const runCtx = {
 		...ctx,
@@ -2153,7 +2104,7 @@ const runRollout = async (program, example, metric, ctx) => {
 	};
 	let prediction;
 	try {
-		prediction = await program.run(example.inputData, runCtx);
+		prediction = await runWith(workflow, prompts, example.inputData, runCtx);
 	} catch (error) {
 		console.warn(error);
 	}
@@ -2206,23 +2157,23 @@ const prepareModelsForResampling = (rt, nextRolloutId) => {
 		nextRolloutId: id
 	};
 };
-const sampleBatchRollouts = (rt, rng, programs, avg, batch, models) => {
+const sampleBatchRollouts = (workflow, rt, rng, pool, avg, batch, models) => {
 	const topK = topKPlusBaseline(avg, rt.candidates);
 	const runs = [];
 	for (const modelCtx of models) for (const example of batch) {
 		const srcIdx = softmaxSample(rng, topK, avg, rt.samplingTemperature);
-		const rolloutProgram = at(programs, srcIdx, "programs");
-		runs.push(() => runRollout(rolloutProgram, example, rt.metric, modelCtx));
+		const rolloutPrompts = at(pool, srcIdx, "pool");
+		runs.push(() => runRollout(workflow, rolloutPrompts, example, rt.metric, modelCtx));
 	}
 	return Promise.all(runs.map((run) => run()));
 };
-const generateCandidatesFromBuckets = async (rt, rng, poissonRNG, programs, avg, buckets, percentiles) => {
+const generateCandidatesFromBuckets = async (workflow, rt, rng, poissonRNG, pool, avg, buckets, percentiles) => {
 	const topK = topKPlusBaseline(avg, rt.candidates);
 	const strategyCount = rt.maxFewShotExamples > 0 ? 2 : 1;
 	const generated = [];
 	for (const bucket of buckets) {
 		const srcIdx = softmaxSample(rng, topK, avg, rt.candidateTemperature);
-		const candidate = at(programs, srcIdx, "programs").clone();
+		const candidate = structuredClone(at(pool, srcIdx, "pool"));
 		dropExamples(candidate, rt.maxFewShotExamples, rng, poissonRNG);
 		const strategyIdx = Math.floor(rng() * strategyCount);
 		const useExampleStrategy = rt.maxFewShotExamples > 0 && strategyIdx === 0;
@@ -2231,7 +2182,7 @@ const generateCandidatesFromBuckets = async (rt, rng, poissonRNG, programs, avg,
 				maxFewShotInputLength: rt.maxFewShotInputLength,
 				p10: percentiles.p10
 			});
-			else await appendARule(bucket, candidate, {
+			else await appendARule(workflow, bucket, candidate, {
 				p10: percentiles.p10,
 				p90: percentiles.p90,
 				promptModel: rt.promptModel
@@ -2245,11 +2196,11 @@ const generateCandidatesFromBuckets = async (rt, rng, poissonRNG, programs, avg,
 	}
 	return generated;
 };
-const evaluateOn = async (programsToScore, examples, metric) => {
-	const rollouts = await Promise.all(programsToScore.flatMap((program) => examples.map((example) => runRollout(program, example, metric, {}))));
-	return programsToScore.map((_, idx) => rollouts.slice(idx * examples.length, (idx + 1) * examples.length).map((rollout) => rollout.score));
+const evaluateOn = async (workflow, promptsToScore, examples, metric) => {
+	const rollouts = await Promise.all(promptsToScore.flatMap((prompts) => examples.map((example) => runRollout(workflow, prompts, example, metric, {}))));
+	return promptsToScore.map((_, idx) => rollouts.slice(idx * examples.length, (idx + 1) * examples.length).map((rollout) => rollout.score));
 };
-/** Final selection: candidates+1 programs evenly spaced across the winner
+/** Final selection: candidates+1 prompt sets evenly spaced across the winner
 * timeline, always including the untouched student and the last winner. */
 const finalistIdxs = (winnersCount, candidates) => {
 	const m = winnersCount - 1;
@@ -2329,7 +2280,6 @@ const createSIMBAWorkflow = (workflow, config) => {
 	const seed = config.seed ?? 0;
 	if (trainingSet.length < batchSize) throw new Error(`TrainingSet too small: ${trainingSet.length} < ${batchSize}`);
 	const metric = scorerMetric(resolveScorer(workflow, config.scorer));
-	const base = () => workflowToProgram(workflow);
 	const rt = {
 		batchSize,
 		candidateTemperature: config.candidateTemperature ?? .2,
@@ -2337,7 +2287,7 @@ const createSIMBAWorkflow = (workflow, config) => {
 		maxFewShotExamples: config.maxFewShotExamples ?? 4,
 		maxFewShotInputLength: config.maxFewShotInputLength ?? 1e5,
 		metric,
-		promptModel: config.promptModel ?? first(base().steps, "steps").model,
+		promptModel: config.promptModel ?? first(declarativeSteps(workflow), "steps").model,
 		samplingTemperature: config.samplingTemperature ?? .2,
 		teacherSettings: config.teacherSettings
 	};
@@ -2347,7 +2297,7 @@ const createSIMBAWorkflow = (workflow, config) => {
 		execute: () => {
 			const rng = createRNG(seed);
 			const poissonRNG = createRNG(seed);
-			const baselinePrompts = promptsOf(base());
+			const baselinePrompts = promptsOf(workflow);
 			const dataIdxs = examples.map((_, i) => i);
 			shuffle(rng, dataIdxs);
 			return Promise.resolve({
@@ -2378,12 +2328,11 @@ const createSIMBAWorkflow = (workflow, config) => {
 			if (!resumeData && await checkpoint?.({ iteration: state.step })) return await suspend({ iteration: state.step });
 			const rng = restoreRNG(state.rng.main);
 			const cursor = structuredClone(state.cursor);
-			const programs = state.pool.map((prompts) => programFromPrompts(base(), prompts));
 			console.log(`Starting batch ${state.step + 1} of ${maxSteps}.`);
 			const batch = nextBatch(rng, cursor, examples, batchSize);
 			console.log(`Sampling program trajectories on ${batchSize} examples x ${candidates} samples.`);
 			const resampling = prepareModelsForResampling(rt, state.nextRolloutId);
-			const rollouts = await sampleBatchRollouts(rt, rng, programs, avgOf(state.poolScores), batch, resampling.models);
+			const rollouts = await sampleBatchRollouts(workflow, rt, rng, state.pool, avgOf(state.poolScores), batch, resampling.models);
 			const allScores = rollouts.map((r) => r.score);
 			const baselineScore = mean(allScores);
 			console.log(`Batch ${state.step + 1}: Baseline mini-batch score: ${baselineScore}`);
@@ -2414,14 +2363,13 @@ const createSIMBAWorkflow = (workflow, config) => {
 			const { buckets, p10, p90, ...state } = inputData;
 			const rng = restoreRNG(state.rng.main);
 			const poissonRNG = restoreRNG(state.rng.poisson);
-			const programs = state.pool.map((prompts) => programFromPrompts(base(), prompts));
-			const generated = await generateCandidatesFromBuckets(rt, rng, poissonRNG, programs, avgOf(state.poolScores), buckets, {
+			const generated = await generateCandidatesFromBuckets(workflow, rt, rng, poissonRNG, state.pool, avgOf(state.poolScores), buckets, {
 				p10,
 				p90
 			});
 			return {
 				...state,
-				candidatePrompts: generated.map((candidate) => promptsOf(candidate)),
+				candidatePrompts: generated,
 				rng: {
 					main: rng.state,
 					poisson: poissonRNG.state
@@ -2436,9 +2384,8 @@ const createSIMBAWorkflow = (workflow, config) => {
 		description: "Score the candidates, register them, persist the winner",
 		execute: async ({ inputData }) => {
 			const { baselineScore, batch, candidatePrompts, ...state } = inputData;
-			const stepCandidates = candidatePrompts.map((prompts) => programFromPrompts(base(), prompts));
-			console.log(`Batch ${state.step + 1}: Evaluating ${stepCandidates.length} programs on ${batchSize} examples.`);
-			const candidateScoreLists = await evaluateOn(stepCandidates, batch, metric);
+			console.log(`Batch ${state.step + 1}: Evaluating ${candidatePrompts.length} programs on ${batchSize} examples.`);
+			const candidateScoreLists = await evaluateOn(workflow, candidatePrompts, batch, metric);
 			const candidateScores = candidateScoreLists.map(mean);
 			console.log(`Scores after ${state.step + 1} batches: ${candidateScores}, Best: ${candidateScores.length ? Math.max(...candidateScores) : "N/A"}`);
 			const winners = [...state.winners];
@@ -2476,7 +2423,7 @@ const createSIMBAWorkflow = (workflow, config) => {
 			const state = inputData;
 			const finalists = finalistIdxs(state.winners.length, candidates).map((i) => at(state.winners, i, "winners"));
 			console.log(`VALIDATION: Evaluating ${finalists.length} programs on the full trainingSet.`);
-			const finalScores = (await evaluateOn(finalists.map((prompts) => programFromPrompts(base(), prompts)), examples, metric)).map(mean);
+			const finalScores = (await evaluateOn(workflow, finalists, examples, metric)).map(mean);
 			const candidateData = finalists.map((prompts, idx) => ({
 				prompts,
 				score: at(finalScores, idx, "final scores")

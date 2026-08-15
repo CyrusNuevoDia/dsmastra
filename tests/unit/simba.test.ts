@@ -5,7 +5,6 @@ import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
-import type { Fields } from "../../src/fields"
 import {
   appendAnExample,
   appendARule,
@@ -17,12 +16,12 @@ import {
   topKPlusBaseline,
 } from "../../src/optimizers/simba"
 import type { Bucket, Rollout } from "../../src/optimizers/simba"
+import { promptsOf } from "../../src/optimizers/utils"
 import type { Prompts } from "../../src/optimizers/utils"
-import type { Example, Program } from "../../src/program"
-import { createProgram } from "../../src/program"
 import { createRNG, samplePoisson } from "../../src/random"
 import { declareStep } from "../../src/step"
-import { fakeScorer, runOptimizer } from "./helpers"
+import type { Example } from "../../src/step"
+import { fakeScorer, promptStep, runOptimizer } from "./helpers"
 
 const usage = {
   inputTokens: {
@@ -95,14 +94,14 @@ const classifyStep = (description: string, model: LanguageModel = deadModel) =>
     outputSchema: z.object({ label: z.enum(["pos", "neg"]) }),
   })
 
-const makeProgram = (
-  description: string,
-  model: LanguageModel = deadModel
-): Program =>
-  createProgram({
-    forward: (call, inputData: Fields) => call("classify", inputData),
-    steps: [classifyStep(description, model)],
+const makeWorkflow = (description: string, model: LanguageModel = deadModel) =>
+  createWorkflow({
+    id: "classify-workflow",
+    inputSchema: z.object({ text: z.string() }),
+    outputSchema: z.object({ label: z.enum(["pos", "neg"]) }),
   })
+    .then(classifyStep(description, model))
+    .commit()
 
 describe("topKPlusBaseline", () => {
   test("takes top k by average, ties toward lower index", () => {
@@ -217,30 +216,37 @@ describe("makeBuckets", () => {
 })
 
 describe("dropExamples", () => {
-  const programWithExamples = (count: number): Program => {
-    const program = makeProgram("classify")
-    for (const step of program.steps) {
-      step.examples = Array.from({ length: count }, (_, i) => ({
-        inputData: { text: `example ${i}` },
-        outputData: { label: "pos" },
-      }))
-    }
-    return program
-  }
+  const promptsWithExamples = (count: number): Prompts => ({
+    steps: {
+      classify: {
+        description: "classify",
+        examples: Array.from({ length: count }, (_, i) => ({
+          inputData: { text: `example ${i}` },
+          outputData: { label: "pos" },
+        })),
+      },
+    },
+    version: 1,
+  })
 
   test("never drops when there are no examples", () => {
-    const program = programWithExamples(0)
-    const dropped = dropExamples(program, 4, createRNG(0), createRNG(0))
+    const candidate = promptsWithExamples(0)
+    const dropped = dropExamples(candidate, 4, createRNG(0), createRNG(0))
     expect(dropped).toBe(0)
   })
 
   test("forces at least one drop at or over the cap, bounded by example count", () => {
     for (let seed = 0; seed < 20; seed += 1) {
-      const program = programWithExamples(4)
-      const dropped = dropExamples(program, 4, createRNG(seed), createRNG(seed))
+      const candidate = promptsWithExamples(4)
+      const dropped = dropExamples(
+        candidate,
+        4,
+        createRNG(seed),
+        createRNG(seed)
+      )
       expect(dropped).toBeGreaterThanOrEqual(1)
       expect(dropped).toBeLessThanOrEqual(4)
-      const remaining = (program.steps[0]?.examples ?? []).length
+      const remaining = promptStep(candidate, "classify").examples.length
       // draws are with replacement, so realized drops can be below `dropped`
       expect(remaining).toBeGreaterThanOrEqual(4 - dropped)
       expect(remaining).toBeLessThan(4)
@@ -248,30 +254,25 @@ describe("dropExamples", () => {
   })
 
   test("applies the same index set to every step", () => {
-    const stepOf = (id: "a" | "b") =>
-      declareStep({
-        description: id,
-        id,
-        inputSchema: z.object({}),
-        model: deadModel,
-        outputSchema: z.object({}),
-      })
-    const a = stepOf("a")
-    const b = stepOf("b")
-    for (const step of [a, b]) {
-      step.examples = Array.from({ length: 6 }, (_, i) => ({
-        inputData: { i },
-        outputData: {},
-      }))
+    const candidate: Prompts = {
+      steps: Object.fromEntries(
+        ["a", "b"].map((id) => [
+          id,
+          {
+            description: id,
+            examples: Array.from({ length: 6 }, (_, i) => ({
+              inputData: { i },
+              outputData: {},
+            })),
+          },
+        ])
+      ),
+      version: 1,
     }
-    const program = createProgram({
-      forward: (call, inputData: Fields) => call("a", inputData),
-      steps: [a, b],
-    })
-    dropExamples(program, 4, createRNG(3), createRNG(3))
-    expect(a.examples.map((e) => e.inputData.i)).toEqual(
-      b.examples.map((e) => e.inputData.i)
-    )
+    dropExamples(candidate, 4, createRNG(3), createRNG(3))
+    expect(
+      promptStep(candidate, "a").examples.map((e) => e.inputData.i)
+    ).toEqual(promptStep(candidate, "b").examples.map((e) => e.inputData.i))
   })
 })
 
@@ -290,27 +291,27 @@ describe("appendAnExample", () => {
   ]
 
   test("skips when the best score is at or below p10", () => {
-    const program = makeProgram("classify")
+    const candidate = promptsOf(makeWorkflow("classify"))
     const bucket = bucketOf([0.1, 0.1])
     ;(bucket.rollouts[0] as Rollout).trace = trace
-    const applied = appendAnExample(bucket, program, {
+    const applied = appendAnExample(bucket, candidate, {
       maxFewShotInputLength: 100,
       p10: 0.1,
     })
     expect(applied).toBe(false)
-    expect(program.steps[0]?.examples).toHaveLength(0)
+    expect(promptStep(candidate, "classify").examples).toHaveLength(0)
   })
 
   test("keeps only the last example per step and truncates long inputData", () => {
-    const program = makeProgram("classify")
+    const candidate = promptsOf(makeWorkflow("classify"))
     const bucket = bucketOf([0.9, 0.1])
     ;(bucket.rollouts[0] as Rollout).trace = structuredClone(trace)
-    const applied = appendAnExample(bucket, program, {
+    const applied = appendAnExample(bucket, candidate, {
       maxFewShotInputLength: 10,
       p10: 0.1,
     })
     expect(applied).toBe(true)
-    const examples = program.steps[0]?.examples ?? []
+    const { examples } = promptStep(candidate, "classify")
     expect(examples).toHaveLength(1)
     // last trace step for the step wins
     expect(examples[0]?.inputData.text).toBe(
@@ -327,27 +328,38 @@ describe("appendARule", () => {
   }
 
   test("skips when good is at or below p10", async () => {
-    const program = makeProgram("classify")
-    const applied = await appendARule(bucketOf([0.1, 0]), program, {
-      p10: 0.1,
-      p90: 0.9,
-      promptModel: deadModel,
-    })
+    const workflow = makeWorkflow("classify")
+    const applied = await appendARule(
+      workflow,
+      bucketOf([0.1, 0]),
+      promptsOf(workflow),
+      {
+        p10: 0.1,
+        p90: 0.9,
+        promptModel: deadModel,
+      }
+    )
     expect(applied).toBe(false)
   })
 
   test("skips when bad is at or above p90", async () => {
-    const program = makeProgram("classify")
-    const applied = await appendARule(bucketOf([1, 0.95]), program, {
-      p10: 0.1,
-      p90: 0.9,
-      promptModel: deadModel,
-    })
+    const workflow = makeWorkflow("classify")
+    const applied = await appendARule(
+      workflow,
+      bucketOf([1, 0.95]),
+      promptsOf(workflow),
+      {
+        p10: 0.1,
+        p90: 0.9,
+        promptModel: deadModel,
+      }
+    )
     expect(applied).toBe(false)
   })
 
   test("appends returned advice to the matching step's description", async () => {
-    const program = makeProgram("classify")
+    const workflow = makeWorkflow("classify")
+    const candidate = promptsOf(workflow)
     const seen: string[] = []
     const promptModel = mockModel((promptText) => {
       seen.push(promptText)
@@ -361,13 +373,13 @@ describe("appendARule", () => {
     })
     const bucket = bucketOf([1, 0])
     ;(bucket.rollouts[0] as Rollout).example = example
-    const applied = await appendARule(bucket, program, {
+    const applied = await appendARule(workflow, bucket, candidate, {
       p10: 0.1,
       p90: 0.9,
       promptModel,
     })
     expect(applied).toBe(true)
-    expect(program.steps[0]?.description).toEndWith(
+    expect(promptStep(candidate, "classify").description).toEndWith(
       "\n\nRULE: answer with the sentiment, never its inverse."
     )
     // verbatim OfferFeedback text reaches the prompt model

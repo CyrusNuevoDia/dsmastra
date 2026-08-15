@@ -1,11 +1,14 @@
 import { expect, test } from "bun:test"
 
 import type { LanguageModelV4CallOptions } from "@ai-sdk/provider"
+import { createWorkflow } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
+import { loadPrompts, promptsOf } from "../../src/optimizers/utils"
 import { declareStep } from "../../src/step"
+import { promptStep } from "./helpers"
 
 const usage = {
   inputTokens: {
@@ -54,7 +57,7 @@ test("declareStep forwards AI SDK call settings to generateText", async () => {
   expect(options.maxOutputTokens).toBe(99)
 })
 
-test("tuned description and examples reach the rendered prompt; clone copies them", async () => {
+test("tuned description and examples reach the rendered prompt; prompt snapshots isolate them", async () => {
   const prompts: string[] = []
   const model = new MockLanguageModelV4({
     doGenerate: (options) => {
@@ -92,12 +95,20 @@ test("tuned description and examples reach the rendered prompt; clone copies the
   expect(prompts[0]).toContain("Tuned: double it.")
   expect(prompts[0]).toContain('{"x":1}')
 
-  // Clones copy the tuned state but stop sharing it.
-  const cloned = step.clone()
-  expect(cloned.description).toBe("Tuned: double it.")
-  expect(cloned.examples).toEqual(step.examples)
-  cloned.description = "Diverged."
-  cloned.examples.pop()
+  const workflow = createWorkflow({
+    id: "double-workflow",
+    inputSchema: z.object({ x: z.number() }),
+    outputSchema: z.object({ y: z.number() }),
+  })
+    .then(step)
+    .commit()
+  const snapshot = promptsOf(workflow)
+  const isolated = structuredClone(snapshot)
+  expect(promptStep(isolated, "double").description).toBe("Tuned: double it.")
+  expect(promptStep(isolated, "double").examples).toEqual(step.examples)
+  promptStep(isolated, "double").description = "Diverged."
+  promptStep(isolated, "double").examples.pop()
+  loadPrompts(workflow, snapshot)
   expect(step.description).toBe("Tuned: double it.")
   expect(step.examples).toHaveLength(1)
 })

@@ -1,6 +1,6 @@
 import { createScorer } from "@mastra/core/evals"
 import type { RequestContext } from "@mastra/core/request-context"
-import { createStep } from "@mastra/core/workflows"
+import { createStep, createWorkflow } from "@mastra/core/workflows"
 import type { AnyWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
@@ -39,10 +39,18 @@ export const fakeScorer = (
 
 const fieldsSchema = z.record(z.string(), z.unknown())
 
+/** Read a named prompt entry while keeping fixture assertions non-optional. */
+export const promptStep = (prompts: Prompts, id: string) => {
+  const step = prompts.steps[id]
+  if (!step) {
+    throw new Error(`Prompts lost step ${id}`)
+  }
+  return step
+}
+
 /**
  * Deterministic fake step: `fn` maps inputData (+ctx) to outputData, calls are
- * logged, clones share the log and behavior but copy examples/description.
- * Built on a real Mastra `createStep` and carrying the declarative prompt state
+ * logged, and built on a real Mastra `createStep` with declarative prompt state
  * alongside, exactly like `declareStep`.
  */
 export const fakeStep = (
@@ -78,12 +86,6 @@ export const fakeStep = (
     outputSchema: fieldsSchema,
   })
   const declarative = Object.assign(step, {
-    clone: () => {
-      const cloned = fakeStep(id, fn, log)
-      cloned.description = declarative.description
-      cloned.examples = structuredClone(declarative.examples)
-      return cloned
-    },
     description: "solve",
     examples: [] as Example[],
     execute,
@@ -93,6 +95,22 @@ export const fakeStep = (
     settings: {},
   })
   return declarative
+}
+
+/** A sequential workflow over fake declarative steps for engine-path tests. */
+export const fakeWorkflow = (
+  first: ReturnType<typeof fakeStep>,
+  second?: ReturnType<typeof fakeStep>
+) => {
+  /* oxlint-disable promise/prefer-await-to-then -- Mastra's workflow builder chains `.then(step)`: these are graph edges, not promise continuations */
+  const workflow = createWorkflow({
+    id: `${first.id}-workflow`,
+    inputSchema: fieldsSchema,
+    outputSchema: fieldsSchema,
+  }).then(first)
+  const built = second ? workflow.then(second) : workflow
+  /* oxlint-enable promise/prefer-await-to-then */
+  return built.commit()
 }
 
 /** Run a factory-built optimizer workflow to completion, rethrowing failures. */

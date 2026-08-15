@@ -1,5 +1,5 @@
-import type { AnyWorkflow } from "@mastra/core/workflows"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
+import type { AnyWorkflow } from "@mastra/core/workflows"
 import { generateText, Output } from "ai"
 import type { LanguageModel } from "ai"
 import { z } from "zod"
@@ -7,21 +7,21 @@ import { z } from "zod"
 import { at, first, last } from "../collections"
 import type { Fields } from "../fields"
 import {
+  codeOf,
+  declarativeSteps,
   exampleSchema,
   fieldsSchema,
   loadPrompts,
   optimizerResultSchema,
-  programFromPrompts,
   promptsOf,
   promptsSchema,
-  workflowToProgram,
+  runWith,
 } from "../optimizers/utils"
 import type {
   OptimizerCheckpoint,
   Prompts,
   SavePrompts,
 } from "../optimizers/utils"
-import type { Example, Program } from "../program"
 import { inspectModules, serializeField } from "../prompting"
 import {
   createRNG,
@@ -33,7 +33,7 @@ import {
 import type { RNG } from "../random"
 import { resolveScorer, scorerMetric } from "../scorers"
 import type { Metric, ScorerRef } from "../scorers"
-import type { RunContext, TraceStep } from "../step"
+import type { Example, RunContext, TraceStep } from "../step"
 
 export type SIMBAConfig = {
   batchSize?: number
@@ -66,8 +66,8 @@ type InternalConfig<TInput = Fields, TOutput = Fields> = {
   maxFewShotInputLength?: number
   maxSteps?: number
   metric: Metric<TInput, TOutput>
-  /** Called with each optimization step's winning program — checkpointing. */
-  onImprovement?: (program: Program<TInput, TOutput>) => Promise<void>
+  /** Called with each optimization step's winning prompts — checkpointing. */
+  onImprovement?: (prompts: Prompts) => Promise<void>
   promptModel?: LanguageModel
   samplingTemperature?: number
   seed?: number
@@ -95,10 +95,10 @@ export type TrialLog = {
   step: number
 }
 
-export type SIMBAProgramResult<TInput, TOutput> = {
-  /** All finalist programs with their full-trainingSet scores, sorted descending. */
-  candidates: { program: Program<TInput, TOutput>; score: number }[]
-  program: Program<TInput, TOutput>
+export type SIMBAPromptsResult = {
+  /** All finalist prompts with their full-trainingSet scores, sorted descending. */
+  candidates: { prompts: Prompts; score: number }[]
+  prompts: Prompts
   score: number
   trialLogs: TrialLog[]
 }
@@ -216,7 +216,7 @@ export const makeBuckets = <TInput, TOutput>(
  * set applies to every step of the candidate.
  */
 export const dropExamples = (
-  candidate: Program<never, unknown>,
+  candidate: Prompts,
   maxFewShotExamples: number,
   rng: () => number,
   poissonRNG: () => number
@@ -224,7 +224,7 @@ export const dropExamples = (
   const cap = maxFewShotExamples > 0 ? maxFewShotExamples : 3
   const examplesCount = Math.max(
     0,
-    ...candidate.steps.map((step) => step.examples.length)
+    ...Object.values(candidate.steps).map((step) => step.examples.length)
   )
   let toDrop = Math.max(
     samplePoisson(poissonRNG, examplesCount / cap),
@@ -235,7 +235,7 @@ export const dropExamples = (
   for (let i = 0; i < toDrop; i += 1) {
     dropIdxs.add(Math.floor(rng() * examplesCount))
   }
-  for (const step of candidate.steps) {
+  for (const step of Object.values(candidate.steps)) {
     step.examples = step.examples.filter((_, idx) => !dropIdxs.has(idx))
   }
   return toDrop
@@ -245,7 +245,7 @@ export const dropExamples = (
 
 export const appendAnExample = <TInput, TOutput>(
   bucket: Bucket<TInput, TOutput>,
-  candidate: Program<TInput, TOutput>,
+  candidate: Prompts,
   opts: { maxFewShotInputLength: number; p10: number }
 ): boolean => {
   const good = first(bucket.rollouts, "bucket rollouts")
@@ -278,7 +278,7 @@ export const appendAnExample = <TInput, TOutput>(
 
   let added = 0
   for (const [stepId, example] of idToExample) {
-    const step = candidate.steps.find((s) => s.id === stepId)
+    const step = candidate.steps[stepId]
     if (!step) {
       continue
     }
@@ -406,8 +406,9 @@ const BLANKED_CONTRAST = {
 } as const satisfies Partial<RolloutContrast>
 
 export const appendARule = async <TInput, TOutput extends Fields>(
+  workflow: AnyWorkflow,
   bucket: Bucket<TInput, TOutput>,
-  candidate: Program<TInput, TOutput>,
+  candidate: Prompts,
   opts: {
     p10: number
     p90: number
@@ -448,31 +449,44 @@ export const appendARule = async <TInput, TOutput extends Fields>(
   }
 
   const { example } = good
-  const result = await offerFeedback(
-    opts.promptModel,
-    candidate.steps.map((step) => step.id),
-    {
-      better_program_outputs: goodView.prediction ?? {},
-      better_program_trajectory: toTrajectory(goodView.trace),
-      better_reward_info: goodView.outputMetadata,
-      better_reward_value: goodView.score,
-      module_names: candidate.steps.map((step) => step.id),
-      modules_defn: inspectModules(candidate),
-      oracle_metadata: example.outputData,
-      program_code: candidate.code,
-      program_inputs: example.inputData,
-      worse_program_outputs: badView.prediction ?? {},
-      worse_program_trajectory: toTrajectory(badView.trace),
-      worse_reward_info: badView.outputMetadata,
-      worse_reward_value: badView.score,
+  const modules = declarativeSteps(workflow).map((step) => {
+    const prompt = candidate.steps[step.id]
+    if (!prompt) {
+      throw new Error(`Candidate prompts lost step ${step.id}`)
     }
-  )
+    return {
+      description: prompt.description,
+      id: step.id,
+      inputSchema: step.inputSchema,
+      outputSchema: step.outputSchema,
+    }
+  })
+  const moduleNames = modules.map((module) => module.id)
+  const result = await offerFeedback(opts.promptModel, moduleNames, {
+    better_program_outputs: goodView.prediction ?? {},
+    better_program_trajectory: toTrajectory(goodView.trace),
+    better_reward_info: goodView.outputMetadata,
+    better_reward_value: goodView.score,
+    module_names: moduleNames,
+    modules_defn: inspectModules(modules),
+    oracle_metadata: example.outputData,
+    program_code: codeOf(workflow),
+    program_inputs: example.inputData,
+    worse_program_outputs: badView.prediction ?? {},
+    worse_program_trajectory: toTrajectory(badView.trace),
+    worse_reward_info: badView.outputMetadata,
+    worse_reward_value: badView.score,
+  })
 
-  for (const step of candidate.steps) {
-    const advice = result.moduleAdvice[step.id]
+  for (const module of modules) {
+    const advice = result.moduleAdvice[module.id]
     if (advice !== undefined) {
-      console.log(`Advice for ${step.id}: ${advice}`)
-      step.description = `${step.description}\n\n${advice}`
+      console.log(`Advice for ${module.id}: ${advice}`)
+      const prompt = candidate.steps[module.id]
+      if (!prompt) {
+        throw new Error(`Candidate prompts lost step ${module.id}`)
+      }
+      prompt.description = `${prompt.description}\n\n${advice}`
     }
   }
   return true
@@ -480,8 +494,9 @@ export const appendARule = async <TInput, TOutput extends Fields>(
 
 // --- Rollouts ---------------------------------------------------------------
 
-const runRollout = async <TInput, TOutput>(
-  program: Program<TInput, TOutput>,
+const runRollout = async <TInput extends Fields, TOutput extends Fields>(
+  workflow: AnyWorkflow,
+  prompts: Prompts,
   example: Example<TInput, TOutput>,
   metric: Metric<TInput, TOutput>,
   ctx: RunContext
@@ -490,7 +505,14 @@ const runRollout = async <TInput, TOutput>(
   const runCtx: RunContext = { ...ctx, trace }
   let prediction: TOutput | undefined
   try {
-    prediction = await program.run(example.inputData, runCtx)
+    // SAFETY: TOutput is the caller's typed view of the workflow output; the
+    // engine validates that output against the workflow's final schema.
+    prediction = (await runWith(
+      workflow,
+      prompts,
+      example.inputData,
+      runCtx
+    )) as TOutput
   } catch (error) {
     console.warn(error)
   }
@@ -517,12 +539,12 @@ const runRollout = async <TInput, TOutput>(
 //
 // One SIMBA batch decomposes into three phases — rollout sampling, candidate
 // generation (the LM-reflection phase), and candidate scoring — shared by the
-// in-memory driver (simbaProgram) and the durable workflow driver
+// in-memory driver (simbaPrompts) and the durable workflow driver
 // (createSIMBAWorkflow). RNG streams thread through explicitly so the durable
 // driver can checkpoint them between phases.
 
 /** The fixed per-run knobs both drivers thread through the phases. */
-type SIMBARuntime<TInput, TOutput> = {
+type SIMBARuntime<TInput extends Fields, TOutput extends Fields> = {
   batchSize: number
   candidates: number
   candidateTemperature: number
@@ -557,9 +579,12 @@ const nextBatch = <TInput, TOutput>(
   return batch
 }
 
-// Rollout models always derive from the baseline program's LM; rollout_id is
+// Rollout models always derive from the baseline workflow's LM; rollout_id is
 // a cache-buster mapped onto the seed parameter.
-const prepareModelsForResampling = <TInput, TOutput>(
+const prepareModelsForResampling = <
+  TInput extends Fields,
+  TOutput extends Fields,
+>(
   rt: SIMBARuntime<TInput, TOutput>,
   nextRolloutId: number
 ) => {
@@ -581,10 +606,11 @@ const prepareModelsForResampling = <TInput, TOutput>(
 }
 
 // Model-major, example-minor: bucket extraction strides by batchSize.
-const sampleBatchRollouts = <TInput, TOutput>(
+const sampleBatchRollouts = <TInput extends Fields, TOutput extends Fields>(
+  workflow: AnyWorkflow,
   rt: SIMBARuntime<TInput, TOutput>,
   rng: RNG,
-  programs: Program<TInput, TOutput>[],
+  pool: Prompts[],
   avg: number[],
   batch: Example<TInput, TOutput>[],
   models: RunContext[]
@@ -595,30 +621,36 @@ const sampleBatchRollouts = <TInput, TOutput>(
   for (const modelCtx of models) {
     for (const example of batch) {
       const srcIdx = softmaxSample(rng, topK, avg, rt.samplingTemperature)
-      // Rollouts never mutate the program, so no clone is needed.
-      const rolloutProgram = at(programs, srcIdx, "programs")
-      runs.push(() => runRollout(rolloutProgram, example, rt.metric, modelCtx))
+      // Rollouts never mutate the prompts, so no copy is needed.
+      const rolloutPrompts = at(pool, srcIdx, "pool")
+      runs.push(() =>
+        runRollout(workflow, rolloutPrompts, example, rt.metric, modelCtx)
+      )
     }
   }
   return Promise.all(runs.map((run) => run()))
 }
 
-const generateCandidatesFromBuckets = async <TInput, TOutput extends Fields>(
+const generateCandidatesFromBuckets = async <
+  TInput extends Fields,
+  TOutput extends Fields,
+>(
+  workflow: AnyWorkflow,
   rt: SIMBARuntime<TInput, TOutput>,
   rng: RNG,
   poissonRNG: RNG,
-  programs: Program<TInput, TOutput>[],
+  pool: Prompts[],
   avg: number[],
   buckets: Bucket<TInput, TOutput>[],
   percentiles: { p10: number; p90: number }
-): Promise<Program<TInput, TOutput>[]> => {
+): Promise<Prompts[]> => {
   // Candidates only join the pool after the step, so the caller scored it once.
   const topK = topKPlusBaseline(avg, rt.candidates)
   const strategyCount = rt.maxFewShotExamples > 0 ? 2 : 1
-  const generated: Program<TInput, TOutput>[] = []
+  const generated: Prompts[] = []
   for (const bucket of buckets) {
     const srcIdx = softmaxSample(rng, topK, avg, rt.candidateTemperature)
-    const candidate = at(programs, srcIdx, "programs").clone()
+    const candidate = structuredClone(at(pool, srcIdx, "pool"))
     dropExamples(candidate, rt.maxFewShotExamples, rng, poissonRNG)
     const strategyIdx = Math.floor(rng() * strategyCount)
     // With maxFewShotExamples > 0 the strategies are [example, rule]; without,
@@ -634,7 +666,7 @@ const generateCandidatesFromBuckets = async <TInput, TOutput extends Fields>(
         })
       } else {
         // oxlint-disable-next-line no-await-in-loop -- see above
-        await appendARule(bucket, candidate, {
+        await appendARule(workflow, bucket, candidate, {
           p10: percentiles.p10,
           p90: percentiles.p90,
           promptModel: rt.promptModel,
@@ -652,24 +684,27 @@ const generateCandidatesFromBuckets = async <TInput, TOutput extends Fields>(
   return generated
 }
 
-const evaluateOn = async <TInput, TOutput>(
-  programsToScore: Program<TInput, TOutput>[],
+const evaluateOn = async <TInput extends Fields, TOutput extends Fields>(
+  workflow: AnyWorkflow,
+  promptsToScore: Prompts[],
   examples: Example<TInput, TOutput>[],
   metric: Metric<TInput, TOutput>
 ): Promise<number[][]> => {
   const rollouts = await Promise.all(
-    programsToScore.flatMap((program) =>
-      examples.map((example) => runRollout(program, example, metric, {}))
+    promptsToScore.flatMap((prompts) =>
+      examples.map((example) =>
+        runRollout(workflow, prompts, example, metric, {})
+      )
     )
   )
-  return programsToScore.map((_, idx) =>
+  return promptsToScore.map((_, idx) =>
     rollouts
       .slice(idx * examples.length, (idx + 1) * examples.length)
       .map((rollout) => rollout.score)
   )
 }
 
-/** Final selection: candidates+1 programs evenly spaced across the winner
+/** Final selection: candidates+1 prompt sets evenly spaced across the winner
  * timeline, always including the untouched student and the last winner. */
 const finalistIdxs = (winnersCount: number, candidates: number): number[] => {
   const m = winnersCount - 1
@@ -686,14 +721,15 @@ const avgOf = (scoreLists: number[][]): number[] =>
 
 // --- Main loop --------------------------------------------------------------
 
-export const simbaProgram = async <
+export const simbaPrompts = async <
   TInput extends Fields,
   TOutput extends Fields,
 >(
-  student: Program<TInput, TOutput>,
+  workflow: AnyWorkflow,
+  prompts: Prompts,
   trainingSet: Example<TInput, TOutput>[],
   config: InternalConfig<TInput, TOutput>
-): Promise<SIMBAProgramResult<TInput, TOutput>> => {
+): Promise<SIMBAPromptsResult> => {
   const {
     batchSize = 32,
     candidates = 6,
@@ -709,8 +745,7 @@ export const simbaProgram = async <
     )
   }
 
-  type AnyProgram = Program<TInput, TOutput>
-  const baseline = student.clone()
+  const baseline = structuredClone(prompts)
   const rt: SIMBARuntime<TInput, TOutput> = {
     batchSize,
     candidateTemperature: config.candidateTemperature ?? 0.2,
@@ -718,7 +753,8 @@ export const simbaProgram = async <
     maxFewShotExamples: config.maxFewShotExamples ?? 4,
     maxFewShotInputLength: config.maxFewShotInputLength ?? 100_000,
     metric,
-    promptModel: config.promptModel ?? first(baseline.steps, "steps").model,
+    promptModel:
+      config.promptModel ?? first(declarativeSteps(workflow), "steps").model,
     samplingTemperature: config.samplingTemperature ?? 0.2,
     teacherSettings: config.teacherSettings,
   }
@@ -728,10 +764,10 @@ export const simbaProgram = async <
 
   // Index 0 is the baseline; its score list stays empty forever, pinning its
   // average at 0.0 — the exploration floor.
-  const programs: AnyProgram[] = [baseline]
-  const programScores: number[][] = [[]]
+  const pool: Prompts[] = [baseline]
+  const poolScores: number[][] = [[]]
 
-  const winningPrograms: AnyProgram[] = [baseline]
+  const winners: Prompts[] = [baseline]
   const trialLogs: TrialLog[] = []
 
   const cursor: SIMBACursor = {
@@ -748,13 +784,14 @@ export const simbaProgram = async <
     console.log(
       `Sampling program trajectories on ${batchSize} examples x ${candidates} samples.`
     )
-    const avg = avgOf(programScores)
+    const avg = avgOf(poolScores)
     const resampling = prepareModelsForResampling(rt, nextRolloutId)
     ;({ nextRolloutId } = resampling)
     const rollouts = await sampleBatchRollouts(
+      workflow,
       rt,
       rng,
-      programs,
+      pool,
       avg,
       batch,
       resampling.models
@@ -772,11 +809,12 @@ export const simbaProgram = async <
 
     const buckets = makeBuckets(rollouts, batchSize)
     const stepCandidates = await generateCandidatesFromBuckets(
+      workflow,
       rt,
       rng,
       poissonRNG,
-      programs,
-      avgOf(programScores),
+      pool,
+      avgOf(poolScores),
       buckets,
       percentiles
     )
@@ -784,7 +822,12 @@ export const simbaProgram = async <
     console.log(
       `Batch ${step + 1}: Evaluating ${stepCandidates.length} programs on ${batchSize} examples.`
     )
-    const candidateScoreLists = await evaluateOn(stepCandidates, batch, metric)
+    const candidateScoreLists = await evaluateOn(
+      workflow,
+      stepCandidates,
+      batch,
+      metric
+    )
     const candidateScores = candidateScoreLists.map(mean)
     console.log(
       `Scores after ${step + 1} batches: ${candidateScores}, Best: ${candidateScores.length ? Math.max(...candidateScores) : "N/A"}`
@@ -793,15 +836,15 @@ export const simbaProgram = async <
     // Winner = argmax mean score, first max wins ties.
     if (candidateScores.length > 0) {
       const bestIdx = candidateScores.indexOf(Math.max(...candidateScores))
-      const winner = at(stepCandidates, bestIdx, "candidates").clone()
-      winningPrograms.push(winner)
+      const winner = structuredClone(at(stepCandidates, bestIdx, "candidates"))
+      winners.push(winner)
       await onImprovement?.(winner)
     }
 
     // Register ALL candidates into the pool.
     for (const [idx, candidate] of stepCandidates.entries()) {
-      programs.push(candidate)
-      programScores.push(at(candidateScoreLists, idx, "candidate scores"))
+      pool.push(candidate)
+      poolScores.push(at(candidateScoreLists, idx, "candidate scores"))
     }
 
     trialLogs.push({ baselineScore, candidateScores, step })
@@ -813,19 +856,24 @@ export const simbaProgram = async <
   }
 
   // Winners were already cloned at push time, so no extra copy is needed.
-  const finalists = finalistIdxs(winningPrograms.length, candidates).map((i) =>
-    at(winningPrograms, i, "winners")
+  const finalists = finalistIdxs(winners.length, candidates).map((i) =>
+    at(winners, i, "winners")
   )
 
   console.log(
     `VALIDATION: Evaluating ${finalists.length} programs on the full trainingSet.`
   )
-  const finalistScores = await evaluateOn(finalists, trainingSet, metric)
+  const finalistScores = await evaluateOn(
+    workflow,
+    finalists,
+    trainingSet,
+    metric
+  )
   const finalScores = finalistScores.map(mean)
 
   const candidateData = finalists
-    .map((program, idx) => ({
-      program,
+    .map((finalistPrompts, idx) => ({
+      prompts: finalistPrompts,
       score: at(finalScores, idx, "final scores"),
     }))
     .toSorted((a, b) => b.score - a.score)
@@ -839,7 +887,7 @@ export const simbaProgram = async <
 
   return {
     candidates: candidateData,
-    program: at(finalists, bestIdx, "finalists").clone(),
+    prompts: structuredClone(at(finalists, bestIdx, "finalists")),
     score: bestScore,
     trialLogs,
   }
@@ -931,7 +979,6 @@ export const createSIMBAWorkflow = (
     )
   }
   const metric = scorerMetric(resolveScorer(workflow, config.scorer))
-  const base = () => workflowToProgram(workflow)
   const rt: SIMBARuntime<Fields, Fields> = {
     batchSize,
     candidateTemperature: config.candidateTemperature ?? 0.2,
@@ -939,7 +986,8 @@ export const createSIMBAWorkflow = (
     maxFewShotExamples: config.maxFewShotExamples ?? 4,
     maxFewShotInputLength: config.maxFewShotInputLength ?? 100_000,
     metric,
-    promptModel: config.promptModel ?? first(base().steps, "steps").model,
+    promptModel:
+      config.promptModel ?? first(declarativeSteps(workflow), "steps").model,
     samplingTemperature: config.samplingTemperature ?? 0.2,
     teacherSettings: config.teacherSettings,
   }
@@ -950,7 +998,7 @@ export const createSIMBAWorkflow = (
     execute: () => {
       const rng = createRNG(seed)
       const poissonRNG = createRNG(seed)
-      const baselinePrompts = promptsOf(base())
+      const baselinePrompts = promptsOf(workflow)
       const dataIdxs = examples.map((_, i) => i)
       shuffle(rng, dataIdxs)
       return Promise.resolve({
@@ -980,9 +1028,6 @@ export const createSIMBAWorkflow = (
       }
       const rng = restoreRNG(state.rng.main)
       const cursor = structuredClone(state.cursor)
-      const programs = state.pool.map((prompts) =>
-        programFromPrompts(base(), prompts)
-      )
       console.log(`Starting batch ${state.step + 1} of ${maxSteps}.`)
       const batch = nextBatch(rng, cursor, examples, batchSize)
       console.log(
@@ -990,9 +1035,10 @@ export const createSIMBAWorkflow = (
       )
       const resampling = prepareModelsForResampling(rt, state.nextRolloutId)
       const rollouts = await sampleBatchRollouts(
+        workflow,
         rt,
         rng,
-        programs,
+        state.pool,
         avgOf(state.poolScores),
         batch,
         resampling.models
@@ -1028,14 +1074,12 @@ export const createSIMBAWorkflow = (
       const { buckets, p10, p90, ...state } = inputData
       const rng = restoreRNG(state.rng.main)
       const poissonRNG = restoreRNG(state.rng.poisson)
-      const programs = state.pool.map((prompts) =>
-        programFromPrompts(base(), prompts)
-      )
       const generated = await generateCandidatesFromBuckets(
+        workflow,
         rt,
         rng,
         poissonRNG,
-        programs,
+        state.pool,
         avgOf(state.poolScores),
         // SAFETY: the schema's optional `prediction` is the JSON face of
         // Rollout's required `TOutput | undefined` — identical runtime shape,
@@ -1045,7 +1089,7 @@ export const createSIMBAWorkflow = (
       )
       return {
         ...state,
-        candidatePrompts: generated.map((candidate) => promptsOf(candidate)),
+        candidatePrompts: generated,
         rng: { main: rng.state, poisson: poissonRNG.state },
       }
     },
@@ -1058,14 +1102,12 @@ export const createSIMBAWorkflow = (
     description: "Score the candidates, register them, persist the winner",
     execute: async ({ inputData }) => {
       const { baselineScore, batch, candidatePrompts, ...state } = inputData
-      const stepCandidates = candidatePrompts.map((prompts) =>
-        programFromPrompts(base(), prompts)
-      )
       console.log(
-        `Batch ${state.step + 1}: Evaluating ${stepCandidates.length} programs on ${batchSize} examples.`
+        `Batch ${state.step + 1}: Evaluating ${candidatePrompts.length} programs on ${batchSize} examples.`
       )
       const candidateScoreLists = await evaluateOn(
-        stepCandidates,
+        workflow,
+        candidatePrompts,
         batch,
         metric
       )
@@ -1123,7 +1165,8 @@ export const createSIMBAWorkflow = (
         `VALIDATION: Evaluating ${finalists.length} programs on the full trainingSet.`
       )
       const finalistScores = await evaluateOn(
-        finalists.map((prompts) => programFromPrompts(base(), prompts)),
+        workflow,
+        finalists,
         examples,
         metric
       )

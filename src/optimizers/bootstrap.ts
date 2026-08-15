@@ -1,17 +1,19 @@
+import type { AnyWorkflow } from "@mastra/core/workflows"
 import type { LanguageModel } from "ai"
 
 import { at, last } from "../collections"
 import type { Fields } from "../fields"
-import type { Example, Program } from "../program"
+import { runWith } from "../optimizers/utils"
+import type { Prompts } from "../optimizers/utils"
 import { createRNG, sample, shuffle } from "../random"
 import type { MetricOutput } from "../scorers"
-import type { RunContext, TraceStep } from "../step"
+import type { Example, RunContext, TraceStep } from "../step"
 import { isEqualJSON } from "../utils"
 
 /**
  * Shared bootstrap machinery, ported faithfully from
  * dspy.teleprompt.bootstrap.BootstrapFewShot and its LabeledFewShot dependency
- * (dspy/dspy/teleprompt/{bootstrap,vanilla}.py). Program-level and internal:
+ * (dspy/dspy/teleprompt/{bootstrap,vanilla}.py). Optimizer-internal:
  * the public entry points in bootstrap-few-shot.ts and labeled-few-shot.ts
  * wrap these for workflows, and GEPA's few-shot pre-pass calls them directly.
  */
@@ -39,7 +41,7 @@ export type BootstrapOptions<TInput = Fields, TOutput = Fields> = {
   maxRounds?: number
   metric?: BootstrapMetric<TInput, TOutput>
   metricThreshold?: number
-  teacher?: Program<TInput, TOutput>
+  teacher?: { prompts: Prompts; workflow: AnyWorkflow }
   teacherSettings?: { model?: LanguageModel; temperature?: number }
 }
 
@@ -50,10 +52,6 @@ const cloneExample = (example: Example): Example => ({
   inputData: structuredClone(example.inputData),
   outputData: structuredClone(example.outputData),
 })
-
-const examplesEqual = (a: Example, b: Example): boolean =>
-  isEqualJSON(a.inputData, b.inputData) &&
-  isEqualJSON(a.outputData, b.outputData)
 
 /** FNV-1a over the JSON rendering — stands in for dspy's Hasher.hash. */
 const contentHash = (value: Example[]): number => {
@@ -69,12 +67,10 @@ const contentHash = (value: Example[]): number => {
   /* oxlint-enable no-bitwise */
 }
 
-/** Reset copy: fresh clone with step examples cleared (dspy reset_copy). */
-const resetCopy = <TInput, TOutput>(
-  program: Program<TInput, TOutput>
-): Program<TInput, TOutput> => {
-  const copy = program.clone()
-  for (const step of copy.steps) {
+/** Reset copy: fresh snapshot with step examples cleared (dspy reset_copy). */
+export const resetCopy = (prompts: Prompts): Prompts => {
+  const copy = structuredClone(prompts)
+  for (const step of Object.values(copy.steps)) {
     step.examples = []
   }
   return copy
@@ -85,20 +81,17 @@ const resetCopy = <TInput, TOutput>(
  * few-shot examples on a reset copy of the student. Each step draws its own
  * sample from the same seed-0 RNG stream; nothing else is shuffled.
  */
-export const labeledFewShotProgram = <
-  TInput extends Fields,
-  TOutput extends Fields,
->(
-  student: Program<TInput, TOutput>,
-  trainingSet: Example<TInput, TOutput>[],
+export const labeledFewShotPrompts = (
+  prompts: Prompts,
+  trainingSet: Example[],
   k = 16
-): Program<TInput, TOutput> => {
-  const compiled = resetCopy(student)
+): Prompts => {
+  const compiled = resetCopy(prompts)
   if (trainingSet.length === 0) {
     return compiled
   }
   const rng = createRNG(0)
-  for (const step of compiled.steps) {
+  for (const step of Object.values(compiled.steps)) {
     step.examples = sample(
       rng,
       trainingSet,
@@ -111,33 +104,36 @@ export const labeledFewShotProgram = <
 /**
  * _prepare_student_and_teacher: reset copy for the student, deep copy for
  * the teacher — then LabeledFewShot over a reset teacher copy when labeled
- * examples are requested (our programs carry no _compiled flag; a provided
+ * examples are requested (our prompt snapshots carry no _compiled flag; a provided
  * teacher is treated as uncompiled, see the doc's deviation list). Validates
  * _prepare_predictor_mappings: same structure, matched by position + id.
  */
-export const prepareStudentAndTeacher = <
-  TInput extends Fields,
-  TOutput extends Fields,
->(
-  studentProgram: Program<TInput, TOutput>,
-  trainingSet: Example<TInput, TOutput>[],
-  options: Pick<
-    BootstrapOptions<TInput, TOutput>,
-    "maxLabeledExamples" | "teacher"
-  >
+export const prepareStudentAndTeacher = (
+  studentPrompts: Prompts,
+  trainingSet: Example[],
+  options: {
+    maxLabeledExamples?: number
+    teacherPrompts?: Prompts
+  }
 ) => {
   const { maxLabeledExamples = 16 } = options
-  const student = resetCopy(studentProgram)
-  let teacher = (options.teacher ?? studentProgram).clone()
+  const student = resetCopy(studentPrompts)
+  let teacher = structuredClone(options.teacherPrompts ?? studentPrompts)
   if (maxLabeledExamples > 0) {
-    teacher = labeledFewShotProgram(teacher, trainingSet, maxLabeledExamples)
+    teacher = labeledFewShotPrompts(teacher, trainingSet, maxLabeledExamples)
   }
-  if (student.steps.length !== teacher.steps.length) {
+  const studentSteps = Object.entries(student.steps)
+  const teacherSteps = Object.entries(teacher.steps)
+  if (studentSteps.length !== teacherSteps.length) {
     throw new Error("Student and teacher must have the same number of steps.")
   }
-  for (const [idx, studentStep] of student.steps.entries()) {
-    const teacherStep = teacher.steps[idx]
-    if (studentStep.id !== teacherStep?.id) {
+  for (const [idx, [studentId, studentStep]] of studentSteps.entries()) {
+    const [teacherId, teacherStep] = at(
+      teacherSteps,
+      idx,
+      "teacher prompt steps"
+    )
+    if (studentId !== teacherId) {
       throw new Error(
         "Student and teacher must have the same program structure."
       )
@@ -161,7 +157,8 @@ export const runBootstrapAttempt = async <
   TInput extends Fields,
   TOutput extends Fields,
 >(
-  teacher: Program<TInput, TOutput>,
+  teacherWorkflow: AnyWorkflow,
+  teacherPrompts: Prompts,
   example: Example<TInput, TOutput>,
   roundIdx: number,
   options: Pick<
@@ -180,21 +177,21 @@ export const runBootstrapAttempt = async <
     ctx.seed = roundIdx
     ctx.temperature = 1
   }
-  // Hide any example equal to the one being bootstrapped, restore after.
-  const exampleCache = teacher.steps.map((step) => step.examples)
-  for (const step of teacher.steps) {
+  // Hide any example equal to the one being bootstrapped on an isolated value.
+  const attemptPrompts = structuredClone(teacherPrompts)
+  for (const step of Object.values(attemptPrompts.steps)) {
     step.examples = step.examples.filter(
-      (installed) => !examplesEqual(installed, example)
+      (installed) => !isEqualJSON(installed, example)
     )
   }
-  let prediction: TOutput | null
-  try {
-    prediction = await teacher.run(example.inputData, ctx)
-  } finally {
-    for (const [idx, step] of teacher.steps.entries()) {
-      step.examples = at(exampleCache, idx, "teacher example cache")
-    }
-  }
+  // SAFETY: the workflow validates its successful final output against its
+  // output schema; TOutput is the optimizer caller's typed view of that record.
+  const prediction = (await runWith(
+    teacherWorkflow,
+    attemptPrompts,
+    example.inputData,
+    ctx
+  )) as TOutput
   if (!metric) {
     return { success: true, trace }
   }
@@ -250,26 +247,27 @@ export const harvestTraceExamples = (
  * _train: bootstrapped examples first, labeled backfill after. The
  * un-bootstrapped pool is seed-0 shuffled, and the Python quirk that
  * rawExamples is REASSIGNED to each step's sample is preserved, so later
- * steps draw from the shrinking pool. Mutates and returns `student`.
+ * steps draw from the shrinking pool. Returns an updated cloned snapshot.
  */
 export const installTrainExamples = <
   TInput extends Fields,
   TOutput extends Fields,
 >(
-  student: Program<TInput, TOutput>,
+  studentPrompts: Prompts,
   id2traces: Map<string, Example[]>,
   unBootstrapped: Example<TInput, TOutput>[],
   options: Pick<
     Required<BootstrapOptions<TInput, TOutput>>,
     "maxFewShotExamples" | "maxLabeledExamples"
   >
-): Program<TInput, TOutput> => {
+): Prompts => {
+  const student = structuredClone(studentPrompts)
   const validation = [...unBootstrapped]
   shuffle(createRNG(0), validation)
   const rng = createRNG(0)
   let rawExamples: Example[] = validation
-  for (const step of student.steps) {
-    const harvested = (id2traces.get(step.id) ?? []).slice(
+  for (const [stepId, step] of Object.entries(student.steps)) {
+    const harvested = (id2traces.get(stepId) ?? []).slice(
       0,
       options.maxFewShotExamples
     )
@@ -295,30 +293,33 @@ export const BOOTSTRAP_DEFAULT_MAX_ERRORS = DEFAULT_MAX_ERRORS
  * remaining slots with raw labeled examples. The durable workflow driver in
  * bootstrap-few-shot.ts runs the same helpers one attempt per loop iteration.
  */
-export const bootstrapFewShotProgram = async <
+export const bootstrapFewShotPrompts = async <
   TInput extends Fields,
   TOutput extends Fields,
 >(
-  studentProgram: Program<TInput, TOutput>,
-  trainingSet: Example<TInput, TOutput>[],
+  workflow: AnyWorkflow,
+  prompts: Prompts,
+  trainingSet: readonly Example<TInput, TOutput>[],
   options: BootstrapOptions<TInput, TOutput> = {}
-): Promise<Program<TInput, TOutput>> => {
+): Promise<Prompts> => {
   const {
     maxErrors = DEFAULT_MAX_ERRORS,
     maxFewShotExamples = 4,
     maxLabeledExamples = 16,
     maxRounds = 1,
   } = options
+  const teacherWorkflow = options.teacher?.workflow ?? workflow
+  const teacherPrompts = options.teacher?.prompts ?? prompts
 
   const { student, teacher } = prepareStudentAndTeacher(
-    studentProgram,
-    trainingSet,
-    options
+    prompts,
+    [...trainingSet],
+    { maxLabeledExamples, teacherPrompts }
   )
 
   // _bootstrap ---------------------------------------------------------------
   const id2traces = new Map<string, Example[]>(
-    student.steps.map((step) => [step.id, []])
+    Object.keys(student.steps).map((stepId) => [stepId, []])
   )
   let errorCount = 0
 
@@ -329,6 +330,7 @@ export const bootstrapFewShotProgram = async <
     let success = false
     try {
       const attempt = await runBootstrapAttempt(
+        teacherWorkflow,
         teacher,
         example,
         roundIdx,

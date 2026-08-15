@@ -2,18 +2,17 @@ import type { AnyWorkflow } from "@mastra/core/workflows"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 
-import { labeledFewShotProgram } from "../optimizers/bootstrap"
+import { labeledFewShotPrompts } from "../optimizers/bootstrap"
 import {
   compiledSchema,
   finishingSteps,
   optimizerResultSchema,
   promptsOf,
-  workflowToProgram,
 } from "../optimizers/utils"
 import type { SavePrompts } from "../optimizers/utils"
-import type { Example } from "../program"
 import { resolveScorer, scorerMetric } from "../scorers"
 import type { ScorerRef } from "../scorers"
+import type { Example } from "../step"
 
 export type LabeledFewShotConfig = {
   maxFewShotExamples?: number
@@ -39,14 +38,14 @@ export const createLabeledFewShotWorkflow = (
 ) => {
   const compile = createStep({
     description: "Install labeled examples as few-shot examples on every step",
-    execute: () => {
-      const compiled = labeledFewShotProgram(
-        workflowToProgram(workflow),
-        [...config.trainingSet],
-        config.maxFewShotExamples ?? 16
-      )
-      return Promise.resolve({ prompts: promptsOf(compiled) })
-    },
+    execute: () =>
+      Promise.resolve({
+        prompts: labeledFewShotPrompts(
+          promptsOf(workflow),
+          [...config.trainingSet],
+          config.maxFewShotExamples ?? 16
+        ),
+      }),
     id: "compile",
     inputSchema: z.object({}),
     outputSchema: compiledSchema,

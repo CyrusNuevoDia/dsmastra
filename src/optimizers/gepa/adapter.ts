@@ -1,3 +1,4 @@
+import type { AnyWorkflow } from "@mastra/core/workflows"
 import { generateText } from "ai"
 import type { LanguageModel } from "ai"
 
@@ -13,7 +14,8 @@ import type {
   RNG,
   Trajectory,
 } from "../../optimizers/gepa/engine"
-import type { Example, Program } from "../../program"
+import { declarativeSteps, runWith } from "../../optimizers/utils"
+import type { Prompts } from "../../optimizers/utils"
 import {
   expectedStructure,
   extractInstructionText,
@@ -21,7 +23,7 @@ import {
   stringifyFields,
 } from "../../prompting"
 import type { MetricOutput, MetricResult } from "../../scorers"
-import type { ScoreTarget } from "../../step"
+import type { Example, ScoreTarget } from "../../step"
 
 /** A metric result that names the feedback field GEPA's reflection LM reads. */
 export type ScoreWithFeedback = MetricResult & { feedback?: string }
@@ -110,29 +112,37 @@ Read all the assistant responses and the corresponding feedback. Identify all ni
 
 Provide the new instructions within \`\`\` blocks.`
 
-// --- Program adapter ---------------------------------------------------------
+// --- Workflow adapter --------------------------------------------------------
 
-export type ProgramAdapterConfig<TInput = Fields, TOutput = Fields> = {
+export type WorkflowAdapterConfig<TInput = Fields, TOutput = Fields> = {
   addFormatFailureAsFeedback: boolean
   adapterRNG: RNG
+  basePrompts: Prompts
   failureScore: number
   metric: GEPAMetric<TInput, TOutput>
-  program: Program<TInput, TOutput>
   reflectionModel: ReflectionModel
   warnOnScoreMismatch: boolean
+  workflow: AnyWorkflow
 }
 
-export type ProgramGEPAAdapter<TInput = Fields, TOutput = Fields> = GEPAAdapter<
-  TInput,
-  TOutput
-> & {
-  buildProgram: (candidate: Candidate) => Program<TInput, TOutput>
+export type WorkflowGEPAAdapter<
+  TInput = Fields,
+  TOutput = Fields,
+> = GEPAAdapter<TInput, TOutput> & {
+  buildPrompts: (candidate: Candidate) => Prompts
 }
 
-export const createProgramAdapter = <TInput, TOutput>(
-  config: ProgramAdapterConfig<TInput, TOutput>
-): ProgramGEPAAdapter<TInput, TOutput> => {
-  const { adapterRNG, failureScore, metric, program, reflectionModel } = config
+export const createWorkflowAdapter = <TInput, TOutput>(
+  config: WorkflowAdapterConfig<TInput, TOutput>
+): WorkflowGEPAAdapter<TInput, TOutput> => {
+  const {
+    adapterRNG,
+    basePrompts,
+    failureScore,
+    metric,
+    reflectionModel,
+    workflow,
+  } = config
   let warnedScoreMismatch = false
 
   const proposeText =
@@ -147,35 +157,43 @@ export const createProgramAdapter = <TInput, TOutput>(
           return text
         }
 
-  // Descriptions only, exactly like upstream build_program — the clone keeps
-  // whatever few-shot examples the student's steps already carry (e.g. from a
-  // bootstrapFewShot pre-pass).
-  const buildProgram = (candidate: Candidate): Program<TInput, TOutput> => {
-    const built = program.clone()
-    for (const step of built.steps) {
-      const description = candidate[step.id]
-      if (description !== undefined) {
-        step.description = description
+  // Descriptions only, exactly like upstream build_program — the copy keeps
+  // whatever few-shot examples the student's prompts already carry (e.g. from
+  // a bootstrapFewShot pre-pass).
+  const buildPrompts = (candidate: Candidate): Prompts => {
+    const built = structuredClone(basePrompts)
+    for (const [componentName, description] of Object.entries(candidate)) {
+      const step = built.steps[componentName]
+      if (!step) {
+        throw new Error(`Candidate prompts lost step ${componentName}`)
       }
+      step.description = description
     }
     return built
   }
 
   // Never throws per example: a failed rollout scores failureScore with a
-  // null output. Only a build-time program error may abort.
+  // null output. Only a build-time prompts error may abort.
   const evaluate = async (
     batch: Example<TInput, TOutput>[],
     candidate: Candidate,
     captureTraces: boolean
   ): Promise<EvaluationBatch<TInput, TOutput>> => {
-    const built = buildProgram(candidate)
+    const built = buildPrompts(candidate)
     const trajectories = await Promise.all(
       batch.map(async (example): Promise<Trajectory<TInput, TOutput>> => {
         const trace: GEPATraceStep[] = []
         const ctx: RolloutContext = { trace }
         let prediction: TOutput | null = null
         try {
-          prediction = await built.run(example.inputData, ctx)
+          // SAFETY: every workflow rollout result is the same output record
+          // that previously came from the generic candidate runner.
+          prediction = (await runWith(
+            workflow,
+            built,
+            example.inputData as Fields,
+            ctx
+          )) as TOutput
         } catch (error) {
           console.warn(error)
         }
@@ -212,7 +230,9 @@ export const createProgramAdapter = <TInput, TOutput>(
     componentName: string
   ): Promise<ReflectiveExample> => {
     if (traceStep.parseFailure !== undefined) {
-      const step = program.steps.find((s) => s.id === componentName)
+      const step = declarativeSteps(workflow).find(
+        (candidate) => candidate.id === componentName
+      )
       return {
         Feedback:
           PARSE_FAILURE_FEEDBACK_PREFIX + expectedStructure(step?.outputSchema),
@@ -322,7 +342,7 @@ export const createProgramAdapter = <TInput, TOutput>(
   }
 
   return {
-    buildProgram,
+    buildPrompts,
     evaluate,
     makeReflectiveDataset,
     proposeNewTexts,

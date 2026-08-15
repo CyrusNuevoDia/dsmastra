@@ -6,10 +6,10 @@ import { MockLanguageModelV4 } from "ai/test"
 import { z } from "zod"
 
 import { createLabeledFewShotWorkflow } from "../../src/optimizers/labeled-few-shot"
-import { loadPrompts, workflowToProgram } from "../../src/optimizers/utils"
-import type { AnyDeclarativeStep, TraceStep } from "../../src/step"
+import { loadPrompts, promptsOf, runWith } from "../../src/optimizers/utils"
+import type { TraceStep } from "../../src/step"
 import { declareStep } from "../../src/step"
-import { fakeScorer, fakeStep, runOptimizer } from "./helpers"
+import { fakeScorer, fakeStep, promptStep, runOptimizer } from "./helpers"
 
 const usage = {
   inputTokens: {
@@ -113,9 +113,11 @@ test("engine rollouts honor RunContext overrides and capture per-step traces", a
     .then(step)
     .commit()
 
-  const program = workflowToProgram(workflow)
+  const prompts = promptsOf(workflow)
   const trace: TraceStep[] = []
-  const output = await program.run(
+  const output = await runWith(
+    workflow,
+    prompts,
     { text: "great" },
     { seed: 9, temperature: 0.7, trace }
   )
@@ -160,7 +162,12 @@ test("engine rollouts run parallel graphs; tuning lands on declarative steps onl
 
   // A rollout through the engine executes the parallel section correctly.
   const trace: TraceStep[] = []
-  const output = await workflowToProgram(workflow).run({ x: 3 }, { trace })
+  const output = await runWith(
+    workflow,
+    promptsOf(workflow),
+    { x: 3 },
+    { trace }
+  )
   expect(output).toEqual({ sum: 10 })
   expect(trace.map((t) => t.stepId).toSorted()).toEqual(["double", "inc"])
 
@@ -209,17 +216,17 @@ test("concurrent candidates never observe mixed prompt state", async () => {
     .then(probe)
     .commit()
 
-  const base = workflowToProgram(workflow)
-  const candidateA = base.clone()
-  const candidateB = base.clone()
-  ;(candidateA.steps[0] as AnyDeclarativeStep).description = "CANDIDATE-A"
-  ;(candidateB.steps[0] as AnyDeclarativeStep).description = "CANDIDATE-B"
+  const base = promptsOf(workflow)
+  const candidateA = structuredClone(base)
+  const candidateB = structuredClone(base)
+  promptStep(candidateA, "probe").description = "CANDIDATE-A"
+  promptStep(candidateB, "probe").description = "CANDIDATE-B"
 
   // Launch both candidates' batches concurrently: the gate must serialize
   // them so every rollout sees exactly its own candidate's state.
   await Promise.all([
-    ...["a1", "a2", "a3"].map((tag) => candidateA.run({ tag })),
-    ...["b1", "b2", "b3"].map((tag) => candidateB.run({ tag })),
+    ...["a1", "a2", "a3"].map((tag) => runWith(workflow, candidateA, { tag })),
+    ...["b1", "b2", "b3"].map((tag) => runWith(workflow, candidateB, { tag })),
   ])
 
   expect(observed).toHaveLength(6)

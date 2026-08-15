@@ -45,7 +45,7 @@ type ScoreTarget = {
 type RunContext = {
   model?: LanguageModel;
   seed?: number;
-  /** Written by the engine runner after a successful run — see workflowToProgram. */
+  /** Written by the engine runner after a successful run. */
   target?: ScoreTarget;
   temperature?: number;
   trace?: TraceStep[];
@@ -93,7 +93,6 @@ type StepConfig<TStepId extends string, TInputSchema extends FieldSchema, TOutpu
  * the real Mastra step satisfies this narrower view without an assertion.
  */
 type DeclarativeStep<TStepId extends string = string, TInputSchema extends FieldSchema = FieldSchema, TOutputSchema extends FieldSchema = FieldSchema> = {
-  clone: () => DeclarativeStep<TStepId, TInputSchema, TOutputSchema>;
   description: string;
   examples: Example[];
   execute(params: {

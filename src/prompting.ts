@@ -1,7 +1,6 @@
 import type { z } from "zod"
 
-import type { Fields } from "./fields"
-import type { Program } from "./program"
+import type { FieldSchema, Fields } from "./fields"
 import { schemaProperties } from "./schema"
 import type { Example } from "./step"
 
@@ -100,9 +99,16 @@ export const indentContinuations = (text: string): string =>
 const MODULE_SEPARATOR = "-".repeat(80)
 
 /** Every module's I/O fields and current instructions, DSPy inspect-style. */
-export const inspectModules = (program: Program<never, unknown>): string => {
+export const inspectModules = (
+  modules: readonly {
+    description: string
+    id: string
+    inputSchema: FieldSchema
+    outputSchema: FieldSchema
+  }[]
+): string => {
   const blocks = [MODULE_SEPARATOR]
-  for (const step of program.steps) {
+  for (const step of modules) {
     blocks.push(
       `Module ${step.id}`,
       `\n\tInput Fields:${indentContinuations(fieldDescriptionLines(step.inputSchema))}`,

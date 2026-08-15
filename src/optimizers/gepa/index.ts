@@ -4,8 +4,8 @@ import { z } from "zod"
 
 import { at, first } from "../../collections"
 import type { Fields } from "../../fields"
-import { bootstrapFewShotProgram } from "../../optimizers/bootstrap"
-import { createProgramAdapter } from "../../optimizers/gepa/adapter"
+import { bootstrapFewShotPrompts } from "../../optimizers/bootstrap"
+import { createWorkflowAdapter } from "../../optimizers/gepa/adapter"
 import type { GEPAMetric, ReflectionModel } from "../../optimizers/gepa/adapter"
 import {
   acceptReflection,
@@ -29,24 +29,22 @@ import type {
   ReflectionPlan,
 } from "../../optimizers/gepa/engine"
 import {
-  applyProgram,
+  declarativeSteps,
+  loadPrompts,
   optimizerResultSchema,
-  programFromPrompts,
   promptsOf,
   promptsSchema,
-  workflowToProgram,
 } from "../../optimizers/utils"
 import type {
   OptimizerCheckpoint,
   Prompts,
   SavePrompts,
 } from "../../optimizers/utils"
-import type { Example, Program } from "../../program"
 import { createRNG, restoreRNG } from "../../random"
 import type { RNG } from "../../random"
 import { resolveScorer, scorerMetric } from "../../scorers"
 import type { MetricOutput, ScorerRef } from "../../scorers"
-import type { ScoreTarget } from "../../step"
+import type { Example, ScoreTarget } from "../../step"
 
 // --- Budget -----------------------------------------------------------------
 
@@ -103,7 +101,7 @@ type EngineTuning<TInput, TOutput> = {
   warnOnScoreMismatch?: boolean
 }
 
-export type GEPAProgramConfig<TInput = Fields, TOutput = Fields> = EngineTuning<
+export type GEPAPromptsConfig<TInput = Fields, TOutput = Fields> = EngineTuning<
   TInput,
   TOutput
 > & {
@@ -112,8 +110,8 @@ export type GEPAProgramConfig<TInput = Fields, TOutput = Fields> = EngineTuning<
   maxFullEvals?: number
   maxMetricCalls?: number
   metric: GEPAMetric<TInput, TOutput>
-  /** Called with each new aggregate-score-best program — checkpointing. */
-  onImprovement?: (program: Program<TInput, TOutput>) => Promise<void>
+  /** Called with each new aggregate-score-best prompts snapshot — checkpointing. */
+  onImprovement?: (prompts: Prompts) => Promise<void>
   reflectionModel: ReflectionModel
 }
 
@@ -186,9 +184,18 @@ const resolveBudget = (
   )
 }
 
+/** The description-only Candidate view of a student snapshot. */
+const seedCandidateOf = (studentPrompts: Prompts): Candidate =>
+  Object.fromEntries(
+    Object.entries(studentPrompts.steps).map(([id, step]) => [
+      id,
+      step.description,
+    ])
+  )
+
 // --- Result -----------------------------------------------------------------
 
-export type GEPAProgramResult<TInput, TOutput> = {
+export type GEPAPromptsResult = {
   /** argmax of validationAggregateScores, lowest index winning ties. */
   bestIdx: number
   candidates: Candidate[]
@@ -196,19 +203,19 @@ export type GEPAProgramResult<TInput, TOutput> = {
   validationSetEvalsCount: number
   parents: (number | null)[][]
   perValidationInstanceBestCandidates: Map<number, Set<number>>
-  program: Program<TInput, TOutput>
+  prompts: Prompts
   seed: number
   totalMetricCalls: number
   validationAggregateScores: number[]
   validationSubscores: number[][]
 }
 
-export const buildResult = <TInput, TOutput>(
+export const buildResult = (
   state: GEPAState,
   validationSetSize: number,
   seed: number,
-  buildProgram: (candidate: Candidate) => Program<TInput, TOutput>
-): GEPAProgramResult<TInput, TOutput> => {
+  buildPrompts: (candidate: Candidate) => Prompts
+): GEPAPromptsResult => {
   const validationAggregateScores =
     state.candidateValidationSubscores.map(aggregateScore)
   const bestIdx = argmax(validationAggregateScores)
@@ -219,7 +226,7 @@ export const buildResult = <TInput, TOutput>(
     parents: state.parentProgramForCandidate,
     perValidationInstanceBestCandidates:
       state.programAtParetoFrontValidationSet,
-    program: buildProgram(at(state.programCandidates, bestIdx, "candidates")),
+    prompts: buildPrompts(at(state.programCandidates, bestIdx, "candidates")),
     seed,
     totalMetricCalls: state.totalEvalsCount,
     validationAggregateScores,
@@ -240,13 +247,14 @@ export const buildResult = <TInput, TOutput>(
   }
 }
 
-// --- Program-level entry point ----------------------------------------------
+// --- Prompts-level entry point ----------------------------------------------
 
-export const gepaProgram = async <TInput, TOutput>(
-  student: Program<TInput, TOutput>,
+export const gepaPrompts = async <TInput, TOutput>(
+  workflow: AnyWorkflow,
+  prompts: Prompts,
   trainingSet: Example<TInput, TOutput>[],
-  config: GEPAProgramConfig<TInput, TOutput>
-): Promise<GEPAProgramResult<TInput, TOutput>> => {
+  config: GEPAPromptsConfig<TInput, TOutput>
+): Promise<GEPAPromptsResult> => {
   if (trainingSet.length === 0) {
     throw new Error("GEPA requires a non-empty trainingSet")
   }
@@ -262,15 +270,10 @@ export const gepaProgram = async <TInput, TOutput>(
     )
   }
 
-  const program = student
-  // Description text only, like upstream; the student's few-shot examples stay
-  // on its steps and reach every candidate through buildProgram's clone.
-  const seedCandidate: Candidate = Object.fromEntries(
-    program.steps.map((step) => [step.id, step.description])
-  )
+  const seedCandidate = seedCandidateOf(prompts)
   const maxMetricCalls = resolveBudget(
     config,
-    program.steps.length,
+    declarativeSteps(workflow).length,
     trainingSet,
     validationSet.length
   )
@@ -279,14 +282,15 @@ export const gepaProgram = async <TInput, TOutput>(
   const engineRNG = createRNG(seed)
   const adapterRNG = createRNG(seed)
 
-  const adapter = createProgramAdapter({
+  const adapter = createWorkflowAdapter({
     adapterRNG,
     addFormatFailureAsFeedback: config.addFormatFailureAsFeedback ?? false,
+    basePrompts: prompts,
     failureScore: config.failureScore ?? 0,
     metric: config.metric,
-    program,
     reflectionModel: config.reflectionModel,
     warnOnScoreMismatch: config.warnOnScoreMismatch ?? true,
+    workflow,
   })
 
   const { onImprovement } = config
@@ -297,7 +301,7 @@ export const gepaProgram = async <TInput, TOutput>(
     maxMetricCalls,
     onImprovement:
       onImprovement &&
-      ((candidate) => onImprovement(adapter.buildProgram(candidate))),
+      ((candidate) => onImprovement(adapter.buildPrompts(candidate))),
     perfectScore: config.perfectScore ?? 1,
     reflectionMinibatchSize: config.reflectionMinibatchSize ?? 3,
     rng: engineRNG,
@@ -308,7 +312,7 @@ export const gepaProgram = async <TInput, TOutput>(
     validationSet,
   })
 
-  return buildResult(state, validationSet.length, seed, adapter.buildProgram)
+  return buildResult(state, validationSet.length, seed, adapter.buildPrompts)
 }
 
 // --- Workflow-level entry point ----------------------------------------------
@@ -377,15 +381,6 @@ const proposedSchema = reflectedSchema.extend({
 
 type IterationPayload = z.infer<typeof iterationSchema>
 
-/** The description-only Candidate view of a student snapshot. */
-const seedCandidateOf = (studentPrompts: Prompts): Candidate =>
-  Object.fromEntries(
-    Object.entries(studentPrompts.steps).map(([id, step]) => [
-      id,
-      step.description,
-    ])
-  )
-
 /**
  * Genetic-Pareto reflective prompt evolution as a Mastra workflow over the
  * target `workflow`: a pre-pass step optionally bootstraps few-shot examples
@@ -438,7 +433,7 @@ export const createGEPAWorkflow = (
       `GEPA: validationSet has ${validationSet.length} examples; every accepted candidate costs a full validationSet eval.`
     )
   }
-  const stepsCount = workflowToProgram(workflow).steps.length
+  const stepsCount = declarativeSteps(workflow).length
   const maxMetricCalls = resolveBudget(
     { ...tuning, maxMetricCalls: maxScorerCalls },
     stepsCount,
@@ -490,22 +485,20 @@ export const createGEPAWorkflow = (
   // the serializable payload — never carried across steps in closures — so a
   // resumed run in a fresh process reconstructs the exact same world.
   const buildAdapter = (studentPrompts: Prompts, adapterRNGState: number) => {
-    const student = programFromPrompts(
-      workflowToProgram(workflow),
-      studentPrompts
-    )
     const adapterRNG = restoreRNG(adapterRNGState)
-    const adapter = createProgramAdapter({
+    const adapter = createWorkflowAdapter({
       adapterRNG,
       addFormatFailureAsFeedback: tuning.addFormatFailureAsFeedback ?? false,
+      basePrompts: studentPrompts,
       failureScore: tuning.failureScore ?? 0,
       metric: gepaMetric,
-      program: student,
       reflectionModel:
-        reflectionModel ?? first(student.steps, "workflow steps").model,
+        reflectionModel ??
+        first(declarativeSteps(workflow), "workflow steps").model,
       warnOnScoreMismatch: tuning.warnOnScoreMismatch ?? true,
+      workflow,
     })
-    return { adapter, adapterRNG, student }
+    return { adapter, adapterRNG }
   }
 
   const engineOptionsFor = (
@@ -518,7 +511,7 @@ export const createGEPAWorkflow = (
     maxMergeInvocations: tuning.maxMergeInvocations ?? 5,
     maxMetricCalls,
     onImprovement: async (candidate) => {
-      await savePrompts(promptsOf(adapter.buildProgram(candidate)))
+      await savePrompts(adapter.buildPrompts(candidate))
     },
     perfectScore: tuning.perfectScore ?? 1,
     reflectionMinibatchSize: tuning.reflectionMinibatchSize ?? 3,
@@ -534,17 +527,22 @@ export const createGEPAWorkflow = (
     description:
       "Optional BootstrapFewShot pre-pass installing few-shot examples",
     execute: async () => {
-      let student = workflowToProgram(workflow)
+      let studentPrompts = promptsOf(workflow)
       if (maxFewShotExamples > 0) {
-        student = await bootstrapFewShotProgram(student, examples, {
-          maxFewShotExamples,
-          // A TOTAL cap per step, so the labeled backfill shares it instead of
-          // DSPy's default 16 — unless the caller raises it explicitly.
-          maxLabeledExamples: maxLabeledExamples ?? maxFewShotExamples,
-          metric: (gold, prediction) => cachedMetric(gold, prediction),
-        })
+        studentPrompts = await bootstrapFewShotPrompts(
+          workflow,
+          studentPrompts,
+          examples,
+          {
+            maxFewShotExamples,
+            // A TOTAL cap per step, so the labeled backfill shares it instead of
+            // DSPy's default 16 — unless the caller raises it explicitly.
+            maxLabeledExamples: maxLabeledExamples ?? maxFewShotExamples,
+            metric: (gold, prediction) => cachedMetric(gold, prediction),
+          }
+        )
       }
-      return { studentPrompts: promptsOf(student) }
+      return { studentPrompts }
     },
     id: "prepass",
     inputSchema: z.object({}),
@@ -705,7 +703,7 @@ export const createGEPAWorkflow = (
     execute: async ({ inputData }) => {
       const payload: IterationPayload = inputData
       const state = deserializeGEPAState(payload.state)
-      const { adapter, student } = buildAdapter(
+      const { adapter } = buildAdapter(
         payload.studentPrompts,
         payload.rng.adapter
       )
@@ -713,26 +711,19 @@ export const createGEPAWorkflow = (
         state,
         validationSet.length,
         seed,
-        adapter.buildProgram
+        adapter.buildPrompts
       )
-      await savePrompts(promptsOf(result.program))
+      await savePrompts(result.prompts)
       // The winner's prompt state lands in place on the caller's workflow.
-      applyProgram(workflow, result.program)
+      loadPrompts(workflow, result.prompts)
       return {
         // Every candidate GEPA tried, as a JSON-safe snapshot paired with its
         // validation aggregate score. Candidates are description-only; the
         // snapshot carries the student's (possibly pre-pass-installed)
         // examples.
         candidates: result.candidates.map((candidate, idx) => {
-          const snapshot = student.clone()
-          for (const step of snapshot.steps) {
-            const description = candidate[step.id]
-            if (description !== undefined) {
-              step.description = description
-            }
-          }
           const pair: [Prompts, { score: number }] = [
-            promptsOf(snapshot),
+            adapter.buildPrompts(candidate),
             {
               score: at(
                 result.validationAggregateScores,
