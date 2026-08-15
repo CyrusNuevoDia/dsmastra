@@ -175,13 +175,12 @@ export const makeBuckets = <TInput, TOutput>(
       rollouts: bucket,
     })
   }
-  buckets.sort(
+  return buckets.toSorted(
     (a, b) =>
       b.maxToMinGap - a.maxToMinGap ||
       b.maxScore - a.maxScore ||
       b.maxToAvgGap - a.maxToAvgGap
   )
-  return buckets
 }
 
 // --- Example dropping --------------------------------------------------------
