@@ -96,12 +96,12 @@ export type StepConfig<
  * Mastra simply never passes. Method syntax makes the parameter bivariant, so
  * the real Mastra step satisfies this narrower view without an assertion.
  */
-export type TunableStep<
+export type DeclarativeStep<
   TStepId extends string = string,
   TInputSchema extends FieldSchema = FieldSchema,
   TOutputSchema extends FieldSchema = FieldSchema,
 > = {
-  clone: () => TunableStep<TStepId, TInputSchema, TOutputSchema>
+  clone: () => DeclarativeStep<TStepId, TInputSchema, TOutputSchema>
   description: string
   examples: Example[]
   // oxlint-disable-next-line typescript/method-signature-style -- bivariance is the point; see the doc comment above
@@ -117,7 +117,7 @@ export type TunableStep<
   settings: StepSettings
 }
 
-export type AnyTunableStep = TunableStep
+export type AnyDeclarativeStep = DeclarativeStep
 
 export const declareStep = <
   TStepId extends string,
@@ -125,7 +125,7 @@ export const declareStep = <
   TOutputSchema extends FieldSchema,
 >(
   config: StepConfig<TStepId, TInputSchema, TOutputSchema>
-): TunableStep<TStepId, TInputSchema, TOutputSchema> => {
+): DeclarativeStep<TStepId, TInputSchema, TOutputSchema> => {
   const {
     description,
     examples,
@@ -140,25 +140,29 @@ export const declareStep = <
   // Assigned at the bottom of this function; `execute` only dereferences it at
   // call time, after construction, so tuned description/examples are read live.
   // oxlint-disable-next-line prefer-const -- assigned once at the bottom, after `execute` (which closes over it) is defined
-  let tunable: TunableStep<TStepId, TInputSchema, TOutputSchema>
+  let declarative: DeclarativeStep<TStepId, TInputSchema, TOutputSchema>
 
   const execute = async (
     { inputData }: { inputData: z.infer<TInputSchema> },
     ctx?: RunContext
   ): Promise<z.infer<TOutputSchema>> => {
     const generated = await generateText({
-      ...tunable.settings,
-      model: ctx?.model ?? tunable.model,
-      output: Output.object({ schema: tunable.outputSchema }),
-      prompt: renderPrompt(tunable.description, tunable.examples, inputData),
-      seed: ctx?.seed ?? tunable.settings.seed,
-      temperature: ctx?.temperature ?? tunable.settings.temperature,
+      ...declarative.settings,
+      model: ctx?.model ?? declarative.model,
+      output: Output.object({ schema: declarative.outputSchema }),
+      prompt: renderPrompt(
+        declarative.description,
+        declarative.examples,
+        inputData
+      ),
+      seed: ctx?.seed ?? declarative.settings.seed,
+      temperature: ctx?.temperature ?? declarative.settings.temperature,
     })
     // The AI SDK types `output` through a conditional it can't collapse while
     // the schema is still generic, so re-parse instead of asserting: this both
     // recovers the precise output type and re-checks what the model returned.
-    const outputData = tunable.outputSchema.parse(generated.output)
-    ctx?.trace?.push({ inputData, outputData, stepId: tunable.id })
+    const outputData = declarative.outputSchema.parse(generated.output)
+    ctx?.trace?.push({ inputData, outputData, stepId: declarative.id })
     return outputData
   }
 
@@ -213,17 +217,17 @@ export const declareStep = <
   // types `execute` for in-workflow invocation. Overwriting them restores the
   // library's own view of the step without disturbing what Mastra runs, and
   // the tuning fields (description, examples, settings, clone) ride alongside.
-  tunable = Object.assign(step, {
+  declarative = Object.assign(step, {
     clone: () =>
       declareStep({
-        ...tunable.settings,
-        description: tunable.description,
-        examples: tunable.examples,
+        ...declarative.settings,
+        description: declarative.description,
+        examples: declarative.examples,
         id,
         inputSchema,
-        model: tunable.model,
+        model: declarative.model,
         outputSchema,
-        scorers: tunable.scorers,
+        scorers: declarative.scorers,
       }),
     description,
     examples: structuredClone(examples ?? []),
@@ -235,5 +239,5 @@ export const declareStep = <
     settings,
   })
 
-  return tunable
+  return declarative
 }

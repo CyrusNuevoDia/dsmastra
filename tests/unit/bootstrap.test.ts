@@ -8,7 +8,7 @@ import {
 import { gepaProgram } from "@/optimizers/gepa"
 import { createProgram } from "@/program"
 import type { Example, Program } from "@/program"
-import type { AnyTunableStep, RunContext } from "@/step"
+import type { AnyDeclarativeStep, RunContext } from "@/step"
 
 import { fakeStep } from "./helpers"
 import type { Call } from "./helpers"
@@ -37,12 +37,12 @@ const exactMetric = (gold: Example, prediction: Fields | null) => ({
 
 test("labeledFewShot installs k labeled examples on a reset copy", () => {
   const program = singleProgram((inputData) => ({ y: inputData.x }))
-  ;(program.steps[0] as AnyTunableStep).examples = [
+  ;(program.steps[0] as AnyDeclarativeStep).examples = [
     { inputData: { x: 0 }, outputData: { y: 0 } },
   ]
   const trainingSet = dataset([1, 2, 3, 4, 5])
   const compiled = labeledFewShotProgram(program, trainingSet, 3)
-  const { examples } = compiled.steps[0] as AnyTunableStep
+  const { examples } = compiled.steps[0] as AnyDeclarativeStep
   expect(examples.length).toBe(3)
   // Reset copy: the pre-existing example was cleared, not kept alongside.
   expect(examples.every((e) => (e.inputData.x as number) >= 1)).toBe(true)
@@ -76,7 +76,7 @@ test("bootstrapped examples only come from metric-passing traces", async () => {
       metric: exactMetric,
     }
   )
-  const { examples } = compiled.steps[0] as AnyTunableStep
+  const { examples } = compiled.steps[0] as AnyDeclarativeStep
   expect(
     examples.map((e) => e.inputData.x as number).toSorted((a, b) => a - b)
   ).toEqual([2, 4])
@@ -141,7 +141,7 @@ test("maxFewShotExamples caps bootstrapped EXAMPLES; labeled backfill fills to m
     maxLabeledExamples: 5,
     metric: exactMetric,
   })
-  const { examples } = compiled.steps[0] as AnyTunableStep
+  const { examples } = compiled.steps[0] as AnyDeclarativeStep
   // Bootstrapped examples come first: the first two trainingSet examples
   // bootstrap, then the loop stops.
   const bootstrapped = examples.slice(0, 2)
@@ -247,7 +247,7 @@ test("student and source stay unmutated; examples matching the example are hidde
     y: (inputData.x as number) * 2,
   }))
   const preExisting: Example = { inputData: { x: 1 }, outputData: { y: 2 } }
-  ;(program.steps[0] as AnyTunableStep).examples = [preExisting]
+  ;(program.steps[0] as AnyDeclarativeStep).examples = [preExisting]
   const compiled = await bootstrapFewShotProgram(program, dataset([1]), {
     // Labeled pass installs examples on the teacher; the example equal to the
     // in-flight one must be hidden during its own bootstrap run.

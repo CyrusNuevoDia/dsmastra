@@ -40,7 +40,7 @@ const fieldsSchema = z.record(z.string(), z.unknown())
 /**
  * Deterministic fake step: `fn` maps inputData (+ctx) to outputData, calls are
  * logged, clones share the log and behavior but copy examples/description.
- * Built on a real Mastra `createStep` and carrying the tunable prompt state
+ * Built on a real Mastra `createStep` and carrying the declarative prompt state
  * alongside, exactly like `declareStep`.
  */
 export const fakeStep = (
@@ -75,11 +75,11 @@ export const fakeStep = (
     inputSchema: fieldsSchema,
     outputSchema: fieldsSchema,
   })
-  const tunable = Object.assign(step, {
+  const declarative = Object.assign(step, {
     clone: () => {
       const cloned = fakeStep(id, fn, log)
-      cloned.description = tunable.description
-      cloned.examples = structuredClone(tunable.examples)
+      cloned.description = declarative.description
+      cloned.examples = structuredClone(declarative.examples)
       return cloned
     },
     description: "solve",
@@ -90,5 +90,5 @@ export const fakeStep = (
     outputSchema: fieldsSchema,
     settings: {},
   })
-  return tunable
+  return declarative
 }

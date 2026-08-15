@@ -5,7 +5,7 @@ import type { AnyWorkflow, SingleStepEntry, Step } from "@mastra/core/workflows"
 import type { Fields } from "@/fields"
 import type { Program } from "@/program"
 import type { Metric } from "@/scorers"
-import type { AnyTunableStep, Example, RunContext } from "@/step"
+import type { AnyDeclarativeStep, Example, RunContext } from "@/step"
 import { RUN_CONTEXT_KEY } from "@/step"
 
 /**
@@ -26,20 +26,20 @@ export type Prompts = {
 // oxlint-disable-next-line anti-slop/no-unknown-returns -- deliberately permissive: callers may return whatever their storage layer returns (a write result, a DB row); the optimizers only await it
 export type SavePrompts = (prompts: Prompts) => Promise<unknown>
 
-const isTunableStep = (step: Step): step is Step & AnyTunableStep =>
+const isDeclarativeStep = (step: Step): step is Step & AnyDeclarativeStep =>
   "description" in step && "examples" in step && "clone" in step
 
 const singleEntrySteps = (entry: SingleStepEntry): Step[] =>
   entry.type === "step" ? [entry.step] : []
 
 /**
- * A workflow's tunable steps in graph order, read from Mastra's step graph.
+ * A workflow's declarative steps in graph order, read from Mastra's step graph.
  * The walk descends into parallel, branch, loop, and foreach entries; steps
  * that weren't built with `declareStep` (agents, tools, mappings, plain steps,
  * nested workflows) pass through untouched — the engine runs them, the
  * optimizers just don't tune them. Steps inside a nested workflow are opaque.
  */
-export const tunableSteps = (workflow: AnyWorkflow): AnyTunableStep[] =>
+export const declarativeSteps = (workflow: AnyWorkflow): AnyDeclarativeStep[] =>
   workflow.stepGraph
     .flatMap((entry) => {
       switch (entry.type) {
@@ -56,7 +56,7 @@ export const tunableSteps = (workflow: AnyWorkflow): AnyTunableStep[] =>
         }
       }
     })
-    .filter((step) => isTunableStep(step))
+    .filter((step) => isDeclarativeStep(step))
 
 // --- The candidate gate -------------------------------------------------------
 //
@@ -66,7 +66,7 @@ export const tunableSteps = (workflow: AnyWorkflow): AnyTunableStep[] =>
 // candidate's step array identifies it) while letting one holder's rollouts
 // run concurrently.
 
-type CandidateSteps = AnyTunableStep[]
+type CandidateSteps = AnyDeclarativeStep[]
 
 type Gate = {
   count: number
@@ -121,7 +121,7 @@ const releaseGate = (gate: Gate): void => {
 export const workflowToProgram = (
   workflow: AnyWorkflow
 ): Program<Fields, Fields> => {
-  const liveSteps = tunableSteps(workflow)
+  const liveSteps = declarativeSteps(workflow)
   if (liveSteps.length === 0) {
     throw new Error(
       `Workflow ${workflow.id} has no declareStep steps to optimize`
@@ -131,7 +131,7 @@ export const workflowToProgram = (
     .map((step) => step.id)
     .join(" -> ")}`
 
-  const make = (steps: AnyTunableStep[]): Program<Fields, Fields> => ({
+  const make = (steps: AnyDeclarativeStep[]): Program<Fields, Fields> => ({
     clone: () => make(steps.map((step) => step.clone())),
     code,
     run: async (inputData: Fields, ctx?: RunContext): Promise<Fields> => {
@@ -199,7 +199,7 @@ export const applyProgram = <TWorkflow extends AnyWorkflow>(
   workflow: TWorkflow,
   program: Program<Fields, Fields>
 ): TWorkflow => {
-  for (const step of tunableSteps(workflow)) {
+  for (const step of declarativeSteps(workflow)) {
     const tuned = program.steps.find((candidate) => candidate.id === step.id)
     if (!tuned) {
       throw new Error(`Tuned program lost step ${step.id}`)
@@ -265,7 +265,7 @@ export const loadPrompts = <TWorkflow extends AnyWorkflow>(
   workflow: TWorkflow,
   prompts: Prompts
 ): TWorkflow => {
-  const steps = tunableSteps(workflow)
+  const steps = declarativeSteps(workflow)
   const workflowIds = steps.map((step) => step.id)
   const promptIds = Object.keys(prompts.steps)
   const missing = workflowIds.filter((id) => !(id in prompts.steps))

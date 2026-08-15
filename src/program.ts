@@ -1,5 +1,5 @@
 import type { Fields } from "@/fields"
-import type { AnyTunableStep, RunContext } from "@/step"
+import type { AnyDeclarativeStep, RunContext } from "@/step"
 
 export type { Example } from "@/step"
 
@@ -9,7 +9,7 @@ export type ProgramForward<TInput, TOutput> = (
 ) => Promise<TOutput>
 
 /**
- * The unit the optimizers work on internally: a set of tunable steps plus a
+ * The unit the optimizers work on internally: a set of declarative steps plus a
  * forward function that wires them together. Cloning deep-copies step prompt
  * state (description, examples) while sharing the forward function and models.
  */
@@ -17,17 +17,17 @@ export type Program<TInput = Fields, TOutput = Fields> = {
   clone: () => Program<TInput, TOutput>
   code: string
   run: (inputData: TInput, ctx?: RunContext) => Promise<TOutput>
-  steps: AnyTunableStep[]
+  steps: AnyDeclarativeStep[]
 }
 
 export const createProgram = <TInput, TOutput>(config: {
   forward: ProgramForward<TInput, TOutput>
-  steps: AnyTunableStep[]
+  steps: AnyDeclarativeStep[]
 }): Program<TInput, TOutput> => {
   const { forward } = config
   const code = forward.toString()
 
-  const make = (steps: AnyTunableStep[]): Program<TInput, TOutput> => {
+  const make = (steps: AnyDeclarativeStep[]): Program<TInput, TOutput> => {
     const byId = new Map(steps.map((step) => [step.id, step]))
     return {
       clone: () => make(steps.map((step) => step.clone())),

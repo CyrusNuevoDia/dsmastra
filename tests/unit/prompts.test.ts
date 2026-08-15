@@ -62,7 +62,7 @@ test("loadPrompts throws on step-id mismatch in either direction", () => {
   ).toThrow("unknown: stray")
 })
 
-test("loadPrompts reaches tunable steps inside a parallel section", () => {
+test("loadPrompts reaches declarative steps inside a parallel section", () => {
   const left = fakeStep("left", (inputData) => inputData)
   const right = fakeStep("right", (inputData) => inputData)
   const parallelWorkflow = createWorkflow({

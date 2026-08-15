@@ -7,7 +7,7 @@ import { z } from "zod"
 
 import { labeledFewShot } from "@/optimizers/labeled-few-shot"
 import { loadPrompts, workflowToProgram } from "@/optimizers/utils"
-import type { AnyTunableStep, TraceStep } from "@/step"
+import type { AnyDeclarativeStep, TraceStep } from "@/step"
 import { declareStep } from "@/step"
 
 import { fakeScorer, fakeStep } from "./helpers"
@@ -132,7 +132,7 @@ test("engine rollouts honor RunContext overrides and capture per-step traces", a
   ])
 })
 
-test("engine rollouts run parallel graphs; tuning lands on tunable steps only", async () => {
+test("engine rollouts run parallel graphs; tuning lands on declarative steps only", async () => {
   const double = fakeStep("double", (inputData) => ({
     y: (inputData.x as number) * 2,
   }))
@@ -165,7 +165,7 @@ test("engine rollouts run parallel graphs; tuning lands on tunable steps only", 
   expect(output).toEqual({ sum: 10 })
   expect(trace.map((t) => t.stepId).toSorted()).toEqual(["double", "inc"])
 
-  // Optimizing tunes the tunable steps in place; the merge step is untouched.
+  // Optimizing tunes the declarative steps in place; the merge step is untouched.
   const { candidates, score } = await labeledFewShot(workflow, {
     maxFewShotExamples: 1,
     savePrompts: () => Promise.resolve(),
@@ -211,8 +211,8 @@ test("concurrent candidates never observe mixed prompt state", async () => {
   const base = workflowToProgram(workflow)
   const candidateA = base.clone()
   const candidateB = base.clone()
-  ;(candidateA.steps[0] as AnyTunableStep).description = "CANDIDATE-A"
-  ;(candidateB.steps[0] as AnyTunableStep).description = "CANDIDATE-B"
+  ;(candidateA.steps[0] as AnyDeclarativeStep).description = "CANDIDATE-A"
+  ;(candidateB.steps[0] as AnyDeclarativeStep).description = "CANDIDATE-B"
 
   // Launch both candidates' batches concurrently: the gate must serialize
   // them so every rollout sees exactly its own candidate's state.

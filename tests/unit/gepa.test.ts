@@ -27,7 +27,7 @@ import type { Prompts } from "@/optimizers/utils"
 import { createProgram } from "@/program"
 import type { Example, Program } from "@/program"
 import { extractInstructionText } from "@/prompting"
-import type { AnyTunableStep, RunContext } from "@/step"
+import type { AnyDeclarativeStep, RunContext } from "@/step"
 import { RUN_CONTEXT_KEY } from "@/step"
 
 import { fakeScorer } from "./helpers"
@@ -470,7 +470,7 @@ const makeMathStep = (id: string) => {
     const { inputData } = params
     const { x } = inputData
     // oxlint-disable-next-line no-use-before-define -- read at call time, after construction, so tuned descriptions are seen live
-    const doubles = tunable.description.includes("double")
+    const doubles = declarative.description.includes("double")
     if (x === 3 && !doubles) {
       throw new Error("boom")
     }
@@ -478,13 +478,13 @@ const makeMathStep = (id: string) => {
     ctx?.trace?.push({ inputData, outputData: { y }, stepId: id })
     return Promise.resolve({ y })
   }
-  const tunable = Object.assign(
+  const declarative = Object.assign(
     createStep({ execute, id, inputSchema, outputSchema }),
     {
       clone: () => {
         const cloned = makeMathStep(id)
-        cloned.description = tunable.description
-        cloned.examples = structuredClone(tunable.examples)
+        cloned.description = declarative.description
+        cloned.examples = structuredClone(declarative.examples)
         return cloned
       },
       description: "identity",
@@ -496,7 +496,7 @@ const makeMathStep = (id: string) => {
       settings: {},
     }
   )
-  return tunable
+  return declarative
 }
 
 const makeMathProgram = (): Program =>
@@ -534,7 +534,7 @@ test("evaluate never throws per example: failures score failureScore with null o
 test("student examples survive gepa untouched; candidates stay description-only", async () => {
   const example: Example = { inputData: { x: 5 }, outputData: { y: 10 } }
   const program = makeMathProgram()
-  ;(program.steps[0] as AnyTunableStep).examples = [example]
+  ;(program.steps[0] as AnyDeclarativeStep).examples = [example]
   const result = await gepaProgram(program, examples(3), {
     // The seed eval alone exceeds this, so the loop never runs.
     maxMetricCalls: 1,

@@ -12,7 +12,7 @@ import { fakeScorer, fakeStep } from "./helpers"
 const fieldsSchema = z.record(z.string(), z.unknown())
 
 /**
- * One tunable step whose outputs carry a `note` marker absent from the gold
+ * One declarative step whose outputs carry a `note` marker absent from the gold
  * outputData, so trace-harvested demos are distinguishable from labeled
  * backfill in the compiled examples.
  */
@@ -121,7 +121,7 @@ test("a gate scores the trajectory and decides acceptance instead of the objecti
   expect(workflowInput).toEqual({ x: 1 })
 })
 
-test("non-tunable steps appear in the gate's trajectory but never as demos", async () => {
+test("non-declarative steps appear in the gate's trajectory but never as demos", async () => {
   const solve = fakeStep("solve", (inputData) => ({
     note: "t",
     y: (inputData.x as number) * 2,
@@ -155,7 +155,7 @@ test("non-tunable steps appear in the gate's trajectory but never as demos", asy
   })
 
   // Every engine-executed step shows up, in execution order — the plain
-  // createStep included, even though only declareStep steps are tunable.
+  // createStep included, even though only declareStep steps are declarative.
   expect(seen[0]?.steps.map((step) => step.name)).toEqual(["solve", "plain"])
   expect(seen[0]).toMatchObject({
     steps: [
